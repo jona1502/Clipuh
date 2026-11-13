@@ -1,0 +1,450 @@
+//! Windows recorder worker: WGC capture -> pacing -> Media Foundation encoder.
+
+use std::fs::{self, OpenOptions};
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError, sync_channel};
+use std::time::{Duration, Instant};
+
+use clipper_capture::windows::{CaptureSession, CaptureSignal, list_sources};
+use clipper_core::pipeline::{FramePacer, RateMeter, recording_file_name};
+use clipper_core::recording::{
+    CaptureSource, RecorderCommand, RecorderEndpoint, RecorderEvent, RecordingOptions,
+    RecordingStats, StopReason,
+};
+use clipper_encoder::backends::media_foundation::{
+    EncoderConfig, EncoderError, HardwareEncoder, MediaFoundation, SubmitOutcome,
+};
+use clipper_platform::windows::{ComApartment, D3DContext};
+use windows::Win32::System::SystemInformation::GetLocalTime;
+
+use crate::emit;
+use crate::logic::{
+    Counters, Lifecycle, StopOutcome, classify_stop, partial_path, unique_file_name,
+};
+
+const MAX_WAIT: Duration = Duration::from_millis(250);
+const STATS_WINDOW: Duration = Duration::from_secs(1);
+
+struct Recording {
+    // Field order matters for implicit drops: capture first, then encoder,
+    // then the device.
+    session: Option<CaptureSession>,
+    encoder: HardwareEncoder,
+    _d3d: D3DContext,
+    pacer: FramePacer,
+    meter: RateMeter,
+    counters: Counters,
+    started: Instant,
+    final_path: PathBuf,
+    partial: PathBuf,
+    wake: Receiver<()>,
+    source_closed: Arc<AtomicBool>,
+}
+
+impl Recording {
+    fn stats(&self) -> RecordingStats {
+        self.counters
+            .snapshot(self.started.elapsed(), self.meter.rate())
+    }
+
+    /// Moves every pending capture frame through pacer and encoder.
+    fn pump(&mut self) -> Result<(), String> {
+        let Some(session) = self.session.as_mut() else {
+            return Ok(());
+        };
+        while let Some(frame) = session
+            .try_next_frame()
+            .map_err(|error| error.to_string())?
+        {
+            self.counters.captured += 1;
+            let Some(sample_time) = self.pacer.accept(frame.timestamp()) else {
+                continue;
+            };
+            let outcome = self
+                .encoder
+                .submit(
+                    frame.texture(),
+                    frame.content_size(),
+                    sample_time,
+                    self.pacer.interval(),
+                )
+                .map_err(|error| encoder_message(&error))?;
+            match outcome {
+                SubmitOutcome::Submitted => {
+                    self.counters.encoded += 1;
+                    self.meter.record();
+                }
+                SubmitOutcome::Dropped => self.counters.dropped += 1,
+            }
+            // `frame` drops here, returning its slot to the WGC pool.
+        }
+        Ok(())
+    }
+}
+
+struct Worker<'a> {
+    endpoint: &'a RecorderEndpoint,
+    lifecycle: Lifecycle,
+    _com: Option<ComApartment>,
+    init_error: Option<String>,
+    media_foundation: Option<MediaFoundation>,
+    recording: Option<Recording>,
+}
+
+pub fn run(endpoint: &RecorderEndpoint) {
+    let (com, init_error) = match ComApartment::init_multithreaded() {
+        Ok(com) => (Some(com), None),
+        Err(error) => (None, Some(format!("COM initialization failed: {error}"))),
+    };
+    if let Some(message) = &init_error {
+        emit(
+            endpoint,
+            RecorderEvent::Error {
+                message: message.clone(),
+            },
+        );
+    }
+    let mut worker = Worker {
+        endpoint,
+        lifecycle: Lifecycle::new(),
+        _com: com,
+        init_error,
+        media_foundation: None,
+        recording: None,
+    };
+
+    let mut running = true;
+    while running {
+        if worker.recording.is_none() {
+            match endpoint.commands.recv() {
+                Ok(command) => running = worker.handle(command),
+                Err(_) => break,
+            }
+            continue;
+        }
+        worker.service_recording();
+        loop {
+            match endpoint.commands.try_recv() {
+                Ok(command) => {
+                    if !worker.handle(command) {
+                        running = false;
+                        break;
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    running = false;
+                    break;
+                }
+            }
+        }
+    }
+    worker.stop_recording(StopReason::Shutdown, None);
+}
+
+impl Worker<'_> {
+    fn send(&self, event: RecorderEvent) {
+        emit(self.endpoint, event);
+    }
+
+    fn error(&self, message: impl Into<String>) {
+        self.send(RecorderEvent::Error {
+            message: message.into(),
+        });
+    }
+
+    /// Returns `false` when the worker must exit.
+    fn handle(&mut self, command: RecorderCommand) -> bool {
+        match command {
+            RecorderCommand::Shutdown => {
+                self.stop_recording(StopReason::Shutdown, None);
+                return false;
+            }
+            RecorderCommand::RefreshSources => match list_sources() {
+                Ok(sources) => self.send(RecorderEvent::SourcesListed(sources)),
+                Err(error) => self.error(format!("could not list capture sources: {error}")),
+            },
+            RecorderCommand::StartRecording { source, options } => {
+                self.start_recording(&source, &options);
+            }
+            RecorderCommand::StopRecording => match self.lifecycle.begin_stop() {
+                Ok(()) => self.stop_recording_started(StopReason::User, None),
+                Err(message) => self.error(message),
+            },
+        }
+        true
+    }
+
+    fn start_recording(&mut self, source: &CaptureSource, options: &RecordingOptions) {
+        if let Err(message) = self.lifecycle.begin_start() {
+            self.error(message);
+            return;
+        }
+        match self.try_start(source, options) {
+            Ok(recording) => {
+                self.lifecycle.started();
+                self.send(RecorderEvent::RecordingStarted {
+                    path: recording.final_path.clone(),
+                    encoder: recording.encoder.name().to_owned(),
+                });
+                self.recording = Some(recording);
+            }
+            Err(message) => {
+                self.lifecycle.start_failed(&message);
+                self.send(RecorderEvent::RecordingFailed { message });
+            }
+        }
+    }
+
+    fn try_start(
+        &mut self,
+        source: &CaptureSource,
+        options: &RecordingOptions,
+    ) -> Result<Recording, String> {
+        if let Some(message) = &self.init_error {
+            return Err(message.clone());
+        }
+        if self.media_foundation.is_none() {
+            let mf = MediaFoundation::start().map_err(|error| encoder_message(&error))?;
+            self.media_foundation = Some(mf);
+        }
+        let Some(mf) = self.media_foundation.as_ref() else {
+            return Err("Media Foundation is not available".into());
+        };
+
+        fs::create_dir_all(&options.output_directory).map_err(|error| {
+            format!(
+                "could not create the output folder {}: {error}",
+                options.output_directory.display()
+            )
+        })?;
+        let (final_path, partial) = choose_paths(&options.output_directory);
+        precheck_writable(&partial)?;
+
+        let result = build_recording(mf, source, options, final_path, partial.clone());
+        if result.is_err() {
+            let _ = fs::remove_file(&partial);
+        }
+        result
+    }
+
+    /// Waits for a capture wake (bounded), moves frames and reports stats.
+    fn service_recording(&mut self) {
+        let Some(recording) = self.recording.as_mut() else {
+            return;
+        };
+        match recording.wake.recv_timeout(MAX_WAIT) {
+            Ok(()) | Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => std::thread::sleep(Duration::from_millis(10)),
+        }
+        if let Err(message) = recording.pump() {
+            self.stop_recording(StopReason::SourceClosed, Some(message));
+            return;
+        }
+        if recording.source_closed.load(Ordering::Acquire) {
+            self.stop_recording(StopReason::SourceClosed, None);
+            return;
+        }
+        if recording
+            .meter
+            .update(recording.started.elapsed(), STATS_WINDOW)
+        {
+            let stats = recording.stats();
+            // Never block on stats: drop them if the UI queue is full.
+            let _ = self.endpoint.events.try_send(RecorderEvent::Stats(stats));
+        }
+    }
+
+    /// Stops an active recording (no-op when idle), validating via lifecycle.
+    fn stop_recording(&mut self, reason: StopReason, failure: Option<String>) {
+        if self.recording.is_none() {
+            return;
+        }
+        let _ = self.lifecycle.begin_stop();
+        self.stop_recording_started(reason, failure);
+    }
+
+    /// Finalizes the active recording after `begin_stop` succeeded.
+    fn stop_recording_started(&mut self, reason: StopReason, failure: Option<String>) {
+        let Some(recording) = self.recording.take() else {
+            self.lifecycle.stopped();
+            return;
+        };
+        let Recording {
+            session,
+            encoder,
+            _d3d,
+            meter,
+            counters,
+            started,
+            final_path,
+            partial,
+            ..
+        } = recording;
+        // Stop frames first, then drain and finalize the encoder.
+        drop(session);
+        let stats = counters.snapshot(started.elapsed(), meter.rate());
+        let finish = encoder.finish().map_err(|error| encoder_message(&error));
+        drop(_d3d);
+
+        let outcome = match classify_stop(counters.encoded, finish) {
+            StopOutcome::Success => fs::rename(&partial, &final_path).map_err(|error| {
+                format!(
+                    "could not save the recording to {}: {error}",
+                    final_path.display()
+                )
+            }),
+            StopOutcome::Failure(message) => Err(message),
+        };
+        self.lifecycle.stopped();
+        match outcome {
+            Ok(()) => {
+                if let Some(message) = failure {
+                    self.error(message);
+                }
+                self.send(RecorderEvent::RecordingFinished {
+                    path: final_path,
+                    stats,
+                    reason,
+                });
+            }
+            Err(message) => {
+                let _ = fs::remove_file(&partial);
+                let message = match failure {
+                    Some(cause) if cause != message => format!("{cause}; {message}"),
+                    _ => message,
+                };
+                self.send(RecorderEvent::RecordingFailed { message });
+            }
+        }
+    }
+}
+
+fn build_recording(
+    mf: &MediaFoundation,
+    source: &CaptureSource,
+    options: &RecordingOptions,
+    final_path: PathBuf,
+    partial: PathBuf,
+) -> Result<Recording, String> {
+    let d3d =
+        D3DContext::new().map_err(|error| format!("could not create the GPU device: {error}"))?;
+
+    let (wake_tx, wake) = sync_channel::<()>(1);
+    let source_closed = Arc::new(AtomicBool::new(false));
+    let session = CaptureSession::start(
+        &d3d,
+        source,
+        signal_handler(wake_tx, Arc::clone(&source_closed)),
+    )
+    .map_err(|error| error.to_string())?;
+
+    let (width, height) = session.size();
+    let config = EncoderConfig {
+        input_width: round_up_even(width),
+        input_height: round_up_even(height),
+        output_width: options.width,
+        output_height: options.height,
+        fps: options.fps,
+        bitrate_mbps: options.bitrate_mbps,
+        profile: options.profile,
+    };
+    let encoder = HardwareEncoder::create(mf, &d3d, &config, &partial)
+        .map_err(|error| encoder_message(&error))?;
+
+    Ok(Recording {
+        session: Some(session),
+        encoder,
+        _d3d: d3d,
+        pacer: FramePacer::new(options.fps),
+        meter: RateMeter::new(),
+        counters: Counters::default(),
+        started: Instant::now(),
+        final_path,
+        partial,
+        wake,
+        source_closed,
+    })
+}
+
+/// Runs on a WGC thread: must never block or allocate.
+fn signal_handler(
+    wake: SyncSender<()>,
+    source_closed: Arc<AtomicBool>,
+) -> Box<dyn Fn(CaptureSignal) + Send + Sync + 'static> {
+    Box::new(move |signal| {
+        if signal == CaptureSignal::SourceClosed {
+            source_closed.store(true, Ordering::Release);
+        }
+        // Full means a wake is already pending, which is enough.
+        let _ = wake.try_send(());
+    })
+}
+
+fn round_up_even(value: u32) -> u32 {
+    value.max(2).saturating_add(1) & !1
+}
+
+#[allow(unsafe_code)]
+fn choose_paths(directory: &Path) -> (PathBuf, PathBuf) {
+    // SAFETY: GetLocalTime takes no arguments and only returns a value.
+    let now = unsafe { GetLocalTime() };
+    let base = recording_file_name(
+        now.wYear,
+        now.wMonth,
+        now.wDay,
+        now.wHour,
+        now.wMinute,
+        now.wSecond,
+    );
+    let name = unique_file_name(&base, |candidate| {
+        let path = directory.join(candidate);
+        path.exists() || partial_path(&path).exists()
+    });
+    let final_path = directory.join(name);
+    let partial = partial_path(&final_path);
+    (final_path, partial)
+}
+
+/// Fails early with a clear message if the output location is not writable.
+fn precheck_writable(partial: &Path) -> Result<(), String> {
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(partial)
+    {
+        Ok(file) => {
+            drop(file);
+            Ok(())
+        }
+        Err(error) if error.kind() == ErrorKind::PermissionDenied => Err(format!(
+            "no permission to write to {}",
+            partial.parent().unwrap_or(partial).display()
+        )),
+        Err(error) => Err(format!("cannot create the output file: {error}")),
+    }
+}
+
+fn encoder_message(error: &EncoderError) -> String {
+    match error {
+        EncoderError::DiskFull => "not enough disk space to keep recording".into(),
+        EncoderError::AccessDenied => "no permission to write the output file".into(),
+        other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::round_up_even;
+
+    #[test]
+    fn rounds_up_to_even() {
+        assert_eq!(round_up_even(1920), 1920);
+        assert_eq!(round_up_even(1081), 1082);
+        assert_eq!(round_up_even(0), 2);
+        assert_eq!(round_up_even(u32::MAX), u32::MAX - 1);
+    }
+}
