@@ -29,6 +29,9 @@ const SPILL_QUEUE: usize = 4;
 const SPILL_MIN_GOPS: usize = 4;
 /// ...unless they already reach this many charged bytes.
 const SPILL_TARGET_BYTES: usize = 8 << 20;
+/// Headroom above current RAM use kept by the relaxed hard cap after the RAM
+/// budget was lowered.
+const SHRINK_SLACK: usize = 16 << 20;
 /// After a failed spill (disk full, quota reached while exports pin old
 /// segments, transient I/O) the buffer runs RAM only for this long, then
 /// tries the SSD tier again.
@@ -197,6 +200,11 @@ struct Core {
     retry_at: Option<Instant>,
     disk_error: Option<String>,
     dropped_gops: u64,
+    /// After the RAM budget was lowered live, RAM may legitimately stay above
+    /// `2 * memory_limit` until the spill thread caught up. The hard cap is
+    /// relaxed to this value (it follows the real usage down) so shrinking
+    /// the budget does not throw away the whole SSD tier.
+    shrink_floor: usize,
 }
 
 impl Core {
@@ -343,8 +351,12 @@ impl Core {
             if excess > 0 {
                 self.try_spill(excess);
             }
-            // Spill queue full / disk slow: never exceed twice the budget.
-            self.evict_ram_over(limit.saturating_mul(2));
+            // Spill queue full / disk slow: never exceed twice the budget
+            // (or, right after the budget was lowered, what was in use then,
+            // shrinking as the spill thread drains it).
+            let total = self.ram.total_bytes();
+            self.shrink_floor = self.shrink_floor.min(total.saturating_add(SHRINK_SLACK));
+            self.evict_ram_over(limit.saturating_mul(2).max(self.shrink_floor));
         } else {
             self.evict_ram_over(limit);
         }
@@ -516,6 +528,7 @@ impl ReplayBuffer {
                 retry_at: None,
                 disk_error,
                 dropped_gops: 0,
+                shrink_floor: 0,
             }),
         })
     }
@@ -545,6 +558,9 @@ impl ReplayBuffer {
     /// Changes the RAM budget live; excess GOPs spill or are evicted.
     pub fn set_memory_limit(&mut self, bytes: usize) {
         let core = self.core_mut();
+        if bytes < core.memory_limit {
+            core.shrink_floor = core.ram.total_bytes().saturating_add(SHRINK_SLACK);
+        }
         core.memory_limit = bytes;
         core.drain();
         core.enforce_budget();
