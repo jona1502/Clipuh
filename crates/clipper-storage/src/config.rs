@@ -1,4 +1,5 @@
-use directories::ProjectDirs;
+use clipper_core::recording::{QualityProfile, RecordingOptions};
+use directories::{ProjectDirs, UserDirs};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt;
@@ -8,11 +9,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-const MIN_VIDEO_WIDTH: u32 = 320;
-const MAX_VIDEO_WIDTH: u32 = 3840;
-const MIN_VIDEO_HEIGHT: u32 = 240;
-const MAX_VIDEO_HEIGHT: u32 = 2160;
-const MAX_VIDEO_FPS: u32 = 120;
+/// Output resolutions offered by the recorder: 720p, 1080p, 1440p, 4K.
+pub const VIDEO_RESOLUTIONS: [(u32, u32); 4] =
+    [(1280, 720), (1920, 1080), (2560, 1440), (3840, 2160)];
+/// Frame rates offered by the recorder.
+pub const VIDEO_FPS: [u32; 3] = [30, 60, 120];
 const MAX_BITRATE_MBPS: u32 = 100;
 const MIN_REPLAY_DURATION_SECONDS: u32 = 5;
 const MAX_REPLAY_DURATION_SECONDS: u32 = 300;
@@ -33,6 +34,7 @@ pub struct AppConfig {
     pub replay: ReplaySettings,
     pub audio: AudioSettings,
     pub performance: PerformanceSettings,
+    pub recording: RecordingSettings,
     pub app: AppSettings,
 }
 
@@ -48,34 +50,16 @@ impl AppConfig {
     pub fn validate(&self) -> Result<(), ConfigValidationError> {
         let mut issues = Vec::new();
 
-        if !(MIN_VIDEO_WIDTH..=MAX_VIDEO_WIDTH).contains(&self.video.width) {
+        if !VIDEO_RESOLUTIONS.contains(&(self.video.width, self.video.height)) {
             issues.push(ValidationIssue::new(
                 "video.width",
-                "must be between 320 and 3840 pixels",
+                "resolution must be 1280x720, 1920x1080, 2560x1440 or 3840x2160",
             ));
         }
-        if !(MIN_VIDEO_HEIGHT..=MAX_VIDEO_HEIGHT).contains(&self.video.height) {
-            issues.push(ValidationIssue::new(
-                "video.height",
-                "must be between 240 and 2160 pixels",
-            ));
-        }
-        if !self.video.width.is_multiple_of(2) {
-            issues.push(ValidationIssue::new(
-                "video.width",
-                "must be even for H.264 encoding",
-            ));
-        }
-        if !self.video.height.is_multiple_of(2) {
-            issues.push(ValidationIssue::new(
-                "video.height",
-                "must be even for H.264 encoding",
-            ));
-        }
-        if self.video.fps == 0 || self.video.fps > MAX_VIDEO_FPS {
+        if !VIDEO_FPS.contains(&self.video.fps) {
             issues.push(ValidationIssue::new(
                 "video.fps",
-                "must be between 1 and 120 frames per second",
+                "must be 30, 60 or 120 frames per second",
             ));
         }
         if self.video.bitrate_mbps == 0 || self.video.bitrate_mbps > MAX_BITRATE_MBPS {
@@ -125,11 +109,38 @@ impl AppConfig {
             ));
         }
 
+        if let Some(directory) = &self.recording.output_directory
+            && !directory.is_absolute()
+        {
+            issues.push(ValidationIssue::new(
+                "recording.output_directory",
+                "must be an absolute path",
+            ));
+        }
+
         if issues.is_empty() {
             Ok(())
         } else {
             Err(ConfigValidationError { issues })
         }
+    }
+
+    /// Resolves the settings needed to start one recording.
+    ///
+    /// Without a configured directory, recordings go to `<Videos>/Clipper`.
+    pub fn recording_options(&self) -> Result<RecordingOptions, ConfigError> {
+        let output_directory = match &self.recording.output_directory {
+            Some(directory) => directory.clone(),
+            None => default_recording_directory()?,
+        };
+        Ok(RecordingOptions {
+            width: self.video.width,
+            height: self.video.height,
+            fps: self.video.fps,
+            bitrate_mbps: self.video.bitrate_mbps,
+            profile: self.recording.quality.into(),
+            output_directory,
+        })
     }
 
     /// Saves this configuration to the per-user settings path.
@@ -276,6 +287,43 @@ impl Default for PerformanceSettings {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RecordingSettings {
+    pub quality: QualityPreset,
+    /// Absolute directory for recordings; `None` means `<Videos>/Clipper`.
+    pub output_directory: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualityPreset {
+    Performance,
+    #[default]
+    Balanced,
+    Quality,
+}
+
+impl From<QualityPreset> for QualityProfile {
+    fn from(preset: QualityPreset) -> Self {
+        match preset {
+            QualityPreset::Performance => Self::Performance,
+            QualityPreset::Balanced => Self::Balanced,
+            QualityPreset::Quality => Self::Quality,
+        }
+    }
+}
+
+impl From<QualityProfile> for QualityPreset {
+    fn from(profile: QualityProfile) -> Self {
+        match profile {
+            QualityProfile::Performance => Self::Performance,
+            QualityProfile::Balanced => Self::Balanced,
+            QualityProfile::Quality => Self::Quality,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
@@ -311,6 +359,16 @@ pub enum Theme {
     Dark,
     Light,
     System,
+}
+
+/// `<Videos>/Clipper` for the current user.
+pub fn default_recording_directory() -> Result<PathBuf, ConfigError> {
+    let user_dirs = UserDirs::new().ok_or(ConfigError::NoVideoDirectory)?;
+    let videos = user_dirs
+        .video_dir()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| user_dirs.home_dir().join("Videos"));
+    Ok(videos.join("Clipper"))
 }
 
 /// Returns the settings file path in the current user's config directory.
@@ -368,6 +426,7 @@ impl Error for ConfigValidationError {}
 #[derive(Debug)]
 pub enum ConfigError {
     NoConfigDirectory,
+    NoVideoDirectory,
     Io {
         path: PathBuf,
         source: io::Error,
@@ -385,6 +444,9 @@ impl fmt::Display for ConfigError {
         match self {
             Self::NoConfigDirectory => {
                 formatter.write_str("could not determine the user config directory")
+            }
+            Self::NoVideoDirectory => {
+                formatter.write_str("could not determine the user videos directory")
             }
             Self::Io { path, source } => {
                 write!(
@@ -411,7 +473,7 @@ impl fmt::Display for ConfigError {
 impl Error for ConfigError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::NoConfigDirectory => None,
+            Self::NoConfigDirectory | Self::NoVideoDirectory => None,
             Self::Io { source, .. } => Some(source),
             Self::Parse { source, .. } => Some(source),
             Self::Serialize(source) => Some(source),
@@ -550,6 +612,9 @@ mod tests {
         assert_eq!(config.performance.command_queue_capacity, 32);
         assert_eq!(config.performance.event_queue_capacity, 64);
 
+        assert_eq!(config.recording.quality, QualityPreset::Balanced);
+        assert_eq!(config.recording.output_directory, None);
+
         assert_eq!(config.app.theme, Theme::Dark);
         assert!(config.app.automatic_detection);
         assert!(config.app.manual_detection);
@@ -599,6 +664,57 @@ mod tests {
         assert!(fields.contains(&"replay.hotkey"));
         assert!(fields.contains(&"performance.command_queue_capacity"));
         assert!(fields.contains(&"performance.event_queue_capacity"));
+    }
+
+    #[test]
+    fn validation_accepts_every_offered_resolution_and_fps() {
+        for (width, height) in VIDEO_RESOLUTIONS {
+            for fps in VIDEO_FPS {
+                let mut config = AppConfig::default();
+                config.video.width = width;
+                config.video.height = height;
+                config.video.fps = fps;
+                assert!(config.validate().is_ok(), "{width}x{height}@{fps}");
+            }
+        }
+    }
+
+    #[test]
+    fn validation_rejects_sub_720p_odd_fps_and_relative_output_directory() {
+        let mut config = AppConfig::default();
+        config.video.width = 640;
+        config.video.height = 480;
+        config.video.fps = 45;
+        config.recording.output_directory = Some(PathBuf::from("relative/clips"));
+
+        let fields = config
+            .validate()
+            .expect_err("invalid config should fail")
+            .issues()
+            .iter()
+            .map(|issue| issue.field())
+            .collect::<Vec<_>>();
+        assert!(fields.contains(&"video.width"));
+        assert!(fields.contains(&"video.fps"));
+        assert!(fields.contains(&"recording.output_directory"));
+    }
+
+    #[test]
+    fn recording_options_follow_settings() {
+        let mut config = AppConfig::default();
+        let directory = std::env::temp_dir().join("clipper-recordings");
+        config.recording.output_directory = Some(directory.clone());
+        config.recording.quality = QualityPreset::Quality;
+        config.video.fps = 30;
+
+        let options = config.recording_options().expect("resolve options");
+        assert_eq!(options.output_directory, directory);
+        assert_eq!(options.profile, QualityProfile::Quality);
+        assert_eq!(
+            (options.width, options.height, options.fps),
+            (1920, 1080, 30)
+        );
+        assert_eq!(options.bitrate_mbps, 16);
     }
 
     #[test]
