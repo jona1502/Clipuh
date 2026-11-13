@@ -109,11 +109,14 @@ fn control_row(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
         Phase::Idle => ("Start recording", ButtonKind::Primary, state.can_start()),
         Phase::Starting => ("Starting...", ButtonKind::Primary, false),
         Phase::Recording => ("Stop recording", ButtonKind::Danger, state.can_stop()),
+        Phase::Stopping => ("Saving...", ButtonKind::Danger, false),
     };
     let recording = state.phase == Phase::Recording;
     let on_click = cx.listener(move |this, _, _, cx| {
         if recording {
-            this.send(RecorderCommand::StopRecording);
+            if this.send(RecorderCommand::StopRecording) {
+                this.recording.begin_stop();
+            }
         } else {
             this.start_recording();
         }
@@ -156,8 +159,12 @@ fn status_row(window: &ClipperWindow) -> Div {
                     .child(stats_text(&finished.stats));
             }
         }
-        Phase::Starting => {
-            row = row.child(div().text_color(rgb(theme::MUTED)).child("Starting..."));
+        Phase::Starting | Phase::Stopping => {
+            row = row.child(
+                div()
+                    .text_color(rgb(theme::MUTED))
+                    .child(state.status_label()),
+            );
         }
         Phase::Recording => {
             row = row

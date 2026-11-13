@@ -3,7 +3,7 @@ mod dashboard;
 mod editor;
 mod settings;
 
-use clipper_core::recording::{RecorderCommand, RecorderHandle};
+use clipper_core::recording::{RecorderCommand, RecorderEvent, RecorderHandle};
 use clipper_storage::AppConfig;
 use gpui::prelude::*;
 use gpui::{Context, Div, FontWeight, Render, Task, Window, div, px, rgb};
@@ -77,9 +77,16 @@ impl ClipperWindow {
                     cx.notify();
                 });
                 if updated.is_err() {
-                    break;
+                    return;
                 }
             }
+            // Channel closed without a final event: the worker is gone.
+            let _ = this.update(cx, |this, cx| {
+                if this.recording.phase != Phase::Idle {
+                    this.recording.apply(RecorderEvent::Stopped);
+                    cx.notify();
+                }
+            });
         });
         let mut window = Self {
             active_page: Page::default(),
@@ -215,6 +222,7 @@ impl ClipperWindow {
                             Phase::Idle => "Ready to record. Clip storage is not connected yet.",
                             Phase::Starting => "Starting a recording...",
                             Phase::Recording => "Recording in progress.",
+                            Phase::Stopping => "Saving the recording...",
                         },
                     )),
             )
@@ -293,7 +301,7 @@ impl ClipperWindow {
                             .bg(rgb(match self.recording.phase {
                                 Phase::Idle => 0x78869a,
                                 Phase::Starting => 0xe0b04a,
-                                Phase::Recording => 0xe5484d,
+                                Phase::Recording | Phase::Stopping => 0xe5484d,
                             })),
                     )
                     .child(

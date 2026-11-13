@@ -33,7 +33,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         App, Application, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, px, size,
     };
 
-    let config = AppConfig::load()?;
+    // A broken or outdated settings file must not prevent startup. The file is
+    // left untouched until the user changes a setting.
+    let config = AppConfig::load().unwrap_or_else(|error| {
+        eprintln!("Clipper: {error}; using default settings");
+        AppConfig::default()
+    });
     let recorder = Recorder::spawn(
         config.performance.command_queue_capacity as usize,
         config.performance.event_queue_capacity as usize,

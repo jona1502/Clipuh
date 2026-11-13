@@ -13,6 +13,8 @@ pub enum Phase {
     Idle,
     Starting,
     Recording,
+    /// Stop was requested; the encoder is finalizing the file.
+    Stopping,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -70,12 +72,9 @@ impl RecordingState {
                 self.reset_run();
                 self.error = Some(message);
             }
-            RecorderEvent::Error { message } => {
-                if self.phase == Phase::Starting {
-                    self.phase = Phase::Idle;
-                }
-                self.error = Some(message);
-            }
+            // Non-fatal errors (e.g. a failed source refresh) never change the
+            // run phase: only RecordingStarted/Finished/Failed/Stopped do.
+            RecorderEvent::Error { message } => self.error = Some(message),
             RecorderEvent::Stopped => {
                 self.reset_run();
                 self.error = Some("The recorder stopped. Restart Clipper to record again.".into());
@@ -111,6 +110,12 @@ impl RecordingState {
         self.phase == Phase::Idle
     }
 
+    pub fn begin_stop(&mut self) {
+        if self.phase == Phase::Recording {
+            self.phase = Phase::Stopping;
+        }
+    }
+
     pub fn begin_start(&mut self) {
         self.phase = Phase::Starting;
         self.finished = None;
@@ -137,6 +142,7 @@ impl RecordingState {
             Phase::Idle => "Idle",
             Phase::Starting => "Starting\u{2026}",
             Phase::Recording => "Recording",
+            Phase::Stopping => "Saving...",
         }
     }
 }
@@ -169,6 +175,30 @@ mod tests {
             width: 1920,
             height: 1080,
         }
+    }
+
+    #[test]
+    fn stop_shows_stopping_until_finished_and_errors_keep_phase() {
+        let mut s = RecordingState::default();
+        s.begin_start();
+        s.apply(RecorderEvent::Error {
+            message: "refresh failed".into(),
+        });
+        assert_eq!(s.phase, Phase::Starting);
+        s.apply(RecorderEvent::RecordingStarted {
+            path: "a.mp4".into(),
+            encoder: "hw".into(),
+        });
+        s.begin_stop();
+        assert_eq!(s.phase, Phase::Stopping);
+        assert!(!s.can_stop());
+        assert!(!s.settings_enabled());
+        s.apply(RecorderEvent::RecordingFinished {
+            path: "a.mp4".into(),
+            stats: RecordingStats::default(),
+            reason: StopReason::User,
+        });
+        assert_eq!(s.phase, Phase::Idle);
     }
 
     #[test]
@@ -238,10 +268,10 @@ mod tests {
         s.apply(RecorderEvent::Error {
             message: "bad".into(),
         });
-        assert_eq!(s.phase, Phase::Idle);
+        // A non-fatal error does not end the pending start.
+        assert_eq!(s.phase, Phase::Starting);
         assert_eq!(s.error.as_deref(), Some("bad"));
         s.dismiss_error();
-        s.begin_start();
         s.apply(RecorderEvent::RecordingFailed {
             message: "boom".into(),
         });
