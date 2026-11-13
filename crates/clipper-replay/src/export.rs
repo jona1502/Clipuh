@@ -2,9 +2,9 @@
 //! re-encoding) -> `<name>.mp4.partial` -> flush -> atomic rename.
 //!
 //! Only `Ok` from [`export_clip`] means a complete, finalized clip exists.
-//! The final path is never overwritten (the caller picks unique names); the
-//! check happens before writing and again just before the rename, a tiny
-//! race window remains because `std::fs::rename` replaces on Windows.
+//! The final path is never overwritten (the caller picks unique names):
+//! finalization hard-links the partial to the final name, which fails
+//! atomically if it exists (checked rename fallback on FAT/exFAT).
 
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
@@ -175,11 +175,24 @@ fn write_and_finalize(
     file.sync_all()
         .map_err(|err| ReplayError::io("syncing clip", partial, err))?;
     drop(file);
-    if final_path.exists() {
-        return Err(exists_error(final_path));
+    // `hard_link` fails atomically when the final name exists, so a clip is
+    // never overwritten. Volumes without hard links (FAT/exFAT) fall back to
+    // a checked rename with a tiny race window.
+    match fs::hard_link(partial, final_path) {
+        Ok(()) => {
+            let _ = fs::remove_file(partial);
+        }
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(exists_error(final_path));
+        }
+        Err(_) => {
+            if final_path.exists() {
+                return Err(exists_error(final_path));
+            }
+            fs::rename(partial, final_path)
+                .map_err(|err| ReplayError::io("finalizing clip", final_path, err))?;
+        }
     }
-    fs::rename(partial, final_path)
-        .map_err(|err| ReplayError::io("finalizing clip", final_path, err))?;
     Ok(bytes)
 }
 
