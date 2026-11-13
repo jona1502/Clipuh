@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use windows::Win32::Media::Audio::{
     DEVICE_STATE_ACTIVE, EDataFlow, ERole, IAudioClient, IMMDevice, IMMDeviceEnumerator,
-    IMMNotificationClient, IMMNotificationClient_Impl, eCapture, eConsole, eRender,
+    IMMNotificationClient, IMMNotificationClient_Impl, eCapture, eConsole,
 };
 use windows::Win32::System::Com::CLSCTX_ALL;
 use windows::Win32::System::Threading::ResetEvent;
@@ -75,9 +75,13 @@ struct DefaultFollower {
     event: Arc<OwnedHandle>,
 }
 
-// SAFETY: the COM objects live in the MTA (the capture thread joins it) and
-// are agile; the follower is created, used and dropped on that one thread
-// after being moved there inside the not-yet-opened source.
+// SAFETY: `Send` is needed only because `EndpointSource` (a `Box<dyn
+// StreamSource>`) is moved to the capture thread. At that point `follower` is
+// always `None`: it is constructed lazily inside `open`, on the capture
+// thread, which has joined the MTA, and is used and dropped there (the worker
+// drops the source before CoUninitialize). The contained interfaces are MTA
+// objects and the callback object is agile, so they never cross threads
+// while alive.
 unsafe impl Send for DefaultFollower {}
 
 impl DefaultFollower {
@@ -203,17 +207,6 @@ pub(crate) fn loopback_source() -> Box<dyn StreamSource> {
         Target::Default(DeviceFlow::Render),
         true,
     ))
-}
-
-/// Opens loopback of the current default render device once. Used by the
-/// process EXCLUDE source while its target is not running.
-pub(crate) fn open_default_loopback(channels: u16) -> Result<OpenedStream, AudioError> {
-    let _com = ComGuard::init();
-    let enumerator = create_enumerator()?;
-    // SAFETY: valid enumerator.
-    let device = unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }
-        .map_err(|e| map_os_error("GetDefaultAudioEndpoint(render)", &e))?;
-    activate_stream(&device, channels, true)
 }
 
 /// Microphone capture; `Default` follows default-device changes.

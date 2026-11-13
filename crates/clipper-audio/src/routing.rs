@@ -81,7 +81,9 @@ pub fn plan(selection: &AudioSelection, caps: AudioCapabilities) -> RoutingPlan 
 
     let mut game = selection.game.clone();
     let mut discord = selection.discord.clone();
-    if game.is_some() && game == discord {
+    if let (Some(g), Some(d)) = (&game, &discord)
+        && g.same_as(d)
+    {
         out.warnings.push(RoutingWarning::DuplicateProcess);
         discord = None;
     }
@@ -301,6 +303,19 @@ mod tests {
         );
         assert_eq!(plan.warnings, [RoutingWarning::DuplicateProcess]);
         assert_disjoint(&plan);
+    }
+
+    #[test]
+    fn duplicate_detection_ignores_exe_name_case() {
+        let selection = AudioSelection {
+            game: Some(ProcessTarget::Executable("Discord.exe".into())),
+            discord: Some(ProcessTarget::Executable("discord.exe".into())),
+            desktop: false,
+            microphone: None,
+        };
+        let plan = plan(&selection, SUPPORTED);
+        assert_eq!(contents(&plan), [TrackContent::Game]);
+        assert_eq!(plan.warnings, [RoutingWarning::DuplicateProcess]);
     }
 
     #[test]

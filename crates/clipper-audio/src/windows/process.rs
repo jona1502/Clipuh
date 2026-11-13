@@ -11,7 +11,9 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use windows::Wdk::System::SystemServices::RtlGetVersion;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, STILL_ACTIVE, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, HANDLE, STILL_ACTIVE, WAIT_OBJECT_0,
+};
 use windows::Win32::Media::Audio::{
     AUDIOCLIENT_ACTIVATION_PARAMS, AUDIOCLIENT_ACTIVATION_PARAMS_0,
     AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK, AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS,
@@ -30,12 +32,12 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
 use windows::Win32::System::SystemInformation::OSVERSIONINFOW;
 use windows::Win32::System::Threading::{
     CreateEventW, GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_SYNCHRONIZE, SetEvent, WaitForSingleObject,
+    PROCESS_SYNCHRONIZE, SetEvent, WaitForMultipleObjects,
 };
 use windows::Win32::System::Variant::VT_BLOB;
-use windows_core::{Interface, implement};
+use windows_core::{HRESULT, Interface, implement};
 
-use super::endpoint::open_default_loopback;
+use super::endpoint::loopback_source;
 use super::stream::{OpenedStream, OwnedHandle, StreamSource, init_capture_client};
 use crate::types::{AudioCapabilities, AudioError, ProcessTarget};
 
@@ -92,8 +94,10 @@ fn is_alive(pid: u32) -> bool {
         return false;
     }
     // SAFETY: plain Win32 call; the returned handle is wrapped and closed.
-    let Ok(raw) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }) else {
-        return false;
+    let raw = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+        Ok(raw) => raw,
+        // Protected / anti-cheat processes refuse the open but exist.
+        Err(e) => return e.code() == HRESULT::from_win32(ERROR_ACCESS_DENIED.0),
     };
     let process = OwnedHandle(raw);
     let mut code = 0u32;
@@ -197,10 +201,12 @@ impl IActivateAudioInterfaceCompletionHandler_Impl for ActivationHandler_Impl {
 
 impl IAgileObject_Impl for ActivationHandler_Impl {}
 
-/// Activates a process loopback `IAudioClient` for `pid`.
+/// Activates a process loopback `IAudioClient` for `pid`. The wait for the
+/// asynchronous completion is interrupted by `stop` (`SourceUnavailable`).
 fn activate_process_client(
     pid: u32,
     mode: PROCESS_LOOPBACK_MODE,
+    stop: Option<&OwnedHandle>,
 ) -> Result<IAudioClient, AudioError> {
     let os = |what: &str, e: windows_core::Error| AudioError::Os(format!("{what}: {e}"));
 
@@ -211,7 +217,9 @@ fn activate_process_client(
     let handler: IActivateAudioInterfaceCompletionHandler =
         ActivationHandler { done: done.clone() }.into();
 
-    let mut params = AUDIOCLIENT_ACTIVATION_PARAMS {
+    // Heap-allocated so that, if the activation outlives this call (timeout /
+    // stop), the memory it may still read can be leaked instead of freed.
+    let params_ptr = Box::into_raw(Box::new(AUDIOCLIENT_ACTIVATION_PARAMS {
         ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
         Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
             ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
@@ -219,10 +227,11 @@ fn activate_process_client(
                 ProcessLoopbackMode: mode,
             },
         },
-    };
-    // The PROPVARIANT only borrows `params`; ManuallyDrop + never calling
-    // PropVariantClear guarantees nothing tries to free the stack blob.
-    let prop = ManuallyDrop::new(PROPVARIANT {
+    }));
+    // The PROPVARIANT only borrows the params blob; ManuallyDrop + never
+    // calling PropVariantClear guarantees nothing tries to free it as COM
+    // memory. Boxed for the same leak-on-timeout reason as the params.
+    let prop = Box::new(ManuallyDrop::new(PROPVARIANT {
         Anonymous: PROPVARIANT_0 {
             Anonymous: ManuallyDrop::new(PROPVARIANT_0_0 {
                 vt: VT_BLOB,
@@ -232,31 +241,60 @@ fn activate_process_client(
                 Anonymous: PROPVARIANT_0_0_0 {
                     blob: BLOB {
                         cbSize: size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>() as u32,
-                        pBlobData: (&raw mut params).cast::<u8>(),
+                        pBlobData: params_ptr.cast::<u8>(),
                     },
                 },
             }),
         },
-    });
+    }));
 
-    // SAFETY: `prop` points at `params`, both outlive the call (the OS copies
-    // the blob during the call); `handler` is a valid agile handler.
-    let operation = unsafe {
+    // SAFETY: `prop` points at the heap `params_ptr` block, both alive for the
+    // call; `handler` is a valid agile handler.
+    let started = unsafe {
         ActivateAudioInterfaceAsync(
             VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
             &IAudioClient::IID,
-            Some(&*prop),
+            Some(&**prop),
             &handler,
         )
-    }
-    .map_err(|e| os("ActivateAudioInterfaceAsync", e))?;
+    };
+    let operation = match started {
+        Ok(operation) => operation,
+        Err(e) => {
+            // SAFETY: the call failed, so nothing retains the params block;
+            // it came from `Box::into_raw` above and is freed once.
+            drop(unsafe { Box::from_raw(params_ptr) });
+            return Err(os("ActivateAudioInterfaceAsync", e));
+        }
+    };
 
-    // SAFETY: valid event handle owned by `done`.
-    if unsafe { WaitForSingleObject(done.0, ACTIVATION_TIMEOUT_MS) } != WAIT_OBJECT_0 {
-        return Err(AudioError::Os(
-            "process loopback activation timed out".to_owned(),
-        ));
+    let mut waits = [done.0, HANDLE::default()];
+    let count = match stop {
+        Some(stop) => {
+            waits[1] = stop.0;
+            2
+        }
+        None => 1,
+    };
+    // SAFETY: valid event handles: `done` is kept alive by the Arc, `stop` by
+    // the caller's reference.
+    let wait = unsafe { WaitForMultipleObjects(&waits[..count], false, ACTIVATION_TIMEOUT_MS) };
+    if wait != WAIT_OBJECT_0 {
+        // The activation may still be running and reading the params / prop
+        // blob. Leak both on purpose: a few bytes are cheaper than a
+        // use-after-free in the audio service callback.
+        Box::leak(prop);
+        let _ = params_ptr;
+        return Err(if wait.0 == WAIT_OBJECT_0.0 + 1 {
+            AudioError::SourceUnavailable("stopping".to_owned())
+        } else {
+            AudioError::Os("process loopback activation timed out".to_owned())
+        });
     }
+    // SAFETY: activation completed, so nothing reads the blob any more; the
+    // pointer came from `Box::into_raw` above and is freed exactly once.
+    drop(unsafe { Box::from_raw(params_ptr) });
+    drop(prop);
 
     let mut hr = windows_core::HRESULT(0);
     let mut unknown: Option<windows_core::IUnknown> = None;
@@ -270,12 +308,37 @@ fn activate_process_client(
         .map_err(|e| os("IAudioClient cast", e))
 }
 
-/// Process handle that signals when the process exits (`SYNCHRONIZE`).
-fn open_exit_handle(pid: u32) -> Option<OwnedHandle> {
+/// Opens a handle that signals when the process exits and checks the process
+/// is still running. `Ok(None)`: the process exists but the handle cannot be
+/// obtained (protected process); callers then poll liveness instead.
+/// `Err(SourceUnavailable)`: the process is gone.
+fn open_exit_handle(pid: u32) -> Result<Option<OwnedHandle>, AudioError> {
     // SAFETY: plain Win32 call.
-    unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }
-        .ok()
-        .map(OwnedHandle)
+    let raw = match unsafe {
+        OpenProcess(
+            PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+            false,
+            pid,
+        )
+    } {
+        Ok(raw) => raw,
+        Err(e) if e.code() == HRESULT::from_win32(ERROR_INVALID_PARAMETER.0) => {
+            return Err(AudioError::SourceUnavailable(format!(
+                "process {pid} is not running"
+            )));
+        }
+        Err(_) => return Ok(None),
+    };
+    let handle = OwnedHandle(raw);
+    let mut code = 0u32;
+    // SAFETY: `handle` is a valid process handle, `code` a valid out pointer.
+    let queried = unsafe { GetExitCodeProcess(handle.0, &mut code) }.is_ok();
+    if queried && code != STILL_ACTIVE.0 as u32 {
+        return Err(AudioError::SourceUnavailable(format!(
+            "process {pid} has exited"
+        )));
+    }
+    Ok(Some(handle))
 }
 
 fn describe(target: &ProcessTarget, pid: u32) -> String {
@@ -292,20 +355,57 @@ fn target_label(target: &ProcessTarget) -> String {
     }
 }
 
+/// Opens the exit handle first (and verifies the process is alive), then
+/// activates for that pid and uses the handle as the stream's reopen signal.
 fn open_process_stream(
     target: &ProcessTarget,
     pid: u32,
     mode: PROCESS_LOOPBACK_MODE,
     channels: u16,
+    stop: Option<&OwnedHandle>,
 ) -> Result<OpenedStream, AudioError> {
-    let client = activate_process_client(pid, mode)?;
+    let exit = open_exit_handle(pid)?;
+    let client = activate_process_client(pid, mode, stop)?;
     let mut stream = init_capture_client(client, channels, true, describe(target, pid))?;
-    stream.reopen = open_exit_handle(pid);
+    stream.reopen = exit;
     Ok(stream)
+}
+
+/// Fallback liveness check for a stream without an exit handle: about once a
+/// second, re-resolves the target and reports a change of the running pid.
+#[derive(Default)]
+struct LivenessWatch {
+    /// Pid being streamed; `None` while no handle-less stream is active.
+    pid: Option<u32>,
+    last_scan: Option<Instant>,
+}
+
+impl LivenessWatch {
+    fn arm(&mut self, pid: u32, has_exit_handle: bool) {
+        self.pid = (!has_exit_handle).then_some(pid);
+        self.last_scan = Some(Instant::now());
+    }
+
+    fn changed(&mut self, target: &ProcessTarget) -> bool {
+        let Some(pid) = self.pid else {
+            return false;
+        };
+        let now = Instant::now();
+        if self
+            .last_scan
+            .is_some_and(|t| now.duration_since(t) < RESCAN_INTERVAL)
+        {
+            return false;
+        }
+        self.last_scan = Some(now);
+        find_process(target) != Some(pid)
+    }
 }
 
 struct IncludeSource {
     target: ProcessTarget,
+    stop: Option<OwnedHandle>,
+    watch: LivenessWatch,
 }
 
 impl StreamSource for IncludeSource {
@@ -316,21 +416,34 @@ impl StreamSource for IncludeSource {
                 target_label(&self.target)
             )));
         };
-        open_process_stream(
+        let stream = open_process_stream(
             &self.target,
             pid,
             PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
             channels,
-        )
+            self.stop.as_ref(),
+        )?;
+        self.watch.arm(pid, stream.reopen.is_some());
+        Ok(stream)
+    }
+
+    fn needs_reopen(&mut self) -> bool {
+        self.watch.changed(&self.target)
+    }
+
+    fn set_stop_handle(&mut self, stop: OwnedHandle) {
+        self.stop = Some(stop);
     }
 }
 
 struct ExcludeSource {
     target: ProcessTarget,
-    /// True while streaming the full endpoint loopback because the target
-    /// was not running at `open`.
-    fallback: bool,
+    stop: Option<OwnedHandle>,
+    /// Endpoint loopback (follows default-device changes) used while the
+    /// target is not running; `Some` exactly while in fallback mode.
+    fallback: Option<Box<dyn StreamSource>>,
     last_scan: Option<Instant>,
+    watch: LivenessWatch,
 }
 
 impl StreamSource for ExcludeSource {
@@ -338,24 +451,30 @@ impl StreamSource for ExcludeSource {
         self.last_scan = Some(Instant::now());
         match find_process(&self.target) {
             Some(pid) => {
-                self.fallback = false;
-                open_process_stream(
+                // Drops the endpoint follower (on this COM thread) if any.
+                self.fallback = None;
+                let stream = open_process_stream(
                     &self.target,
                     pid,
                     PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
                     channels,
-                )
+                    self.stop.as_ref(),
+                )?;
+                self.watch.arm(pid, stream.reopen.is_some());
+                Ok(stream)
             }
             None => {
-                self.fallback = true;
-                open_default_loopback(channels)
+                self.watch = LivenessWatch::default();
+                self.fallback
+                    .get_or_insert_with(loopback_source)
+                    .open(channels)
             }
         }
     }
 
     fn needs_reopen(&mut self) -> bool {
-        if !self.fallback {
-            return false;
+        if self.fallback.is_none() {
+            return self.watch.changed(&self.target);
         }
         let now = Instant::now();
         if self
@@ -367,12 +486,20 @@ impl StreamSource for ExcludeSource {
         self.last_scan = Some(now);
         find_process(&self.target).is_some()
     }
+
+    fn set_stop_handle(&mut self, stop: OwnedHandle) {
+        self.stop = Some(stop);
+    }
 }
 
 /// Captures only the target's process tree; survives restarts of
 /// `ProcessTarget::Executable` targets.
 pub(crate) fn include_source(target: ProcessTarget) -> Box<dyn StreamSource> {
-    Box::new(IncludeSource { target })
+    Box::new(IncludeSource {
+        target,
+        stop: None,
+        watch: LivenessWatch::default(),
+    })
 }
 
 /// Captures everything except the target's process tree. While the target is
@@ -385,8 +512,10 @@ pub(crate) fn include_source(target: ProcessTarget) -> Box<dyn StreamSource> {
 pub(crate) fn exclude_source(target: ProcessTarget) -> Box<dyn StreamSource> {
     Box::new(ExcludeSource {
         target,
-        fallback: false,
+        stop: None,
+        fallback: None,
         last_scan: None,
+        watch: LivenessWatch::default(),
     })
 }
 

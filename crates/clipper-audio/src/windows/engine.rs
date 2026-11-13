@@ -36,7 +36,7 @@ pub struct AudioCapture {
 }
 
 /// Current QPC time in 100 ns units.
-fn qpc_now_ticks() -> i64 {
+pub(super) fn qpc_now_ticks() -> i64 {
     let mut freq = 0i64;
     let mut counter = 0i64;
     // SAFETY: both pointers reference valid, live i64 locals.
@@ -90,6 +90,9 @@ impl AudioCapture {
             ) {
                 Ok(thread) => threads.push(thread),
                 Err(error) => {
+                    for thread in &threads {
+                        thread.signal_stop();
+                    }
                     for thread in threads {
                         thread.stop();
                     }
@@ -164,6 +167,10 @@ impl AudioCapture {
 
     fn stop_threads(&mut self) {
         if let Some(threads) = self.threads.take() {
+            // Signal all first so the threads wind down in parallel.
+            for thread in &threads {
+                thread.signal_stop();
+            }
             for thread in threads {
                 thread.stop();
             }

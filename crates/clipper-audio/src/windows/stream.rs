@@ -10,11 +10,12 @@ use windows::Win32::Foundation::{
     CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::Media::Audio::{
-    AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_E_DEVICE_IN_USE,
-    AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_E_RESOURCES_INVALIDATED, AUDCLNT_SHAREMODE_SHARED,
-    AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-    AUDCLNT_STREAMFLAGS_LOOPBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, IAudioCaptureClient,
-    IAudioClient, WAVEFORMATEX, WAVEFORMATEXTENSIBLE, WAVEFORMATEXTENSIBLE_0,
+    AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT,
+    AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR, AUDCLNT_E_DEVICE_IN_USE, AUDCLNT_E_DEVICE_INVALIDATED,
+    AUDCLNT_E_RESOURCES_INVALIDATED, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+    AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK,
+    AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, IAudioCaptureClient, IAudioClient, WAVEFORMATEX,
+    WAVEFORMATEXTENSIBLE, WAVEFORMATEXTENSIBLE_0,
 };
 use windows::Win32::Media::KernelStreaming::WAVE_FORMAT_EXTENSIBLE;
 use windows::Win32::Media::Multimedia::KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
@@ -25,8 +26,10 @@ use windows::Win32::System::Threading::{
 };
 use windows::core::{HRESULT, PCWSTR, w};
 
+use super::engine::qpc_now_ticks;
 use crate::mix;
 use crate::ring::{AudioProducer, PacketHeader};
+use crate::timeline::frames_to_ticks;
 use crate::types::{AudioError, AudioEvent, AudioLevels, FrameFlags, SAMPLE_RATE};
 
 /// Owned Win32 handle (event or process); closed on drop.
@@ -111,6 +114,11 @@ pub(crate) trait StreamSource: Send {
     fn needs_reopen(&mut self) -> bool {
         false
     }
+
+    /// Hands the source a duplicate of the thread's stop event, called once
+    /// before the first `open`, so a long blocking `open` (process loopback
+    /// activation) can be interrupted by stop. Default: ignored.
+    fn set_stop_handle(&mut self, _stop: OwnedHandle) {}
 }
 
 /// Scope guard: joins the COM MTA on this thread and leaves it on drop only
@@ -275,7 +283,9 @@ impl StreamThread {
         events: SyncSender<AudioEvent>,
     ) -> Result<Self, AudioError> {
         let stop = Arc::new(OwnedHandle::new_event(true)?);
-        let mut worker = Worker {
+        let mut source = source;
+        source.set_stop_handle(stop.duplicate()?);
+        let worker = Worker {
             track,
             channels,
             source,
@@ -285,6 +295,7 @@ impl StreamThread {
             stop: Arc::clone(&stop),
             overflow_frames: 0,
             overflow_reported: Instant::now(),
+            next_timestamp: None,
         };
         let thread = std::thread::Builder::new()
             .name(format!("clipper-audio-{track}"))
@@ -294,6 +305,12 @@ impl StreamThread {
             stop,
             thread: Some(thread),
         })
+    }
+
+    /// Signals stop without joining, so several threads can wind down in
+    /// parallel before `stop` joins each.
+    pub fn signal_stop(&self) {
+        self.stop.signal();
     }
 
     /// Signals stop and joins the thread.
@@ -320,11 +337,21 @@ enum Exit {
     Stop,
     /// Default device changed, source asked for a reopen, or device lost.
     Reopen,
+    /// Draining failed (carries the HRESULT text); reopen.
+    Drain(String),
     /// Unexpected API failure; reopen after a pause.
     Fault,
 }
 
 const RETRY_INTERVAL: Duration = Duration::from_secs(1);
+/// A session shorter than this is "short": the next open waits first.
+const MIN_SESSION: Duration = Duration::from_secs(1);
+/// Pause before reopening after a short session (interruptible by stop).
+const REOPEN_BACKOFF: Duration = Duration::from_millis(500);
+/// Without a packet for this long the published levels fall back to zero.
+const LEVEL_IDLE: Duration = Duration::from_millis(200);
+/// Extra attempts for a non-`SourceUnavailable` error on the first open.
+const FIRST_OPEN_RETRIES: u32 = 3;
 
 struct Worker {
     track: usize,
@@ -336,6 +363,9 @@ struct Worker {
     stop: Arc<OwnedHandle>,
     overflow_frames: u64,
     overflow_reported: Instant,
+    /// Predicted timestamp of the next packet (previous + its duration), used
+    /// when WASAPI reports a timestamp error. Reset on every open.
+    next_timestamp: Option<i64>,
 }
 
 /// MMCSS registration, reverted on drop.
@@ -364,19 +394,32 @@ impl Worker {
         let _ = self.events.try_send(event);
     }
 
-    /// Waits up to `RETRY_INTERVAL` for stop; true when stop was signaled.
-    fn wait_stop(&self) -> bool {
+    /// Waits up to `duration` for stop; true when stop was signaled.
+    fn wait_for(&self, duration: Duration) -> bool {
         // SAFETY: valid event handle owned by `self.stop`.
-        let result = unsafe { WaitForSingleObject(self.stop.0, RETRY_INTERVAL.as_millis() as u32) };
+        let result = unsafe { WaitForSingleObject(self.stop.0, duration.as_millis() as u32) };
         result == WAIT_OBJECT_0
     }
 
-    fn run(&mut self) {
+    /// Waits up to `RETRY_INTERVAL` for stop; true when stop was signaled.
+    fn wait_stop(&self) -> bool {
+        self.wait_for(RETRY_INTERVAL)
+    }
+
+    /// Thread entry. Every COM object (source, streams) is owned by
+    /// `run_in_com`, which consumes `self`, so all of them are released
+    /// before `_com` calls `CoUninitialize`.
+    fn run(self) {
         let _com = ComGuard::init();
+        self.run_in_com();
+    }
+
+    fn run_in_com(mut self) {
         let _mmcss = Mmcss::join_pro_audio();
         let mut first = true;
+        let mut first_failures = 0u32;
         let mut lost_reported = false;
-        let mut device_changed = false;
+        let mut last_description: Option<String> = None;
         loop {
             let stream = match self.source.open(self.channels) {
                 Ok(stream) => stream,
@@ -384,11 +427,18 @@ impl Worker {
                     let reason = match error {
                         AudioError::SourceUnavailable(reason) => reason,
                         other if first => {
-                            self.emit(AudioEvent::Failed {
-                                track: self.track,
-                                message: other.to_string(),
-                            });
-                            return;
+                            first_failures += 1;
+                            if first_failures > FIRST_OPEN_RETRIES {
+                                self.emit(AudioEvent::Failed {
+                                    track: self.track,
+                                    message: other.to_string(),
+                                });
+                                return;
+                            }
+                            if self.wait_stop() {
+                                return;
+                            }
+                            continue;
                         }
                         other => other.to_string(),
                     };
@@ -423,22 +473,43 @@ impl Worker {
                 continue;
             }
             lost_reported = false;
+            self.next_timestamp = None;
             self.emit(AudioEvent::TrackStarted { track: self.track });
-            if device_changed {
+            if last_description
+                .as_deref()
+                .is_some_and(|previous| previous != stream.description)
+            {
                 self.emit(AudioEvent::DeviceChanged {
                     track: self.track,
                     device: stream.description.clone(),
                 });
             }
+            last_description = Some(stream.description.clone());
+            let started = Instant::now();
             let exit = self.stream_loop(&stream);
             // SAFETY: the stream was started; errors on Stop are irrelevant.
             let _ = unsafe { stream.client.Stop() };
             drop(stream);
             match exit {
                 Exit::Stop => return,
-                Exit::Reopen => device_changed = true,
+                Exit::Reopen => {
+                    if started.elapsed() < MIN_SESSION && self.wait_for(REOPEN_BACKOFF) {
+                        return;
+                    }
+                }
+                Exit::Drain(reason) => {
+                    if !lost_reported {
+                        lost_reported = true;
+                        self.emit(AudioEvent::SourceLost {
+                            track: self.track,
+                            reason,
+                        });
+                    }
+                    if started.elapsed() < MIN_SESSION && self.wait_for(REOPEN_BACKOFF) {
+                        return;
+                    }
+                }
                 Exit::Fault => {
-                    device_changed = true;
                     if self.wait_stop() {
                         return;
                     }
@@ -457,16 +528,27 @@ impl Worker {
             None => 2,
         };
         let mut last_poll = Instant::now();
+        let mut last_packet = Instant::now();
+        let mut levels_idle = false;
         loop {
             // SAFETY: all handles are valid events that outlive this call
             // (stop is owned by self, the others by `stream`).
-            let wait = unsafe { WaitForMultipleObjects(&handles[..count], false, 1000) };
-            if wait != WAIT_TIMEOUT {
+            let wait = unsafe {
+                WaitForMultipleObjects(&handles[..count], false, LEVEL_IDLE.as_millis() as u32)
+            };
+            if wait == WAIT_TIMEOUT {
+                if !levels_idle && last_packet.elapsed() >= LEVEL_IDLE {
+                    levels_idle = true;
+                    self.levels.store(AudioLevels::default());
+                }
+            } else {
                 match wait.0.wrapping_sub(WAIT_OBJECT_0.0) {
                     0 => return Exit::Stop,
                     1 => {
-                        if self.drain(stream).is_err() {
-                            return Exit::Reopen;
+                        last_packet = Instant::now();
+                        levels_idle = false;
+                        if let Err(reason) = self.drain(stream) {
+                            return Exit::Drain(reason);
                         }
                     }
                     2 => return Exit::Reopen,
@@ -483,12 +565,14 @@ impl Worker {
         }
     }
 
-    /// Moves every pending packet into the ring. `Err` = stream unusable.
-    fn drain(&mut self, stream: &OpenedStream) -> Result<(), ()> {
+    /// Moves every pending packet into the ring. `Err` = stream unusable,
+    /// with the failing call and HRESULT text.
+    fn drain(&mut self, stream: &OpenedStream) -> Result<(), String> {
         let channels = usize::from(stream.channels);
         loop {
             // SAFETY: the capture client belongs to a started stream.
-            let pending = unsafe { stream.capture.GetNextPacketSize() }.map_err(|_| ())?;
+            let pending = unsafe { stream.capture.GetNextPacketSize() }
+                .map_err(|e| format!("GetNextPacketSize: {e}"))?;
             if pending == 0 {
                 return Ok(());
             }
@@ -503,18 +587,30 @@ impl Worker {
                     .capture
                     .GetBuffer(&mut data, &mut frames, &mut flags, None, Some(&mut qpc))
             }
-            .map_err(|_| ())?;
+            .map_err(|e| format!("GetBuffer: {e}"))?;
             if frames == 0 {
                 // AUDCLNT_S_BUFFER_EMPTY: nothing acquired, nothing to release.
                 return Ok(());
             }
             let silent = flags & (AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0 || data.is_null();
+            let mut discontinuity = flags & (AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32) != 0;
+            // A flagged or zero QPC position is unusable: continue from the
+            // previous packet's end (or "now" for the very first packet).
+            let timestamp =
+                if flags & (AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32) != 0 || qpc == 0 {
+                    discontinuity = true;
+                    self.next_timestamp.unwrap_or_else(qpc_now_ticks)
+                } else {
+                    qpc as i64
+                };
+            self.next_timestamp =
+                Some(timestamp.saturating_add(frames_to_ticks(i64::from(frames))));
             let header = PacketHeader {
-                timestamp: qpc as i64,
+                timestamp,
                 frames,
                 flags: FrameFlags {
                     silent,
-                    discontinuity: flags & (AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32) != 0,
+                    discontinuity,
                 },
             };
             let pushed = if silent {
@@ -531,7 +627,8 @@ impl Worker {
                 self.producer.push(header, Some(samples))
             };
             // SAFETY: releases exactly the frames acquired by GetBuffer.
-            unsafe { stream.capture.ReleaseBuffer(frames) }.map_err(|_| ())?;
+            unsafe { stream.capture.ReleaseBuffer(frames) }
+                .map_err(|e| format!("ReleaseBuffer: {e}"))?;
             if !pushed {
                 self.overflow_frames += u64::from(frames);
                 self.report_overflow();

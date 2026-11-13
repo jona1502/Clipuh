@@ -22,6 +22,19 @@ impl ProcessTarget {
     pub fn discord() -> Self {
         Self::Executable("Discord.exe".to_owned())
     }
+
+    /// Whether both targets certainly name the same process. Executable names
+    /// compare ASCII case-insensitively, pids exactly. A `Pid` and an
+    /// `Executable` are never equal here: the platform-independent planner
+    /// cannot resolve an exe name to a pid, so the same process selected both
+    /// ways is not detected.
+    pub fn same_as(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Pid(a), Self::Pid(b)) => a == b,
+            (Self::Executable(a), Self::Executable(b)) => a.eq_ignore_ascii_case(b),
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]

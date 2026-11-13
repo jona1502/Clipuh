@@ -18,6 +18,12 @@ pub const TOLERANCE_FRAMES: i64 = 480;
 /// seek), not drift; they reset the drift estimator.
 const DISCONTINUITY_FRAMES: i64 = 4_800;
 
+/// Largest silence block `align` emits for one packet (10 s at 48 kHz). A
+/// larger gap (e.g. a bogus far-future timestamp) is padded only up to this
+/// cap so one bad packet cannot allocate minutes of silence downstream; the
+/// remaining offset shows up as `max_drift_frames` and is not recovered.
+pub const MAX_PAD_FRAMES: u64 = 480_000;
+
 /// Minimum span of audio (1 s) before `drift_ppm` is reported.
 const MIN_DRIFT_SPAN_FRAMES: f64 = SAMPLE_RATE as f64;
 
@@ -108,7 +114,8 @@ impl TrackTimeline {
     ///
     /// Expected position is `ticks_to_frames(timestamp - origin)`; the packet
     /// is then padded, skipped or left alone per [`TOLERANCE_FRAMES`], and
-    /// the written position advances by `pad + frames - skip`.
+    /// the written position advances by `pad + frames - skip`. The pad never
+    /// exceeds [`MAX_PAD_FRAMES`].
     pub fn align(&mut self, timestamp: i64, frames: u64) -> Alignment {
         let delta = i128::from(timestamp) - i128::from(self.origin);
         let expected = ticks_to_frames_wide(delta);
@@ -118,7 +125,7 @@ impl TrackTimeline {
 
         let mut a = Alignment::default();
         if diff > TOLERANCE_FRAMES {
-            a.pad_frames = diff as u64;
+            a.pad_frames = (diff as u64).min(MAX_PAD_FRAMES);
         } else if diff < -TOLERANCE_FRAMES {
             a.skip_frames = diff.unsigned_abs().min(frames);
         }
@@ -289,6 +296,22 @@ mod tests {
         );
         assert_eq!(t.position(), 48_000 + 4_800 - 2_400);
         assert_eq!(t.stats().skipped_frames, 2_400);
+    }
+
+    #[test]
+    fn pad_is_capped_to_max() {
+        let mut t = TrackTimeline::new(ORIGIN);
+        let a = t.align(ts(10 * 48_000 * 60), PKT);
+        assert_eq!(a.pad_frames, MAX_PAD_FRAMES);
+        assert_eq!(t.position(), MAX_PAD_FRAMES + PKT);
+        assert_eq!(t.stats().padded_frames, MAX_PAD_FRAMES);
+    }
+
+    #[test]
+    fn pad_at_cap_is_not_reduced() {
+        let mut t = TrackTimeline::new(ORIGIN);
+        let a = t.align(ts(MAX_PAD_FRAMES as i64), PKT);
+        assert_eq!(a.pad_frames, MAX_PAD_FRAMES);
     }
 
     #[test]
