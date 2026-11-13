@@ -1,269 +1,218 @@
 use clipper_core::recording::{
     CaptureSource, QualityProfile, RecorderCommand, RecordingStats, SourceKind,
 };
-use clipper_storage::{AppConfig, VIDEO_FPS, VIDEO_RESOLUTIONS};
+use clipper_storage::config::ReplayMode;
+use clipper_storage::{VIDEO_FPS, VIDEO_RESOLUTIONS};
 use gpui::prelude::*;
-use gpui::{Context, Div, FontWeight, div, px, rgb};
+use gpui::{AnyElement, Context, Div, FontWeight, SharedString, div, px, rgb};
 
 use super::ClipperWindow;
-use crate::components::{ButtonKind, button, empty_state, list_row, pill};
+use crate::components::{
+    ButtonVariant, Tone, button, chip, empty_state, list_item, panel, property_row, section_header,
+    stat_tile, status_dot, value_text,
+};
 use crate::state::{Phase, format_elapsed, resolution_label};
 use crate::theme;
-
-const RED: u32 = 0xe5484d;
 
 pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
     div()
         .flex()
         .flex_col()
         .gap_6()
-        .child(recording_panel(window, cx))
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .child(
-                    div()
-                        .text_lg()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child("Recent clips"),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(theme::MUTED))
-                        .child("Your library is empty"),
-                ),
+        .children(
+            window
+                .recording
+                .error
+                .clone()
+                .map(|message| error_banner(message, cx)),
         )
-        .child(empty_state(
-            "Nothing to replay yet",
-            "When clips are available, your latest highlights will appear here.",
-            "◌",
-        ))
+        .child(recording(window, cx))
+        .child(sources(window, cx))
+        .child(capture_settings(window, cx))
+        .child(overview(window))
+        .child(performance(window))
+        .child(recent_clips())
 }
 
-fn section_label(text: &'static str) -> Div {
+fn section(title: &'static str, note: Option<SharedString>) -> Div {
     div()
-        .text_xs()
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_color(rgb(theme::MUTED))
-        .child(text)
-}
-
-fn recording_panel(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
-    let state = &window.recording;
-    let mut panel = div()
-        .w_full()
-        .rounded_2xl()
-        .border_1()
-        .border_color(rgb(theme::BORDER))
-        .bg(rgb(theme::SURFACE))
-        .p_6()
         .flex()
         .flex_col()
-        .gap_5();
-
-    if let Some(message) = &state.error {
-        panel = panel.child(error_banner(message.clone(), cx));
-    }
-
-    panel
-        .child(control_row(window, cx))
-        .child(status_row(window))
-        .child(source_picker(window, cx))
-        .child(settings_pills(window, cx))
+        .gap_3()
+        .child(section_header(title, note))
 }
 
-fn error_banner(message: String, cx: &mut Context<ClipperWindow>) -> impl IntoElement {
-    div()
-        .id("error-banner")
-        .w_full()
+fn error_banner(message: String, cx: &mut Context<ClipperWindow>) -> Div {
+    panel()
         .px_4()
         .py_3()
-        .rounded_lg()
-        .border_1()
-        .border_color(rgb(RED))
-        .bg(rgb(0x2a1517))
-        .cursor_pointer()
         .flex()
         .items_center()
-        .justify_between()
-        .gap_4()
-        .on_click(cx.listener(|this, _, _, cx| {
-            this.recording.dismiss_error();
-            cx.notify();
-        }))
+        .gap_3()
+        .border_color(rgb(theme::RECORDING))
+        .child(status_dot(Tone::Danger))
         .child(div().flex_1().text_sm().child(message))
         .child(
-            div()
-                .text_xs()
-                .text_color(rgb(theme::MUTED))
-                .child("Click to dismiss"),
+            button("dismiss-error", "Dismiss", ButtonVariant::Ghost, None, true).on_click(
+                cx.listener(|this, _, _, cx| {
+                    this.recording.dismiss_error();
+                    cx.notify();
+                }),
+            ),
         )
 }
 
-fn control_row(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
+fn recording(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
     let state = &window.recording;
-    let (label, kind, enabled) = match state.phase {
-        Phase::Idle => ("Start recording", ButtonKind::Primary, state.can_start()),
-        Phase::Starting => ("Starting...", ButtonKind::Primary, false),
-        Phase::Recording => ("Stop recording", ButtonKind::Danger, state.can_stop()),
-        Phase::Stopping => ("Saving...", ButtonKind::Danger, false),
+    let (label, variant, enabled) = match state.phase {
+        Phase::Idle => ("Start recording", ButtonVariant::Primary, state.can_start()),
+        Phase::Starting => ("Starting…", ButtonVariant::Primary, false),
+        Phase::Recording => ("Stop recording", ButtonVariant::Danger, state.can_stop()),
+        Phase::Stopping => ("Saving…", ButtonVariant::Danger, false),
     };
-    let recording = state.phase == Phase::Recording;
-    let on_click = cx.listener(move |this, _, _, cx| {
-        if recording {
-            if this.send(RecorderCommand::StopRecording) {
-                this.recording.begin_stop();
+    let stop = state.phase == Phase::Recording;
+    let toggle = button("record-toggle", label, variant, None, enabled).when(enabled, |this| {
+        this.on_click(cx.listener(move |this, _, _, cx| {
+            if stop {
+                if this.send(RecorderCommand::StopRecording) {
+                    this.recording.begin_stop();
+                }
+            } else {
+                this.start_recording();
             }
-        } else {
-            this.start_recording();
-        }
-        cx.notify();
+            cx.notify();
+        }))
     });
 
-    let mut row = div().flex().items_center().gap_4().child(button(
-        "record-toggle",
-        label,
-        kind,
-        enabled,
-        on_click,
-    ));
-    if let Some(hint) = state.start_hint() {
-        row = row.child(div().text_xs().text_color(rgb(theme::MUTED)).child(hint));
-    }
-    row
-}
+    let (title, detail): (SharedString, Option<SharedString>) = match state.phase {
+        Phase::Recording => (
+            format_elapsed(state.stats.elapsed).into(),
+            state.encoder.as_ref().map(|encoder| encoder.clone().into()),
+        ),
+        Phase::Idle => match &state.finished {
+            Some(finished) => (
+                "Recording saved".into(),
+                Some(finished.path.display().to_string().into()),
+            ),
+            None => (
+                state.status_label().into(),
+                state.start_hint().map(Into::into),
+            ),
+        },
+        Phase::Starting | Phase::Stopping => (state.status_label().into(), None),
+    };
+    let tone = match state.phase {
+        Phase::Idle if state.finished.is_some() => Tone::Success,
+        Phase::Idle => Tone::Neutral,
+        Phase::Starting => Tone::Warning,
+        Phase::Recording | Phase::Stopping => Tone::Danger,
+    };
 
-fn status_row(window: &ClipperWindow) -> Div {
-    let state = &window.recording;
-    let mut row = div()
-        .flex()
-        .flex_wrap()
-        .items_center()
-        .gap_x_5()
-        .gap_y_2()
-        .text_sm();
-
-    match state.phase {
-        Phase::Idle => {
-            row = row.child(
+    section("Recording", None).child(
+        panel()
+            .px_4()
+            .py_3()
+            .flex()
+            .items_center()
+            .gap_3()
+            .child(status_dot(tone))
+            .child(
                 div()
-                    .text_color(rgb(theme::MUTED))
-                    .child(state.status_label()),
-            );
-            if let Some(finished) = &state.finished {
-                row = row
-                    .child(div().child(format!("Saved {}", finished.path.display())))
-                    .child(stats_text(&finished.stats));
-            }
-        }
-        Phase::Starting | Phase::Stopping => {
-            row = row.child(
-                div()
-                    .text_color(rgb(theme::MUTED))
-                    .child(state.status_label()),
-            );
-        }
-        Phase::Recording => {
-            row = row
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(div().size(px(9.)).rounded_full().bg(rgb(RED)))
-                        .child(
-                            div()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(format_elapsed(state.stats.elapsed)),
-                        ),
-                )
-                .child(stats_text(&state.stats));
-            if let Some(encoder) = &state.encoder {
-                row = row.child(
-                    div()
-                        .text_color(rgb(theme::MUTED))
-                        .child(format!("Encoder: {encoder}")),
-                );
-            }
-        }
-    }
-    row
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(title),
+                    )
+                    .children(detail.map(|detail| {
+                        div()
+                            .text_xs()
+                            .text_color(rgb(theme::TEXT_TERTIARY))
+                            .truncate()
+                            .child(detail)
+                    })),
+            )
+            .child(toggle),
+    )
 }
 
-fn stats_text(stats: &RecordingStats) -> Div {
-    div().text_color(rgb(theme::MUTED)).child(format!(
-        "{:.0} fps \u{b7} {} frames \u{b7} {} dropped",
-        stats.current_fps, stats.frames_encoded, stats.frames_dropped
-    ))
-}
-
-fn source_picker(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
+fn sources(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
     let state = &window.recording;
     let enabled = state.settings_enabled();
-    let group = |kind: SourceKind, title: &'static str, cx: &mut Context<ClipperWindow>| {
-        let rows: Vec<_> = state
-            .sources
-            .iter()
-            .filter(|s| s.kind == kind)
-            .map(|s| source_row(s, state.selected == Some((s.kind, s.id)), enabled, cx))
-            .collect();
-        div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(section_label(title))
-            .children(rows)
-    };
+    let refresh = button(
+        "refresh-sources",
+        "Refresh",
+        ButtonVariant::Ghost,
+        None,
+        enabled,
+    )
+    .when(enabled, |this| {
+        this.on_click(cx.listener(|this, _, _, cx| {
+            this.send(RecorderCommand::RefreshSources);
+            cx.notify();
+        }))
+    });
 
     let mut list = div()
         .id("source-list")
-        .max_h(px(200.))
+        .max_h(px(240.))
         .overflow_y_scroll()
+        .p_1()
         .flex()
         .flex_col()
-        .gap_3();
-    list = if state.sources.is_empty() {
-        list.child(
-            div()
-                .text_xs()
-                .text_color(rgb(theme::MUTED))
-                .child("No sources found. Try Refresh."),
-        )
+        .gap_0p5();
+    if state.sources.is_empty() {
+        list = list.child(empty_state(
+            "▭",
+            "No sources found",
+            "Open the game or window you want to record, then refresh.",
+        ));
     } else {
-        list.child(group(SourceKind::Monitor, "Displays", cx))
-            .child(group(SourceKind::Window, "Windows", cx))
-    };
+        for (kind, title) in [
+            (SourceKind::Monitor, "Displays"),
+            (SourceKind::Window, "Windows"),
+        ] {
+            list = list
+                .child(
+                    div()
+                        .px_2()
+                        .pt_2()
+                        .pb_1()
+                        .text_xs()
+                        .text_color(rgb(theme::TEXT_TERTIARY))
+                        .child(title),
+                )
+                .children(
+                    state
+                        .sources
+                        .iter()
+                        .filter(|source| source.kind == kind)
+                        .map(|source| {
+                            let selected = state.selected == Some((source.kind, source.id));
+                            source_row(source, selected, enabled, cx)
+                        }),
+                );
+        }
+    }
 
     div()
         .flex()
         .flex_col()
-        .gap_2()
+        .gap_3()
         .child(
             div()
                 .flex()
                 .items_center()
                 .justify_between()
-                .child(
-                    div()
-                        .text_sm()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child("Source"),
-                )
-                .child(button(
-                    "refresh-sources",
-                    "Refresh",
-                    ButtonKind::Subtle,
-                    enabled,
-                    cx.listener(|this, _, _, cx| {
-                        this.send(RecorderCommand::RefreshSources);
-                        cx.notify();
-                    }),
-                )),
+                .child(section_header("Source", None))
+                .child(refresh),
         )
-        .child(list)
+        .child(panel().child(list))
 }
 
 fn source_row(
@@ -271,86 +220,198 @@ fn source_row(
     selected: bool,
     enabled: bool,
     cx: &mut Context<ClipperWindow>,
-) -> impl IntoElement + use<> {
+) -> AnyElement {
     let (kind, id) = (source.kind, source.id);
-    let prefix = match kind {
-        SourceKind::Monitor => "mon",
-        SourceKind::Window => "win",
+    let (prefix, glyph) = match kind {
+        SourceKind::Monitor => ("mon", "▭"),
+        SourceKind::Window => ("win", "◰"),
     };
-    list_row(
-        (prefix, id),
-        source.name.clone(),
-        format!("{}x{}", source.width, source.height),
-        selected,
-        enabled,
-        cx.listener(move |this, _, _, cx| {
-            this.recording.select(kind, id);
-            cx.notify();
-        }),
-    )
+    list_item((prefix, id), glyph, source.name.clone(), None, selected)
+        .child(
+            div()
+                .flex_none()
+                .text_xs()
+                .text_color(rgb(theme::TEXT_TERTIARY))
+                .child(format!("{}×{}", source.width, source.height)),
+        )
+        .map(|this| {
+            if enabled {
+                this.on_click(cx.listener(move |this, _, _, cx| {
+                    this.recording.select(kind, id);
+                    cx.notify();
+                }))
+            } else {
+                this.cursor_default().opacity(0.45)
+            }
+        })
+        .into_any_element()
 }
 
-fn settings_pills(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
+fn capture_settings(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
     let enabled = window.recording.settings_enabled();
-    let config: &AppConfig = &window.config;
+    let config = &window.config;
     let current = (config.video.width, config.video.height);
 
     let resolutions = VIDEO_RESOLUTIONS.into_iter().map(|(w, h)| {
-        pill(
-            ("res", u64::from(h)),
+        chip(
+            ("res", h),
             resolution_label(w, h),
             current == (w, h),
             enabled,
-            cx.listener(move |this, _, _, cx| {
+        )
+        .when(enabled, |this| {
+            this.on_click(cx.listener(move |this, _, _, cx| {
                 this.config.video.width = w;
                 this.config.video.height = h;
                 this.persist_config(cx);
-            }),
-        )
+            }))
+        })
     });
     let fps = VIDEO_FPS.into_iter().map(|value| {
-        pill(
-            ("fps", u64::from(value)),
+        chip(
+            ("fps", value),
             format!("{value} fps"),
             config.video.fps == value,
             enabled,
-            cx.listener(move |this, _, _, cx| {
+        )
+        .when(enabled, |this| {
+            this.on_click(cx.listener(move |this, _, _, cx| {
                 this.config.video.fps = value;
                 this.persist_config(cx);
-            }),
-        )
+            }))
+        })
     });
+    let current_quality = QualityProfile::from(config.recording.quality);
     let quality = QualityProfile::ALL
         .into_iter()
         .enumerate()
         .map(|(index, profile)| {
-            pill(
-                ("quality", index as u64),
+            chip(
+                ("quality", index),
                 profile.label(),
-                QualityProfile::from(config.recording.quality) == profile,
+                current_quality == profile,
                 enabled,
-                cx.listener(move |this, _, _, cx| {
+            )
+            .when(enabled, |this| {
+                this.on_click(cx.listener(move |this, _, _, cx| {
                     this.config.recording.quality = profile.into();
                     this.persist_config(cx);
-                }),
-            )
+                }))
+            })
         });
 
-    let group = |title: &'static str| {
+    let chips = |items: Vec<gpui::Stateful<Div>>| div().flex().gap_1p5().children(items);
+    let note = (!enabled).then(|| "Locked while recording".into());
+
+    section("Capture settings", note).child(
+        panel()
+            .child(property_row(
+                "Resolution",
+                None,
+                chips(resolutions.collect()),
+                true,
+            ))
+            .child(property_row(
+                "Frame rate",
+                None,
+                chips(fps.collect()),
+                false,
+            ))
+            .child(property_row(
+                "Quality",
+                None,
+                chips(quality.collect()),
+                false,
+            )),
+    )
+}
+
+fn overview(window: &ClipperWindow) -> Div {
+    let config = &window.config;
+    let video = &config.video;
+    let mode = match config.replay.mode {
+        ReplayMode::Hybrid => "Hybrid",
+    };
+    let encoder = window
+        .recording
+        .encoder
+        .clone()
+        .unwrap_or_else(|| "Auto".to_owned());
+    let mb_per_minute = video.bitrate_mbps * 60 / 8;
+
+    section("Configuration", None).child(
         div()
             .flex()
-            .items_center()
-            .gap_2()
-            .child(div().w(px(84.)).child(section_label(title)))
-    };
+            .gap_3()
+            .child(stat_tile(
+                "Encoder",
+                "H.264",
+                format!("{encoder} · {} Mbps", video.bitrate_mbps),
+            ))
+            .child(stat_tile(
+                "Storage",
+                format!("~{mb_per_minute} MB/min"),
+                "Estimate from bitrate",
+            ))
+            .child(stat_tile(
+                "Replay buffer",
+                format!("{} s", config.replay.duration_seconds),
+                format!("{mode} · not available yet"),
+            )),
+    )
+}
 
-    div()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .child(group("RESOLUTION").children(resolutions))
-        .child(group("FRAME RATE").children(fps))
-        .child(group("QUALITY").children(quality))
+fn performance(window: &ClipperWindow) -> Div {
+    let state = &window.recording;
+    let perf = &window.config.performance;
+    // Live stats while recording; otherwise the last finished run, if any.
+    let (stats, note): (Option<&RecordingStats>, &'static str) = match state.phase {
+        Phase::Recording => (Some(&state.stats), "Live"),
+        _ => match &state.finished {
+            Some(finished) => (Some(&finished.stats), "Last recording"),
+            None => (None, "No recording yet"),
+        },
+    };
+    let metric = |value: Option<String>| value_text(value.unwrap_or_else(|| "—".to_owned()));
+
+    section("Performance", Some(note.into())).child(
+        panel()
+            .child(property_row(
+                "Frame rate",
+                None,
+                metric(stats.map(|s| format!("{:.0} fps", s.current_fps))),
+                true,
+            ))
+            .child(property_row(
+                "Frames encoded",
+                None,
+                metric(stats.map(|s| s.frames_encoded.to_string())),
+                false,
+            ))
+            .child(property_row(
+                "Dropped frames",
+                Some("Lost when the encoder falls behind.".into()),
+                metric(stats.map(|s| s.frames_dropped.to_string())),
+                false,
+            ))
+            .child(property_row(
+                "Queues",
+                Some("Command and event capacity.".into()),
+                value_text(format!(
+                    "{} / {}",
+                    perf.command_queue_capacity, perf.event_queue_capacity
+                )),
+                false,
+            )),
+    )
+}
+
+fn recent_clips() -> Div {
+    section("Recent clips", Some("Library is empty".into())).child(panel().child(empty_state(
+        "◌",
+        "Nothing to replay yet",
+        "When clips are available, your latest highlights will appear here.",
+    )))
 }
 
 impl ClipperWindow {

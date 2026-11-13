@@ -50,6 +50,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     Application::new().run(move |cx: &mut App| {
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.bind_keys([KeyBinding::new("ctrl-q", Quit, None)]);
+        clipper_ui::bind_keys(cx);
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
                 cx.quit();
