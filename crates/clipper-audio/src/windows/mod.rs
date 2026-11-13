@@ -1,1 +1,12 @@
-//! Reserved for the future audio windows implementation.
+//! WASAPI backends (shared mode, event-driven) for Windows 10/11.
+#![allow(unsafe_code)]
+
+mod devices;
+mod endpoint;
+mod engine;
+mod process;
+mod stream;
+
+pub use devices::list_devices;
+pub use engine::{AudioCapture, CaptureSummary};
+pub use process::{capabilities, find_process};

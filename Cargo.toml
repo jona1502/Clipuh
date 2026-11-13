@@ -16,8 +16,10 @@ clipper-platform = { path = "crates/clipper-platform" }
 clipper-capture = { path = "crates/clipper-capture" }
 clipper-encoder = { path = "crates/clipper-encoder" }
 clipper-recorder = { path = "crates/clipper-recorder" }
+clipper-audio = { path = "crates/clipper-audio" }
 # Same versions GPUI already pulls in, so no duplicate compilation.
 async-channel = "2.5"
+rtrb = "0.4.1"
 windows = "0.61.3"
 windows-core = "0.61.2"
 gpui ={ version = "=0.2.2", default-features = false, features = ["windows-manifest"] }
