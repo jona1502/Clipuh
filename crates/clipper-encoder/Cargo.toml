@@ -7,6 +7,7 @@ publish.workspace = true
 
 [dependencies]
 clipper-core.workspace = true
+clipper-replay = { path = "../clipper-replay" }
 
 [target.'cfg(windows)'.dependencies]
 clipper-platform.workspace = true

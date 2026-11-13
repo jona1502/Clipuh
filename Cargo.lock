@@ -728,6 +728,7 @@ version = "0.1.0"
 dependencies = [
  "clipper-core",
  "clipper-platform",
+ "clipper-replay",
  "windows",
  "windows-core",
 ]
