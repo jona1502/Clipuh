@@ -171,7 +171,7 @@ struct ToastView {
     open_clip: bool,
 }
 
-fn run_explorer(arg: impl AsRef<std::ffi::OsStr>) {
+pub(crate) fn run_explorer(arg: impl AsRef<std::ffi::OsStr>) {
     if let Err(err) = Command::new("explorer").arg(arg).spawn() {
         eprintln!("notifications: explorer failed: {err}");
     }
