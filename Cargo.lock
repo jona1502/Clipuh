@@ -684,7 +684,9 @@ dependencies = [
 name = "clipper-app"
 version = "0.1.0"
 dependencies = [
+ "async-channel 2.5.0",
  "clipper-core",
+ "clipper-platform",
  "clipper-recorder",
  "clipper-storage",
  "clipper-ui",
@@ -734,6 +736,8 @@ dependencies = [
 name = "clipper-platform"
 version = "0.1.0"
 dependencies = [
+ "async-channel 2.5.0",
+ "clipper-core",
  "windows",
 ]
 
@@ -767,9 +771,12 @@ dependencies = [
 name = "clipper-ui"
 version = "0.1.0"
 dependencies = [
+ "async-channel 2.5.0",
  "clipper-core",
+ "clipper-platform",
  "clipper-storage",
  "gpui",
+ "raw-window-handle",
 ]
 
 [[package]]
