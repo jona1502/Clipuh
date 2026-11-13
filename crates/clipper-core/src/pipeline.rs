@@ -30,6 +30,14 @@ impl FramePacer {
         }
     }
 
+    /// Shares the audio recorder QPC origin instead of rebasing the first frame.
+    pub fn with_origin(fps: u32, origin: i64) -> Self {
+        Self {
+            origin: Some(origin),
+            ..Self::new(fps)
+        }
+    }
+
     /// Nominal frame duration in 100 ns ticks.
     pub fn interval(&self) -> i64 {
         self.interval
@@ -154,6 +162,13 @@ mod tests {
         let mut pacer = FramePacer::new(60);
         assert_eq!(pacer.accept(100 * MS), Some(0));
         assert_eq!(pacer.accept(50 * MS), None);
+    }
+
+    #[test]
+    fn shared_audio_origin_preserves_real_video_start_delay() {
+        let mut pacer = FramePacer::with_origin(60, 5_000_000);
+        assert_eq!(pacer.accept(5_200_000), Some(200_000));
+        assert_eq!(pacer.accept(4_900_000), None);
     }
 
     #[test]

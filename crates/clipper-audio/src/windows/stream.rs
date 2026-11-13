@@ -247,12 +247,17 @@ pub(crate) fn init_capture_client(
 pub(crate) struct LevelCell {
     peak: AtomicU32,
     rms: AtomicU32,
+    source_failed: AtomicU32,
 }
 
 impl LevelCell {
     pub fn store(&self, levels: AudioLevels) {
         self.peak.store(levels.peak.to_bits(), Ordering::Relaxed);
         self.rms.store(levels.rms.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn source_failed(&self) -> bool {
+        self.source_failed.load(Ordering::Acquire) != 0
     }
 
     pub fn load(&self) -> AudioLevels {
@@ -274,6 +279,7 @@ impl StreamThread {
     /// "Pro Audio" (best effort), opens `source`, waits on its event, pushes
     /// packets into `producer`, stores levels, reports `events` with
     /// `try_send` only. Reopens on device loss / reopen signal.
+    #[cfg(test)]
     pub fn spawn(
         track: usize,
         channels: u16,
@@ -281,6 +287,18 @@ impl StreamThread {
         producer: AudioProducer,
         levels: Arc<LevelCell>,
         events: SyncSender<AudioEvent>,
+    ) -> Result<Self, AudioError> {
+        Self::spawn_with_wake(track, channels, source, producer, levels, events, None)
+    }
+
+    pub fn spawn_with_wake(
+        track: usize,
+        channels: u16,
+        source: Box<dyn StreamSource>,
+        producer: AudioProducer,
+        levels: Arc<LevelCell>,
+        events: SyncSender<AudioEvent>,
+        wake: Option<SyncSender<()>>,
     ) -> Result<Self, AudioError> {
         let stop = Arc::new(OwnedHandle::new_event(true)?);
         let mut source = source;
@@ -292,6 +310,7 @@ impl StreamThread {
             producer,
             levels,
             events,
+            wake,
             stop: Arc::clone(&stop),
             overflow_frames: 0,
             overflow_reported: Instant::now(),
@@ -360,6 +379,7 @@ struct Worker {
     producer: AudioProducer,
     levels: Arc<LevelCell>,
     events: SyncSender<AudioEvent>,
+    wake: Option<SyncSender<()>>,
     stop: Arc<OwnedHandle>,
     overflow_frames: u64,
     overflow_reported: Instant,
@@ -391,7 +411,16 @@ impl Drop for Mmcss {
 
 impl Worker {
     fn emit(&self, event: AudioEvent) {
+        if matches!(
+            event,
+            AudioEvent::Failed { .. } | AudioEvent::SourceLost { .. }
+        ) {
+            self.levels.source_failed.store(1, Ordering::Release);
+        }
         let _ = self.events.try_send(event);
+        if let Some(wake) = &self.wake {
+            let _ = wake.try_send(());
+        }
     }
 
     /// Waits up to `duration` for stop; true when stop was signaled.
@@ -510,6 +539,10 @@ impl Worker {
                     }
                 }
                 Exit::Fault => {
+                    self.emit(AudioEvent::SourceLost {
+                        track: self.track,
+                        reason: "WaitForMultipleObjects returned an unexpected result".into(),
+                    });
                     if self.wait_stop() {
                         return;
                     }
@@ -629,6 +662,9 @@ impl Worker {
             // SAFETY: releases exactly the frames acquired by GetBuffer.
             unsafe { stream.capture.ReleaseBuffer(frames) }
                 .map_err(|e| format!("ReleaseBuffer: {e}"))?;
+            if let Some(wake) = &self.wake {
+                let _ = wake.try_send(());
+            }
             if !pushed {
                 self.overflow_frames += u64::from(frames);
                 self.report_overflow();

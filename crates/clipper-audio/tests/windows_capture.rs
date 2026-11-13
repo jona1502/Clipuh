@@ -260,7 +260,16 @@ fn overflow_is_counted_and_capture_recovers() {
     }
     // Resume reading: frames must flow again.
     let stats = read_for(&mut capture, Duration::from_millis(1500));
-    let summary = capture.stop();
+    // Drop every pending notification: final reliability must not depend
+    // on the lossy, throttled event channel.
+    while capture.events().try_recv().is_ok() {}
+    let persistent_drops = capture.dropped_frames();
+    let summary = capture.stop_and_drain(|_| {});
+    assert!(persistent_drops > 0);
+    assert_eq!(
+        summary.dropped_frames.iter().sum::<u64>(),
+        capture.dropped_frames()
+    );
     kill(tone);
     println!(
         "overflow: dropped {:?}, overflow events {overflow_events}, frames after resume {}, summary {summary:?}",

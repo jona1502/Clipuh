@@ -67,6 +67,7 @@ impl QualityProfile {
 /// Everything the recorder needs to start one recording.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecordingOptions {
+    pub audio: RecordingAudioOptions,
     /// Output video size. The source is scaled on the GPU to this size.
     pub width: u32,
     pub height: u32,
@@ -76,9 +77,41 @@ pub struct RecordingOptions {
     pub output_directory: PathBuf,
 }
 
+/// Recording uses one endpoint playback mix plus an optional microphone.
+/// Process-isolated game/Discord capture is not wired into the recorder yet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordingAudioOptions {
+    pub desktop: bool,
+    pub microphone: bool,
+    pub input_device: Option<String>,
+    pub output_device: Option<String>,
+    pub microphone_gain_percent: u16,
+    pub desktop_gain_percent: u16,
+    pub separate_tracks: bool,
+}
+
+impl Default for RecordingAudioOptions {
+    fn default() -> Self {
+        Self {
+            desktop: true,
+            microphone: true,
+            input_device: None,
+            output_device: None,
+            microphone_gain_percent: 100,
+            desktop_gain_percent: 100,
+            separate_tracks: true,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RecorderCommand {
     RefreshSources,
+    StartAudioTest {
+        options: RecordingAudioOptions,
+        output_directory: PathBuf,
+    },
+    StopAudioTest,
     StartRecording {
         source: CaptureSource,
         options: RecordingOptions,
@@ -117,6 +150,15 @@ pub enum StopReason {
 #[derive(Clone, Debug, PartialEq)]
 pub enum RecorderEvent {
     SourcesListed(Vec<CaptureSource>),
+    AudioLevels {
+        desktop: f32,
+        microphone: f32,
+    },
+    AudioTestStarted,
+    AudioTestFinished {
+        path: Option<PathBuf>,
+        error: Option<String>,
+    },
     /// Encoder and capture are running; `encoder` is the hardware encoder name.
     RecordingStarted {
         path: PathBuf,

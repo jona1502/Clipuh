@@ -12,6 +12,7 @@
 #![deny(unsafe_code)]
 
 pub mod mix;
+pub mod mixer;
 pub mod ring;
 pub mod routing;
 pub mod timeline;

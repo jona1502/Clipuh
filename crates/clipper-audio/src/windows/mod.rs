@@ -8,5 +8,5 @@ mod process;
 mod stream;
 
 pub use devices::list_devices;
-pub use engine::{AudioCapture, CaptureSummary};
+pub use engine::{AudioCapture, CaptureSummary, qpc_now_ticks};
 pub use process::{capabilities, find_process};

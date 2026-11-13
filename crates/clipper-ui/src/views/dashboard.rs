@@ -433,6 +433,11 @@ fn recent_clips() -> Div {
 
 impl ClipperWindow {
     fn start_recording(&mut self) {
+        if self.audio_testing {
+            self.recording
+                .fail("Stop the audio test before recording.".into());
+            return;
+        }
         let Some(source) = self.recording.selected_source().cloned() else {
             return;
         };

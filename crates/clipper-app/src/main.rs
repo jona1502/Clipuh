@@ -35,12 +35,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         App, Application, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, px, size,
     };
 
+    // Previous startup policy, superseded to preserve explicit audio device selection:
     // A broken or outdated settings file must not prevent startup. The file is
     // left untouched until the user changes a setting.
-    let config = AppConfig::load().unwrap_or_else(|error| {
-        eprintln!("Clipper: {error}; using default settings");
-        AppConfig::default()
-    });
+    // Reject invalid settings instead of silently recording a different endpoint.
+    let config = AppConfig::load()?;
     let recorder = Recorder::spawn(
         config.performance.command_queue_capacity as usize,
         config.performance.event_queue_capacity as usize,

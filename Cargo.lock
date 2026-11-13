@@ -746,6 +746,7 @@ name = "clipper-recorder"
 version = "0.1.0"
 dependencies = [
  "async-channel 2.5.0",
+ "clipper-audio",
  "clipper-capture",
  "clipper-core",
  "clipper-encoder",
@@ -772,6 +773,7 @@ name = "clipper-ui"
 version = "0.1.0"
 dependencies = [
  "async-channel 2.5.0",
+ "clipper-audio",
  "clipper-core",
  "clipper-platform",
  "clipper-storage",

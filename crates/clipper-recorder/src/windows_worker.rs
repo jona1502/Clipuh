@@ -25,6 +25,7 @@ use crate::logic::{
     Counters, Lifecycle, StopOutcome, classify_stop, fit_output_size, partial_path,
     unique_file_name,
 };
+use crate::recording_audio::{AudioTest, RecordingAudio};
 
 const MAX_WAIT: Duration = Duration::from_millis(250);
 const STATS_WINDOW: Duration = Duration::from_secs(1);
@@ -34,6 +35,10 @@ struct Recording {
     // then the device.
     session: Option<CaptureSession>,
     encoder: HardwareEncoder,
+    audio: Option<RecordingAudio>,
+    audio_failed: bool,
+    video_end: i64,
+    last_audio_meter: Instant,
     _d3d: D3DContext,
     pacer: FramePacer,
     meter: RateMeter,
@@ -56,14 +61,24 @@ impl Recording {
         let Some(session) = self.session.as_mut() else {
             return Ok(());
         };
-        while let Some(frame) = session
-            .try_next_frame()
-            .map_err(|error| error.to_string())?
-        {
+        // Bound each video batch: continuous WGC delivery must not starve
+        // the independent WASAPI rings or command processing.
+        for _ in 0..4 {
+            let Some(frame) = session
+                .try_next_frame()
+                .map_err(|error| error.to_string())?
+            else {
+                break;
+            };
             self.counters.captured += 1;
             let Some(sample_time) = self.pacer.accept(frame.timestamp()) else {
                 continue;
             };
+            // A frame delivered late after a declared WGC gap must not move
+            // the muxer timeline backwards.
+            if sample_time < self.video_end - self.pacer.interval() {
+                continue;
+            }
             let outcome = self
                 .encoder
                 .submit(
@@ -77,10 +92,32 @@ impl Recording {
                 SubmitOutcome::Submitted => {
                     self.counters.encoded += 1;
                     self.meter.record();
+                    self.video_end = sample_time + self.pacer.interval();
                 }
                 SubmitOutcome::Dropped => self.counters.dropped += 1,
             }
             // `frame` drops here, returning its slot to the WGC pool.
+        }
+        if let Some(audio) = &self.audio {
+            let due = clipper_audio::windows::qpc_now_ticks() - audio.origin() - 800_000;
+            if due - self.video_end > 10_000_000 {
+                self.audio_failed = true;
+                return Err("Audio/video clock gap exceeded the bounded recovery window.".into());
+            }
+            // WGC is change-driven. Mark missing frames instead of letting
+            // the synchronous sink writer stall audio while a scene is static.
+            while self.video_end + self.pacer.interval() < due {
+                self.encoder
+                    .video_gap(self.video_end)
+                    .map_err(|error| encoder_message(&error))?;
+                self.video_end += self.pacer.interval();
+            }
+        }
+        if let Some(audio) = &mut self.audio
+            && let Err(message) = audio.pump(&mut self.encoder, false, self.video_end)
+        {
+            self.audio_failed = true;
+            return Err(message);
         }
         Ok(())
     }
@@ -93,6 +130,7 @@ struct Worker<'a> {
     // Field order is drop order: the recording and Media Foundation must be
     // released before the COM apartment is left.
     recording: Option<Recording>,
+    audio_test: Option<AudioTest>,
     media_foundation: Option<MediaFoundation>,
     _com: Option<ComApartment>,
 }
@@ -115,13 +153,14 @@ pub fn run(endpoint: &RecorderEndpoint) {
         lifecycle: Lifecycle::new(),
         init_error,
         recording: None,
+        audio_test: None,
         media_foundation: None,
         _com: com,
     };
 
     let mut running = true;
     while running {
-        if worker.recording.is_none() {
+        if worker.recording.is_none() && worker.audio_test.is_none() {
             match endpoint.commands.recv() {
                 Ok(command) => running = worker.handle(command),
                 Err(_) => break,
@@ -129,6 +168,7 @@ pub fn run(endpoint: &RecorderEndpoint) {
             continue;
         }
         worker.service_recording();
+        worker.service_audio_test();
         loop {
             match endpoint.commands.try_recv() {
                 Ok(command) => {
@@ -146,6 +186,7 @@ pub fn run(endpoint: &RecorderEndpoint) {
         }
     }
     worker.stop_recording(StopReason::Shutdown, None);
+    worker.stop_audio_test(None);
 }
 
 impl Worker<'_> {
@@ -162,7 +203,28 @@ impl Worker<'_> {
     /// Returns `false` when the worker must exit.
     fn handle(&mut self, command: RecorderCommand) -> bool {
         match command {
+            RecorderCommand::StartAudioTest {
+                options,
+                output_directory,
+            } => {
+                if self.recording.is_some() || self.audio_test.is_some() {
+                    self.error("Stop the current recording or audio test first.");
+                } else {
+                    match AudioTest::start(&options, &output_directory) {
+                        Ok(test) => {
+                            self.audio_test = Some(test);
+                            self.send(RecorderEvent::AudioTestStarted);
+                        }
+                        Err(message) => self.send(RecorderEvent::AudioTestFinished {
+                            path: None,
+                            error: Some(message),
+                        }),
+                    }
+                }
+            }
+            RecorderCommand::StopAudioTest => self.stop_audio_test(None),
             RecorderCommand::Shutdown => {
+                self.stop_audio_test(None);
                 self.stop_recording(StopReason::Shutdown, None);
                 return false;
             }
@@ -171,18 +233,72 @@ impl Worker<'_> {
                 Err(error) => self.error(format!("could not list capture sources: {error}")),
             },
             RecorderCommand::StartRecording { source, options } => {
-                self.start_recording(&source, &options);
+                if self.audio_test.is_some() {
+                    self.error("Stop the audio test first.");
+                } else {
+                    self.start_recording(&source, &options);
+                }
             }
             RecorderCommand::StopRecording => match self.lifecycle.begin_stop() {
                 Ok(()) => self.stop_recording_started(StopReason::User, None),
                 Err(message) => self.error(message),
             },
             // A real replay engine will emit ReplaySaving then ReplaySaved/ReplaySaveFailed here.
-            RecorderCommand::SaveReplay => self.send(RecorderEvent::ReplaySaveFailed {
-                message: REPLAY_NOT_RUNNING.into(),
-            }),
+            RecorderCommand::SaveReplay => {
+                // Repeated hotkeys must not stall capture/audio when the UI
+                // notification queue is full. This rejection is best effort.
+                let _ = self
+                    .endpoint
+                    .events
+                    .try_send(RecorderEvent::ReplaySaveFailed {
+                        message: REPLAY_NOT_RUNNING.into(),
+                    });
+            }
         }
         true
+    }
+
+    fn stop_audio_test(&mut self, failure: Option<String>) {
+        let Some(test) = self.audio_test.take() else {
+            return;
+        };
+        let result = test.finish().and_then(|path| {
+            if let Some(message) = failure {
+                let _ = fs::remove_file(path);
+                Err(message)
+            } else {
+                Ok(path)
+            }
+        });
+        let (path, error) = match result {
+            Ok(path) => (Some(path), None),
+            Err(error) => (None, Some(error)),
+        };
+        self.send(RecorderEvent::AudioTestFinished { path, error });
+        let _ = self.endpoint.events.try_send(RecorderEvent::AudioLevels {
+            desktop: 0.0,
+            microphone: 0.0,
+        });
+    }
+
+    fn service_audio_test(&mut self) {
+        let Some(test) = &mut self.audio_test else {
+            return;
+        };
+        let _ = test.wake.recv_timeout(MAX_WAIT);
+        if let Err(message) = test.pump(false) {
+            self.stop_audio_test(Some(message));
+            return;
+        }
+        if let Some((desktop, microphone)) = test.meter() {
+            let _ = self.endpoint.events.try_send(RecorderEvent::AudioLevels {
+                desktop,
+                microphone,
+            });
+        }
+        if test.elapsed() >= Duration::from_secs(30) {
+            self.stop_audio_test(None);
+        }
     }
 
     fn start_recording(&mut self, source: &CaptureSource, options: &RecordingOptions) {
@@ -251,6 +367,16 @@ impl Worker<'_> {
             self.stop_recording(StopReason::Error, Some(message));
             return;
         }
+        if recording.last_audio_meter.elapsed() >= Duration::from_millis(100) {
+            if let Some(audio) = &recording.audio {
+                let (desktop, microphone) = audio.levels();
+                let _ = self.endpoint.events.try_send(RecorderEvent::AudioLevels {
+                    desktop,
+                    microphone,
+                });
+            }
+            recording.last_audio_meter = Instant::now();
+        }
         if recording.source_closed.load(Ordering::Acquire) {
             self.stop_recording(StopReason::SourceClosed, None);
             return;
@@ -282,7 +408,10 @@ impl Worker<'_> {
         };
         let Recording {
             session,
-            encoder,
+            mut encoder,
+            mut audio,
+            audio_failed,
+            video_end: _,
             _d3d,
             meter,
             counters,
@@ -294,9 +423,25 @@ impl Worker<'_> {
         // Stop frames first, then drain and finalize the encoder.
         drop(session);
         let stats = counters.snapshot(started.elapsed(), meter.rate());
-        let finish = encoder.finish().map_err(|error| encoder_message(&error));
+        let audio_finish = audio.as_mut().map_or(Ok(()), |audio| {
+            let end = clipper_audio::windows::qpc_now_ticks().saturating_sub(audio.origin());
+            encoder
+                .video_gap(end)
+                .map_err(|error| encoder_message(&error))?;
+            audio.pump(&mut encoder, true, end)
+        });
+        drop(audio);
+        let finish = encoder
+            .finish()
+            .map_err(|error| encoder_message(&error))
+            .and(audio_finish);
         drop(_d3d);
 
+        let finish = if audio_failed {
+            Err(failure.clone().unwrap_or_default())
+        } else {
+            finish
+        };
         let outcome = match classify_stop(counters.encoded, finish) {
             StopOutcome::Success => match fs::rename(&partial, &final_path) {
                 Ok(()) => Ok(()),
@@ -354,7 +499,7 @@ fn build_recording(
     let session = CaptureSession::start(
         &d3d,
         source,
-        signal_handler(wake_tx, Arc::clone(&source_closed)),
+        signal_handler(wake_tx.clone(), Arc::clone(&source_closed)),
     )
     .map_err(|error| error.to_string())?;
 
@@ -370,14 +515,40 @@ fn build_recording(
         bitrate_mbps: options.bitrate_mbps,
         profile: options.profile,
     };
-    let encoder = HardwareEncoder::create(mf, &d3d, &config, &partial)
-        .map_err(|error| encoder_message(&error))?;
+    let encoder = HardwareEncoder::create_with_audio(
+        mf,
+        &d3d,
+        &config,
+        &partial,
+        if options.audio.desktop || options.audio.microphone {
+            1 + if options.audio.separate_tracks {
+                usize::from(options.audio.desktop) + usize::from(options.audio.microphone)
+            } else {
+                0
+            }
+        } else {
+            0
+        },
+    )
+    .map_err(|error| encoder_message(&error))?;
+
+    // Initialize expensive GPU/codec resources before audio starts, otherwise
+    // hardware encoder discovery can overflow the bounded audio rings.
+    let audio = RecordingAudio::start(&options.audio, wake_tx)?;
+    let origin = audio.as_ref().map(RecordingAudio::origin);
 
     Ok(Recording {
         session: Some(session),
         encoder,
+        audio,
+        audio_failed: false,
+        video_end: 0,
+        last_audio_meter: Instant::now(),
         _d3d: d3d,
-        pacer: FramePacer::new(options.fps),
+        pacer: origin.map_or_else(
+            || FramePacer::new(options.fps),
+            |origin| FramePacer::with_origin(options.fps, origin),
+        ),
         meter: RateMeter::new(),
         counters: Counters::default(),
         started: Instant::now(),

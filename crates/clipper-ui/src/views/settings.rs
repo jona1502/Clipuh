@@ -373,7 +373,7 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
     let config = &window.config;
     let video = &config.video;
     let replay = &config.replay;
-    let audio = &config.audio;
+
     let app = &config.app;
     let perf = &config.performance;
     let notifications = &config.notifications;
@@ -510,16 +510,7 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
                 ),
             ],
         ))
-        .child(group(
-            "Audio",
-            vec![
-                ("Game", None, toggle(audio.game)),
-                ("Desktop", None, toggle(audio.desktop)),
-                ("Discord", None, toggle(audio.discord)),
-                ("Microphone", None, toggle(audio.microphone)),
-                ("Separate tracks", None, toggle(audio.separate_tracks)),
-            ],
-        ));
+        .child(super::audio::content(window, cx));
 
     let recordings = match config.recording_options() {
         Ok(options) => path_text(options.output_directory.display().to_string()),
