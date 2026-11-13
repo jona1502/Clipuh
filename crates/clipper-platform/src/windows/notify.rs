@@ -1,13 +1,14 @@
 //! Overlay helpers: fullscreen detection, non-activating show, notification sound.
 
-use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Shell::{QUNS_RUNNING_D3D_FULL_SCREEN, SHQueryUserNotificationState};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GWL_EXSTYLE, GetWindowLongPtrW, HWND_TOPMOST, MB_OK, SPI_GETWORKAREA, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_SHOWWINDOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetWindowLongPtrW,
-    SetWindowPos, SystemParametersInfoW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    GWL_EXSTYLE, GetCursorPos, GetWindowLongPtrW, GetWindowRect, HWND_TOPMOST, MB_OK,
+    SPI_GETWORKAREA, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_SHOWWINDOW,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetWindowLongPtrW, SetWindowPos, SystemParametersInfoW,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
 };
 
 /// True when a Direct3D exclusive-fullscreen app is running; overlays cannot
@@ -62,6 +63,18 @@ pub fn show_without_activation(
         )
     }
     .map_err(std::io::Error::other)
+}
+
+/// True when the mouse pointer is inside the window `hwnd` (raw HWND value).
+pub fn cursor_over_window(hwnd: isize) -> bool {
+    let hwnd = HWND(hwnd as *mut core::ffi::c_void);
+    let (mut cursor, mut rect) = (POINT::default(), RECT::default());
+    // SAFETY: out-pointers reference live locals; a stale handle just fails.
+    let known =
+        unsafe { GetCursorPos(&mut cursor).is_ok() && GetWindowRect(hwnd, &mut rect).is_ok() };
+    known
+        && (rect.left..rect.right).contains(&cursor.x)
+        && (rect.top..rect.bottom).contains(&cursor.y)
 }
 
 /// Short system notification sound; MessageBeep returns immediately.

@@ -1,13 +1,13 @@
 use gpui::prelude::*;
-use gpui::{Div, div, px, rgb};
+use gpui::{Context, Div, div, px, rgb};
 
 use super::ClipperWindow;
 use crate::components::{ButtonVariant, button, empty_state, panel};
-use crate::notifications::run_explorer;
 use crate::state::{SavedClip, format_elapsed};
 use crate::theme;
+use clipper_platform::windows::shell;
 
-pub(super) fn content(window: &ClipperWindow) -> Div {
+pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
     let clips = &window.recording.saved_clips;
     let count = match clips.len() {
         1 => "1 clip this session".to_owned(),
@@ -43,7 +43,7 @@ pub(super) fn content(window: &ClipperWindow) -> Div {
         .text_color(rgb(theme::TEXT_TERTIARY))
         .child(div().flex_1().min_w_0().child("Name"))
         .child(div().w(px(80.)).child("Duration"))
-        .child(div().w(px(200.)).child("Actions"));
+        .child(div().w(px(290.)).child("Actions"));
 
     let mut list = panel().child(header);
     if clips.is_empty() {
@@ -57,14 +57,15 @@ pub(super) fn content(window: &ClipperWindow) -> Div {
             clips
                 .iter()
                 .enumerate()
-                .map(|(index, clip)| row(index, clip)),
+                .map(|(index, clip)| row(index, clip, cx)),
         );
     }
 
     div().flex().flex_col().gap_3().child(toolbar).child(list)
 }
 
-fn row(index: usize, clip: &SavedClip) -> Div {
+fn row(index: usize, clip: &SavedClip, cx: &mut Context<ClipperWindow>) -> Div {
+    let edit = clip.path.clone();
     let open = clip.path.clone();
     let folder = clip.path.clone();
     div()
@@ -85,9 +86,21 @@ fn row(index: usize, clip: &SavedClip) -> Div {
         )
         .child(
             div()
-                .w(px(200.))
+                .w(px(290.))
                 .flex()
                 .gap_2()
+                .child(
+                    button(
+                        ("clip-edit", index),
+                        "Edit",
+                        ButtonVariant::Primary,
+                        None,
+                        true,
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_in_editor(edit.clone(), window, cx)
+                    })),
+                )
                 .child(
                     button(
                         ("clip-open", index),
@@ -96,7 +109,11 @@ fn row(index: usize, clip: &SavedClip) -> Div {
                         None,
                         true,
                     )
-                    .on_click(move |_, _, _| run_explorer(&open)),
+                    .on_click(move |_, _, _| {
+                        if let Err(err) = shell::open_path(&open) {
+                            eprintln!("clips: open failed: {err}");
+                        }
+                    }),
                 )
                 .child(
                     button(
@@ -106,7 +123,11 @@ fn row(index: usize, clip: &SavedClip) -> Div {
                         None,
                         true,
                     )
-                    .on_click(move |_, _, _| run_explorer(format!("/select,{}", folder.display()))),
+                    .on_click(move |_, _, _| {
+                        if let Err(err) = shell::reveal_in_folder(&folder) {
+                            eprintln!("clips: open folder failed: {err}");
+                        }
+                    }),
                 ),
         )
 }

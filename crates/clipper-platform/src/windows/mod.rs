@@ -3,6 +3,7 @@
 
 pub mod hotkey;
 pub mod notify;
+pub mod shell;
 
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Win32::Foundation::HMODULE;

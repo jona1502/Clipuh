@@ -734,6 +734,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "clipper-media"
+version = "0.1.0"
+dependencies = [
+ "async-channel 2.5.0",
+ "clipper-encoder",
+ "clipper-platform",
+ "windows",
+ "windows-core",
+]
+
+[[package]]
 name = "clipper-platform"
 version = "0.1.0"
 dependencies = [
@@ -781,9 +792,11 @@ dependencies = [
  "async-channel 2.5.0",
  "clipper-audio",
  "clipper-core",
+ "clipper-media",
  "clipper-platform",
  "clipper-storage",
  "gpui",
+ "image",
  "raw-window-handle",
 ]
 
