@@ -198,9 +198,20 @@ fn write_and_finalize(
 
 pub type ExportDone = Box<dyn FnOnce(Result<SavedClip, ReplayError>) + Send + 'static>;
 
-struct Queued {
-    job: ExportJob,
-    done: ExportDone,
+/// Runs on the export thread right before the clip is written: creates the
+/// folder, picks a unique file name (may rewrite `final_path`).
+pub type ExportPrepare = Box<dyn FnOnce(&mut ExportJob) -> Result<(), ReplayError> + Send>;
+
+/// Housekeeping that must not run on the caller's thread.
+pub type ExportTask = Box<dyn FnOnce() + Send + 'static>;
+
+enum Queued {
+    Export {
+        job: ExportJob,
+        prepare: Option<ExportPrepare>,
+        done: ExportDone,
+    },
+    Task(ExportTask),
 }
 
 /// One background export thread with a bounded job queue.
@@ -236,6 +247,18 @@ impl Exporter {
     /// thread exactly once per accepted job (also on shutdown, with
     /// `Shutdown`).
     pub fn try_submit(&self, job: ExportJob, done: ExportDone) -> Result<(), ReplayError> {
+        self.try_submit_with(job, None, done)
+    }
+
+    /// Like [`Exporter::try_submit`]; `prepare` runs on the export thread
+    /// before writing (file system work such as folder creation and name
+    /// selection). Its error is reported through `done`.
+    pub fn try_submit_with(
+        &self,
+        job: ExportJob,
+        prepare: Option<ExportPrepare>,
+        done: ExportDone,
+    ) -> Result<(), ReplayError> {
         let Some(sender) = &self.sender else {
             return Err(ReplayError::Shutdown);
         };
@@ -243,7 +266,7 @@ impl Exporter {
             return Err(ReplayError::Shutdown);
         }
         self.in_flight.fetch_add(1, Ordering::SeqCst);
-        match sender.try_send(Queued { job, done }) {
+        match sender.try_send(Queued::Export { job, prepare, done }) {
             Ok(()) => Ok(()),
             Err(err) => {
                 self.in_flight.fetch_sub(1, Ordering::SeqCst);
@@ -253,6 +276,32 @@ impl Exporter {
                 })
             }
         }
+    }
+
+    /// Runs `task` on the export thread (best effort: `Busy` when the queue is
+    /// full). Not counted in [`Exporter::in_flight`].
+    pub fn try_run(&self, task: ExportTask) -> Result<(), ReplayError> {
+        let Some(sender) = &self.sender else {
+            return Err(ReplayError::Shutdown);
+        };
+        sender.try_send(Queued::Task(task)).map_err(|err| match err {
+            TrySendError::Full(_) => ReplayError::Busy,
+            TrySendError::Disconnected(_) => ReplayError::Shutdown,
+        })
+    }
+
+    /// Waits until every accepted export finished, at most `deadline`.
+    /// Returns `true` when nothing is left. Jobs still queued afterwards get
+    /// `Shutdown` when the exporter is dropped.
+    pub fn finish_queued(&self, deadline: Duration) -> bool {
+        let start = std::time::Instant::now();
+        while self.in_flight() > 0 {
+            if start.elapsed() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        true
     }
 
     /// Jobs accepted and not yet completed.
@@ -273,12 +322,26 @@ impl Drop for Exporter {
 }
 
 fn worker(receiver: Receiver<Queued>, in_flight: Arc<AtomicUsize>, stopping: Arc<AtomicBool>) {
-    while let Ok(Queued { job, done }) = receiver.recv() {
+    while let Ok(queued) = receiver.recv() {
+        let (mut job, prepare, done) = match queued {
+            Queued::Task(task) => {
+                if !stopping.load(Ordering::SeqCst) {
+                    let _ = catch_unwind(AssertUnwindSafe(task));
+                }
+                continue;
+            }
+            Queued::Export { job, prepare, done } => (job, prepare, done),
+        };
         let result = if stopping.load(Ordering::SeqCst) {
             Err(ReplayError::Shutdown)
         } else {
-            catch_unwind(AssertUnwindSafe(|| export_clip(&job)))
-                .unwrap_or_else(|_| Err(ReplayError::Invalid("export panicked".into())))
+            catch_unwind(AssertUnwindSafe(|| {
+                if let Some(prepare) = prepare {
+                    prepare(&mut job)?;
+                }
+                export_clip(&job)
+            }))
+            .unwrap_or_else(|_| Err(ReplayError::Invalid("export panicked".into())))
         };
         let _ = catch_unwind(AssertUnwindSafe(move || done(result)));
         in_flight.fetch_sub(1, Ordering::SeqCst);
@@ -461,6 +524,64 @@ mod tests {
         assert!(rx.try_recv().is_err());
         assert!(!dir.join("q0.mp4").exists() && !dir.join("q1.mp4").exists());
         assert!(no_partials(&dir));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn finish_queued_lets_accepted_jobs_complete_instead_of_shutdown() {
+        let dir = temp_dir("finish");
+        let (exporter, release, started) = blocking_exporter(3, &dir);
+        started.recv_timeout(Duration::from_secs(20)).unwrap();
+        let (tx, rx) = channel();
+        for i in 0..2 {
+            let tx = tx.clone();
+            exporter
+                .try_submit(
+                    job(dir.join(format!("q{i}.mp4"))),
+                    Box::new(move |r| tx.send(r).unwrap()),
+                )
+                .unwrap();
+        }
+        // Too short while the first job is blocked.
+        assert!(!exporter.finish_queued(Duration::from_millis(50)));
+        release.send(()).unwrap();
+        assert!(exporter.finish_queued(Duration::from_secs(20)));
+        drop(exporter);
+        for _ in 0..2 {
+            assert!(rx.try_recv().unwrap().is_ok());
+        }
+        assert!(dir.join("q0.mp4").exists() && dir.join("q1.mp4").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prepare_runs_on_the_export_thread_and_can_rewrite_the_path() {
+        let dir = temp_dir("prepare");
+        let exporter = Exporter::spawn(2).unwrap();
+        let caller = std::thread::current().id();
+        let (tx, rx) = channel();
+        let target = dir.join("made").join("renamed.mp4");
+        let expected = target.clone();
+        exporter
+            .try_submit_with(
+                job(dir.join("original.mp4")),
+                Some(Box::new(move |job| {
+                    assert_ne!(std::thread::current().id(), caller);
+                    fs::create_dir_all(target.parent().unwrap()).unwrap();
+                    job.final_path = target;
+                    Ok(())
+                })),
+                Box::new(move |r| tx.send(r).unwrap()),
+            )
+            .unwrap();
+        let saved = rx.recv_timeout(Duration::from_secs(20)).unwrap().unwrap();
+        assert_eq!(saved.path, expected);
+        let (tx, rx) = channel();
+        exporter
+            .try_run(Box::new(move || tx.send(std::thread::current().id()).unwrap()))
+            .unwrap();
+        assert_ne!(rx.recv_timeout(Duration::from_secs(20)).unwrap(), caller);
+        drop(exporter);
         let _ = fs::remove_dir_all(&dir);
     }
 

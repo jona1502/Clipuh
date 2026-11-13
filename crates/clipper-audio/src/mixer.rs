@@ -22,6 +22,8 @@ pub struct TimelineMixer {
     tracks: Vec<Track>,
     separate: bool,
     late: u64,
+    /// Samples before this position are ignored silently (see `skip_to`).
+    skipped_until: i64,
     mixed: Vec<f32>,
     isolated: Vec<f32>,
 }
@@ -43,6 +45,7 @@ impl TimelineMixer {
                 .collect(),
             separate,
             late: 0,
+            skipped_until: 0,
             mixed: vec![0.0; BLOCK * 2],
             isolated: vec![0.0; BLOCK * 2],
         }
@@ -50,6 +53,18 @@ impl TimelineMixer {
 
     pub fn late_frames(&self) -> u64 {
         self.late
+    }
+
+    /// Starts the timeline at `qpc` without rendering the span before it.
+    /// Samples older than that point are ignored without counting as late.
+    pub fn skip_to(&mut self, qpc: i64) {
+        let target = ((i128::from(qpc) - i128::from(self.origin)) * i128::from(SAMPLE_RATE)
+            / i128::from(TICKS_PER_SECOND))
+        .clamp(0, i128::from(i64::MAX)) as i64;
+        if target > self.position {
+            self.position = target;
+            self.skipped_until = target;
+        }
     }
 
     pub fn all_sources_received(&self) -> bool {
@@ -76,6 +91,9 @@ impl TimelineMixer {
         for (offset, frame) in samples.chunks_exact(channels).enumerate() {
             let position = first.saturating_add(offset as i64);
             if position < 0 {
+                continue;
+            }
+            if position < self.skipped_until {
                 continue;
             }
             if position < self.position || position >= self.position + CAPACITY as i64 {
@@ -202,6 +220,24 @@ mod tests {
         assert_eq!(first, 0.25);
         assert_eq!(mixer.late_frames(), 480);
     }
+    #[test]
+    fn skip_to_starts_the_timeline_late_without_late_samples() {
+        let mut mixer = TimelineMixer::new(0, vec![1.0], false);
+        mixer.skip_to(10 * TICKS_PER_SECOND);
+        // Older audio is ignored silently, newer audio is rendered.
+        mixer.push(0, 9 * TICKS_PER_SECOND, 1, &[0.5; 480]);
+        mixer.push(0, 10 * TICKS_PER_SECOND, 1, &[0.25; 480]);
+        let mut first = None;
+        mixer
+            .render_until(10 * TICKS_PER_SECOND + 100_000, |_, time, samples| {
+                first.get_or_insert((time, samples[0]));
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        assert_eq!(first, Some((10 * TICKS_PER_SECOND, 0.25)));
+        assert_eq!(mixer.late_frames(), 0);
+    }
+
     #[test]
     fn clock_jump_cannot_emit_unbounded_silence() {
         let mut mixer = TimelineMixer::new(0, vec![1.0], false);
