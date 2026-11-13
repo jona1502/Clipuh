@@ -16,7 +16,7 @@ use gpui::{
 
 use crate::components::{Tone, badge, kbd, list_item, shortcut, status_dot};
 use crate::notifications::{Notifier, Toast};
-use crate::state::{Phase, RecordingState};
+use crate::state::{Phase, RecordingState, StorageProjectionCache, StorageProjectionRun};
 use crate::theme;
 
 actions!(
@@ -170,6 +170,8 @@ pub struct ClipperWindow {
     hotkey_recorder: Option<settings::HotkeyRecorder>,
     config: AppConfig,
     recording: RecordingState,
+    storage_projection_cache: StorageProjectionCache,
+    storage_projection_run: StorageProjectionRun,
     /// Awaits recorder events; the UI re-renders only when one arrives.
     _events: Task<()>,
     _hotkey_failures: Task<()>,
@@ -210,6 +212,7 @@ impl ClipperWindow {
                     _ => None,
                 };
                 let updated = this.update(cx, |this, cx| {
+                    this.storage_projection_run.apply_event(&event);
                     match &event {
                         RecorderEvent::AudioLevels {
                             desktop,
@@ -247,6 +250,7 @@ impl ClipperWindow {
             let _ = this.update(cx, |this, cx| {
                 this.audio_testing = false;
                 this.audio_levels = (0.0, 0.0);
+                this.storage_projection_run.clear();
                 if this.recording.phase != Phase::Idle {
                     this.recording.apply(RecorderEvent::Stopped);
                 }
@@ -284,6 +288,8 @@ impl ClipperWindow {
             hotkey_recorder: None,
             config,
             recording: RecordingState::default(),
+            storage_projection_cache: StorageProjectionCache::default(),
+            storage_projection_run: StorageProjectionRun::default(),
             _events: task,
             _hotkey_failures: failures,
             active_page: Page::Dashboard,
@@ -298,6 +304,7 @@ impl ClipperWindow {
             audio_testing: false,
             audio_test_path: None,
         };
+        this.storage_projection_cache.refresh(&this.config);
         this.send(RecorderCommand::RefreshSources);
         this.refresh_audio_devices(cx);
         this.register_hotkey(cx);
@@ -306,6 +313,7 @@ impl ClipperWindow {
 
     /// Saves the config off the UI thread; failures show up in the error banner.
     pub(super) fn persist_config(&mut self, cx: &mut Context<Self>) {
+        self.storage_projection_cache.refresh(&self.config);
         cx.notify();
         let config = self.config.clone();
         let persistence = self.config_persistence.clone();

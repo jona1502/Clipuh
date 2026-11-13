@@ -419,6 +419,30 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
         .children(durations)
         .into_any_element();
 
+    let replay_enabled = window.recording.settings_enabled();
+    let replay_durations = [30u32, 60, 120, 300]
+        .into_iter()
+        .map(|seconds| {
+            chip(
+                ("replay-duration", seconds as usize),
+                format!("{seconds} s"),
+                replay.duration_seconds == seconds,
+                replay_enabled,
+            )
+            .when(replay_enabled, |this| {
+                this.on_click(cx.listener(move |this, _, _, cx| {
+                    this.config.replay.duration_seconds = seconds;
+                    this.persist_config(cx);
+                }))
+            })
+        })
+        .collect::<Vec<_>>();
+    let replay_duration_chips = div()
+        .flex()
+        .gap_1p5()
+        .children(replay_durations)
+        .into_any_element();
+
     let mut root = div()
         .flex()
         .flex_col()
@@ -488,8 +512,8 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
                 ("Codec", None, text(codec)),
                 ("Encoder", None, text(encoder)),
                 (
-                    "Bitrate",
-                    None,
+                    "Base bitrate",
+                    Some("The quality preset adjusts the encoded target used by estimates."),
                     text(format!("{} Mbps", video.bitrate_mbps)),
                 ),
             ],
@@ -500,13 +524,13 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
                 ("Mode", None, text(mode)),
                 (
                     "Duration",
-                    None,
-                    text(format!("{} s", replay.duration_seconds)),
+                    Some("Storage estimate applies to the next recording."),
+                    replay_duration_chips,
                 ),
                 (
                     "Memory budget",
-                    Some("Older footage spills to disk."),
-                    text(format!("{} MB", replay.memory_limit_megabytes)),
+                    Some("RAM allowance for the theoretical replay estimate."),
+                    text(format!("{} MiB", replay.memory_limit_megabytes)),
                 ),
             ],
         ))

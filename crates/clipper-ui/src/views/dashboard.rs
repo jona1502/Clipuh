@@ -2,6 +2,7 @@ use clipper_core::recording::{
     CaptureSource, QualityProfile, RecorderCommand, RecordingStats, SourceKind,
 };
 use clipper_storage::config::ReplayMode;
+use clipper_storage::storage_projection::StorageProjection;
 use clipper_storage::{VIDEO_FPS, VIDEO_RESOLUTIONS};
 use gpui::prelude::*;
 use gpui::{AnyElement, Context, Div, FontWeight, SharedString, div, px, rgb};
@@ -11,7 +12,7 @@ use crate::components::{
     ButtonVariant, Tone, button, chip, empty_state, list_item, panel, property_row, section_header,
     stat_tile, status_dot, value_text,
 };
-use crate::state::{Phase, format_elapsed, resolution_label};
+use crate::state::{Phase, format_decimal_size, format_elapsed, format_mib, resolution_label};
 use crate::theme;
 
 pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
@@ -300,6 +301,21 @@ fn capture_settings(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> 
             })
         });
 
+    let bitrate = [8u32, 16, 24, 32, 50].into_iter().map(|value| {
+        chip(
+            ("bitrate", value as usize),
+            format!("{value} Mbps"),
+            config.video.bitrate_mbps == value,
+            enabled,
+        )
+        .when(enabled, |this| {
+            this.on_click(cx.listener(move |this, _, _, cx| {
+                this.config.video.bitrate_mbps = value;
+                this.persist_config(cx);
+            }))
+        })
+    });
+
     let chips = |items: Vec<gpui::Stateful<Div>>| div().flex().gap_1p5().children(items);
     let note = (!enabled).then(|| "Locked while recording".into());
 
@@ -322,60 +338,273 @@ fn capture_settings(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> 
                 None,
                 chips(quality.collect()),
                 false,
+            ))
+            .child(property_row(
+                "Base bitrate",
+                Some("The quality preset adjusts the encoded target used by estimates.".into()),
+                chips(bitrate.collect()),
+                false,
             )),
     )
 }
 
 fn overview(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
-    let config = &window.config;
-    let video = &config.video;
-    let mode = match config.replay.mode {
-        ReplayMode::Hybrid => "Hybrid",
+    let configured = window.storage_projection_cache.projection();
+    let pending = window.storage_projection_run.pending();
+    let active = window.storage_projection_run.active();
+    let run_projection = window.storage_projection_run.displayed();
+    let projection = run_projection
+        .map(|snapshot| snapshot.projection())
+        .or(configured);
+    let is_pending = pending.is_some();
+    let is_active = active.is_some();
+    let differs_from_next =
+        active.is_some_and(|snapshot| !snapshot.matches_key(window.storage_projection_cache.key()));
+
+    let status = if is_pending {
+        "Starting with this estimate"
+    } else if differs_from_next {
+        "Active estimate · next settings differ"
+    } else if is_active {
+        "Active estimate · next settings match"
+    } else {
+        "Next recording"
     };
+
     let encoder = window
         .recording
         .encoder
         .clone()
         .unwrap_or_else(|| "Auto".to_owned());
-    let mb_per_minute = video.bitrate_mbps * 60 / 8;
+    let encoder_tile = stat_tile(
+        "Encoder",
+        "H.264",
+        format!(
+            "{encoder} · {}",
+            format_video_rate(projection.map_or(
+                u64::from(window.config.video.bitrate_mbps) * 1_000_000,
+                |projection| projection.video_bps,
+            ))
+        ),
+    );
+
+    let storage_tile = if let Some(projection) = projection {
+        let sizes = projection.sizes;
+        let mut tile = panel()
+            .flex_1()
+            .min_w_0()
+            .p_4()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme::TEXT_TERTIARY))
+                    .child("Storage estimate"),
+            )
+            .child(
+                div()
+                    .text_lg()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(format!("{} / min", format_decimal_size(sizes[1]))),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme::TEXT_SECONDARY))
+                    .child(format!(
+                        "30 s {} · 1 min {}",
+                        format_decimal_size(sizes[0]),
+                        format_decimal_size(sizes[1]),
+                    )),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme::TEXT_SECONDARY))
+                    .child(format!(
+                        "2 min {} · 5 min {}",
+                        format_decimal_size(sizes[2]),
+                        format_decimal_size(sizes[3]),
+                    )),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme::TEXT_TERTIARY))
+                    .child(target_rate_description(projection)),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme::TEXT_TERTIARY))
+                    .child(projection_assumptions(projection)),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme::TEXT_TERTIARY))
+                    .child(status),
+            );
+        if is_active && differs_from_next {
+            if let Some(next) = configured {
+                tile = tile.child(div().text_xs().text_color(rgb(theme::TEXT_TERTIARY)).child(
+                    format!(
+                        "Next: {} · {} fps · {} · {} / min · replay {} s / {} RAM",
+                        resolution_label(window.config.video.width, window.config.video.height),
+                        window.config.video.fps,
+                        format_video_rate(next.video_bps),
+                        format_decimal_size(next.sizes[1]),
+                        next.replay_duration_seconds,
+                        format_mib(next.replay.ram_budget_bytes),
+                    ),
+                ));
+            } else if let Some(error) = window.storage_projection_cache.error() {
+                tile = tile.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(theme::TEXT_TERTIARY))
+                        .child(format!("Next estimate unavailable: {error}")),
+                );
+            }
+        }
+        tile
+    } else {
+        panel()
+            .flex_1()
+            .min_w_0()
+            .p_4()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme::TEXT_TERTIARY))
+                    .child("Storage estimate"),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme::TEXT_SECONDARY))
+                    .child(
+                        window
+                            .storage_projection_cache
+                            .error()
+                            .unwrap_or("Unavailable")
+                            .to_owned(),
+                    ),
+            )
+    };
+
+    let mode = match window.config.replay.mode {
+        ReplayMode::Hybrid => "Hybrid",
+    };
+    let replay_details = if let Some(projection) = projection {
+        let replay = projection.replay;
+        div()
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            .text_xs()
+            .text_color(rgb(theme::TEXT_TERTIARY))
+            .child(format!(
+                "{} total · RAM budget {} · SSD {} theoretical",
+                // Total and SSD are estimates from the same target-rate projection.
+                format_decimal_size(replay.total_bytes),
+                format_mib(replay.ram_budget_bytes),
+                format_decimal_size(replay.estimated_ssd_bytes),
+            ))
+            .child(replay_assumptions(projection))
+            .child("Replay engine unavailable in this build; no live buffer or disk usage is measured.")
+    } else {
+        div()
+            .text_xs()
+            .text_color(rgb(theme::TEXT_TERTIARY))
+            .child("Estimate unavailable; replay engine is not available in this build.")
+    };
+    let replay_tile = stat_tile(
+        "Replay buffer",
+        format!(
+            "{} s",
+            projection.map_or(window.config.replay.duration_seconds.into(), |projection| {
+                projection.replay_duration_seconds
+            },)
+        ),
+        format!("{mode} · Save: {}", window.config.replay.hotkey),
+    )
+    .child(
+        div().pt_2().child(
+            button(
+                "save-replay",
+                "Save replay",
+                ButtonVariant::Secondary,
+                None,
+                true,
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.send(RecorderCommand::SaveReplay);
+                cx.notify();
+            })),
+        ),
+    )
+    .child(replay_details);
 
     section("Configuration", None).child(
         div()
             .flex()
             .gap_3()
-            .child(stat_tile(
-                "Encoder",
-                "H.264",
-                format!("{encoder} · {} Mbps", video.bitrate_mbps),
-            ))
-            .child(stat_tile(
-                "Storage",
-                format!("~{mb_per_minute} MB/min"),
-                "Estimate from bitrate",
-            ))
-            .child(
-                stat_tile(
-                    "Replay buffer",
-                    format!("{} s", config.replay.duration_seconds),
-                    format!("{mode} · Save: {}", config.replay.hotkey),
-                )
-                .child(
-                    div().pt_2().child(
-                        button(
-                            "save-replay",
-                            "Save replay",
-                            ButtonVariant::Secondary,
-                            None,
-                            true,
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.send(RecorderCommand::SaveReplay);
-                            cx.notify();
-                        })),
-                    ),
-                ),
-            ),
+            .child(encoder_tile)
+            .child(storage_tile)
+            .child(replay_tile),
     )
+}
+
+fn target_rate_description(projection: StorageProjection) -> String {
+    let audio = if projection.audio_tracks == 0 {
+        "no AAC tracks".to_owned()
+    } else {
+        let per_track = projection.audio_bps / u64::from(projection.audio_tracks);
+        format!(
+            "{} × {} AAC",
+            projection.audio_tracks,
+            format_audio_rate(per_track),
+        )
+    };
+    format!(
+        "{} video · {audio}",
+        format_video_rate(projection.video_bps)
+    )
+}
+
+fn projection_assumptions(projection: StorageProjection) -> &'static str {
+    if projection.variable_bitrate {
+        "VBR target · excludes container overhead"
+    } else {
+        "Target bitrate · excludes container overhead"
+    }
+}
+
+fn replay_assumptions(projection: StorageProjection) -> &'static str {
+    if projection.variable_bitrate {
+        "At target video/AAC rate · VBR · no container overhead"
+    } else {
+        "At target video/AAC rate · no container overhead"
+    }
+}
+
+fn format_video_rate(bits_per_second: u64) -> String {
+    let mbps = bits_per_second as f64 / 1_000_000.0;
+    if mbps.fract().abs() < 0.05 {
+        format!("{mbps:.0} Mbps")
+    } else {
+        format!("{mbps:.1} Mbps")
+    }
+}
+
+fn format_audio_rate(bits_per_second: u64) -> String {
+    format!("{} kbps", bits_per_second / 1_000)
 }
 
 fn performance(window: &ClipperWindow) -> Div {
@@ -452,6 +681,8 @@ impl ClipperWindow {
             }
         };
         if self.send(RecorderCommand::StartRecording { source, options }) {
+            self.storage_projection_run
+                .start_accepted(self.storage_projection_cache.snapshot());
             self.recording.begin_start();
         }
     }
