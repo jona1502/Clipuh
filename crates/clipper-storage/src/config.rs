@@ -1,3 +1,4 @@
+use clipper_core::hotkey::{DEFAULT_SAVE_REPLAY, Hotkey};
 use clipper_core::recording::{QualityProfile, RecordingOptions};
 use directories::{ProjectDirs, UserDirs};
 use serde::{Deserialize, Serialize};
@@ -19,7 +20,8 @@ const MIN_REPLAY_DURATION_SECONDS: u32 = 5;
 const MAX_REPLAY_DURATION_SECONDS: u32 = 300;
 const MIN_REPLAY_MEMORY_MEGABYTES: u32 = 16;
 const MAX_REPLAY_MEMORY_MEGABYTES: u32 = 512;
-const MAX_HOTKEY_LENGTH: usize = 64;
+/// Allowed notification display time, in seconds.
+pub const NOTIFICATION_DURATION_SECONDS: std::ops::RangeInclusive<u32> = 2..=10;
 
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
 static SAVE_LOCK: Mutex<()> = Mutex::new(());
@@ -35,6 +37,7 @@ pub struct AppConfig {
     pub audio: AudioSettings,
     pub performance: PerformanceSettings,
     pub recording: RecordingSettings,
+    pub notifications: NotificationSettings,
     pub app: AppSettings,
 }
 
@@ -85,14 +88,16 @@ impl AppConfig {
                 "must be between 16 and 512 MiB",
             ));
         }
-        let hotkey = self.replay.hotkey.trim();
-        if hotkey.is_empty()
-            || hotkey.len() > MAX_HOTKEY_LENGTH
-            || hotkey.chars().any(char::is_control)
-        {
+        if self.replay.hotkey.parse::<Hotkey>().is_err() {
             issues.push(ValidationIssue::new(
                 "replay.hotkey",
-                "must contain 1 to 64 non-control characters",
+                "must be a supported shortcut such as Ctrl+Shift+F10",
+            ));
+        }
+        if !NOTIFICATION_DURATION_SECONDS.contains(&self.notifications.duration_seconds) {
+            issues.push(ValidationIssue::new(
+                "notifications.duration_seconds",
+                "must be between 2 and 10 seconds",
             ));
         }
 
@@ -232,7 +237,7 @@ impl Default for ReplaySettings {
             mode: ReplayMode::Hybrid,
             duration_seconds: 60,
             memory_limit_megabytes: 64,
-            hotkey: "F9".to_owned(),
+            hotkey: DEFAULT_SAVE_REPLAY.to_owned(),
         }
     }
 }
@@ -320,6 +325,34 @@ impl From<QualityProfile> for QualityPreset {
             QualityProfile::Performance => Self::Performance,
             QualityProfile::Balanced => Self::Balanced,
             QualityProfile::Quality => Self::Quality,
+        }
+    }
+}
+
+/// Toast notifications shown after a clip is saved or fails to save.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotificationSettings {
+    /// Master switch for all notifications.
+    pub enabled: bool,
+    /// How long a notification stays visible.
+    pub duration_seconds: u32,
+    /// Play a sound with the notification.
+    pub sound: bool,
+    /// Offer an action to open the saved clip.
+    pub open_clip_action: bool,
+    /// Also notify when saving a clip fails.
+    pub notify_on_failure: bool,
+}
+
+impl Default for NotificationSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            duration_seconds: 4,
+            sound: true,
+            open_clip_action: true,
+            notify_on_failure: true,
         }
     }
 }
@@ -791,5 +824,60 @@ mod tests {
             AppConfig::load_from(&path),
             Err(ConfigError::Validation(_))
         ));
+    }
+
+    #[test]
+    fn hotkey_default_legacy_and_invalid_values() {
+        let mut config = AppConfig::default();
+        assert_eq!(config.replay.hotkey, "Ctrl+Shift+F10");
+        assert!(config.validate().is_ok());
+        config.replay.hotkey = "F9".to_owned();
+        assert!(config.validate().is_ok());
+        for bad in ["Ctrl+Space", "A"] {
+            config.replay.hotkey = bad.to_owned();
+            let err = config.validate().expect_err(bad);
+            assert_eq!(err.issues()[0].field(), "replay.hotkey");
+        }
+    }
+
+    #[test]
+    fn notification_duration_bounds() {
+        let mut config = AppConfig::default();
+        for (secs, ok) in [(1, false), (2, true), (10, true), (11, false)] {
+            config.notifications.duration_seconds = secs;
+            let result = config.validate();
+            assert_eq!(result.is_ok(), ok, "{secs}");
+            if let Err(err) = result {
+                assert_eq!(err.issues()[0].field(), "notifications.duration_seconds");
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_file_without_notifications_loads_and_custom_settings_round_trip() {
+        let temp = TestDir::new();
+        let path = temp.path("settings.toml");
+        fs::write(
+            &path,
+            "[replay]
+hotkey = \"F9\"
+",
+        )
+        .expect("write legacy");
+        let legacy = AppConfig::load_from(&path).expect("load legacy");
+        assert_eq!(legacy.notifications, NotificationSettings::default());
+
+        let mut config = AppConfig::default();
+        config.replay.hotkey = "Alt+F8".to_owned();
+        config.notifications = NotificationSettings {
+            enabled: false,
+            duration_seconds: 7,
+            sound: false,
+            open_clip_action: false,
+            notify_on_failure: false,
+        };
+        let path = temp.path("custom.toml");
+        config.save_to(&path).expect("save");
+        assert_eq!(AppConfig::load_from(&path).expect("load"), config);
     }
 }
