@@ -25,6 +25,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     use std::cell::Cell;
     use std::rc::Rc;
 
+    use clipper_recorder::Recorder;
     use clipper_storage::AppConfig;
     use clipper_ui::ClipperWindow;
     use gpui::prelude::*;
@@ -32,7 +33,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         App, Application, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, px, size,
     };
 
-    let config = AppConfig::load()?;
+    // A broken or outdated settings file must not prevent startup. The file is
+    // left untouched until the user changes a setting.
+    let config = AppConfig::load().unwrap_or_else(|error| {
+        eprintln!("Clipper: {error}; using default settings");
+        AppConfig::default()
+    });
+    let recorder = Recorder::spawn(
+        config.performance.command_queue_capacity as usize,
+        config.performance.event_queue_capacity as usize,
+    )?;
+    let handle = recorder.handle();
     let window_opened = Rc::new(Cell::new(false));
     let window_opened_in_callback = Rc::clone(&window_opened);
 
@@ -58,7 +69,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }),
                 ..Default::default()
             },
-            |window, cx| cx.new(|cx| ClipperWindow::new(config, window, cx)),
+            |window, cx| {
+                cx.new(|cx| ClipperWindow::new(handle.clone(), config.clone(), window, cx))
+            },
         );
 
         match result {
@@ -72,6 +85,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     });
+
+    // Joins the recorder worker (finalizing any active recording).
+    drop(recorder);
 
     if !window_opened.get() {
         return Err(std::io::Error::other("GPUI could not open the main window").into());

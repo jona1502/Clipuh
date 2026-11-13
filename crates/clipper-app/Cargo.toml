@@ -7,6 +7,8 @@ publish.workspace = true
 [dependencies]
 clipper-ui.workspace = true
 clipper-storage.workspace = true
+clipper-core.workspace = true
+clipper-recorder.workspace = true
 
 
 [target.'cfg(windows)'.dependencies]

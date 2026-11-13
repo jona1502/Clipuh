@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 mod components;
+mod state;
 mod theme;
 mod views;
 

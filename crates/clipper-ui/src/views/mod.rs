@@ -3,14 +3,16 @@ mod dashboard;
 mod editor;
 mod settings;
 
+use clipper_core::recording::{RecorderCommand, RecorderEvent, RecorderHandle};
 use clipper_storage::AppConfig;
 use gpui::prelude::*;
 use gpui::{
-    App, Context, Div, FocusHandle, FontWeight, KeyBinding, KeyDownEvent, Render, Window, actions,
-    div, px, rgb, rgba,
+    App, Context, Div, FocusHandle, FontWeight, KeyBinding, KeyDownEvent, Render, Task, Window,
+    actions, div, px, rgb, rgba,
 };
 
 use crate::components::{Tone, badge, kbd, list_item, shortcut, status_dot};
+use crate::state::{Phase, RecordingState};
 use crate::theme;
 
 actions!(
@@ -79,7 +81,7 @@ impl Page {
 
     fn subtitle(self) -> &'static str {
         match self {
-            Self::Dashboard => "Capture status and setup at a glance",
+            Self::Dashboard => "Record, monitor and tune capture",
             Self::Clips => "Saved moments from your sessions",
             Self::Editor => "Trim and export a saved clip",
             Self::Settings => "How Clipper captures and stores",
@@ -134,7 +136,11 @@ impl CommandPalette {
 
 /// Main desktop application shell.
 pub struct ClipperWindow {
+    handle: RecorderHandle,
     config: AppConfig,
+    recording: RecordingState,
+    /// Awaits recorder events; the UI re-renders only when one arrives.
+    _events: Task<()>,
     active_page: Page,
     focus: FocusHandle,
     nav_focus: Vec<FocusHandle>,
@@ -142,19 +148,67 @@ pub struct ClipperWindow {
 }
 
 impl ClipperWindow {
-    pub fn new(config: AppConfig, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        handle: RecorderHandle,
+        config: AppConfig,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let events = handle.events();
+        let task = cx.spawn(async move |this, cx| {
+            while let Ok(event) = events.recv().await {
+                let updated = this.update(cx, |this, cx| {
+                    this.recording.apply(event);
+                    cx.notify();
+                });
+                if updated.is_err() {
+                    return;
+                }
+            }
+            // Channel closed without a final event: the worker is gone.
+            let _ = this.update(cx, |this, cx| {
+                if this.recording.phase != Phase::Idle {
+                    this.recording.apply(RecorderEvent::Stopped);
+                    cx.notify();
+                }
+            });
+        });
         let focus = cx.focus_handle();
         window.focus(&focus);
         let nav_focus = (0..Page::ALL.len())
             .map(|index| cx.focus_handle().tab_index(index as isize).tab_stop(true))
             .collect();
 
-        Self {
+        let mut this = Self {
+            handle,
             config,
+            recording: RecordingState::default(),
+            _events: task,
             active_page: Page::Dashboard,
             focus,
             nav_focus,
             palette: None,
+        };
+        this.send(RecorderCommand::RefreshSources);
+        this
+    }
+
+    /// Queues a command; a full or closed queue surfaces as an error banner.
+    fn send(&mut self, command: RecorderCommand) -> bool {
+        match self.handle.send(command) {
+            Ok(()) => true,
+            Err(error) => {
+                self.recording.fail(error.to_string());
+                false
+            }
+        }
+    }
+
+    fn status_tone(&self) -> Tone {
+        match self.recording.phase {
+            Phase::Idle => Tone::Neutral,
+            Phase::Starting => Tone::Warning,
+            Phase::Recording | Phase::Stopping => Tone::Danger,
         }
     }
 
@@ -340,8 +394,8 @@ impl ClipperWindow {
                     .px_2()
                     .text_xs()
                     .text_color(rgb(theme::TEXT_TERTIARY))
-                    .child(status_dot(Tone::Neutral))
-                    .child("Capture offline"),
+                    .child(status_dot(self.status_tone()))
+                    .child(self.recording.status_label()),
             )
     }
 
@@ -374,12 +428,12 @@ impl ClipperWindow {
                             .child(page.subtitle()),
                     ),
             )
-            .child(badge("Capture not connected", Tone::Neutral))
+            .child(badge(self.recording.status_label(), self.status_tone()))
     }
 
-    fn page_content(&self) -> Div {
+    fn page_content(&self, cx: &mut Context<Self>) -> Div {
         match self.active_page {
-            Page::Dashboard => dashboard::content(&self.config),
+            Page::Dashboard => dashboard::content(self, cx),
             Page::Clips => clips::content(),
             Page::Editor => editor::content(),
             Page::Settings => settings::content(&self.config),
@@ -572,7 +626,7 @@ impl Render for ClipperWindow {
                                 .mx_auto()
                                 .px_8()
                                 .py_6()
-                                .child(self.page_content()),
+                                .child(self.page_content(cx)),
                         ),
                     ),
             )

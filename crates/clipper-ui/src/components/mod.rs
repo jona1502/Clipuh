@@ -7,14 +7,9 @@ use gpui::{Div, ElementId, FontWeight, IntoElement, SharedString, Stateful, div,
 use crate::theme;
 
 /// Semantic color for badges and status dots.
-#[expect(
-    dead_code,
-    reason = "status tones are wired when capture state reaches the UI"
-)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tone {
     Neutral,
-    Accent,
     Success,
     Warning,
     Danger,
@@ -24,7 +19,6 @@ impl Tone {
     fn color(self) -> u32 {
         match self {
             Self::Neutral => theme::NEUTRAL,
-            Self::Accent => theme::ACCENT,
             Self::Success => theme::SUCCESS,
             Self::Warning => theme::WARNING,
             Self::Danger => theme::DANGER,
@@ -37,6 +31,7 @@ pub enum ButtonVariant {
     Primary,
     Secondary,
     Ghost,
+    Danger,
 }
 
 /// The base surface: one subtle border, one fill, one radius.
@@ -142,6 +137,12 @@ pub fn button(
             theme::TEXT,
             theme::BORDER_STRONG,
         ),
+        ButtonVariant::Danger => (
+            theme::RECORDING,
+            theme::RECORDING_HOVER,
+            theme::TEXT_ON_ACCENT,
+            theme::RECORDING,
+        ),
         ButtonVariant::Ghost => (
             theme::SURFACE,
             theme::SURFACE_HOVER,
@@ -173,6 +174,46 @@ pub fn button(
                 this.opacity(0.45)
             }
         })
+}
+
+/// Selectable option chip (resolution, fps, quality). Callers attach `on_click` only when enabled.
+pub fn chip(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    selected: bool,
+    enabled: bool,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .h(px(26.))
+        .px_2p5()
+        .flex()
+        .items_center()
+        .rounded_md()
+        .border_1()
+        .text_xs()
+        .font_weight(FontWeight::MEDIUM)
+        .map(|this| {
+            if selected {
+                this.border_color(rgba(theme::FOCUS_RING))
+                    .bg(rgba(theme::ACCENT_SUBTLE))
+                    .text_color(rgb(theme::TEXT))
+            } else {
+                this.border_color(rgb(theme::BORDER))
+                    .bg(rgb(theme::SURFACE_RAISED))
+                    .text_color(rgb(theme::TEXT_SECONDARY))
+            }
+        })
+        .map(|this| {
+            if enabled {
+                this.cursor_pointer().when(!selected, |this| {
+                    this.hover(|style| style.border_color(rgb(theme::BORDER_STRONG)))
+                })
+            } else {
+                this.opacity(0.45)
+            }
+        })
+        .child(label.into())
 }
 
 /// One label/value line inside a panel. Rows after the first draw a top divider.

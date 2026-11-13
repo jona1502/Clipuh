@@ -30,3 +30,6 @@ pub const SUCCESS: u32 = 0x4ade80;
 pub const WARNING: u32 = 0xfbbf24;
 pub const DANGER: u32 = 0xf87171;
 pub const NEUTRAL: u32 = 0x7a7a86;
+// Solid fill for the live-recording dot and the stop button.
+pub const RECORDING: u32 = 0xe5484d;
+pub const RECORDING_HOVER: u32 = 0xee5a5f;

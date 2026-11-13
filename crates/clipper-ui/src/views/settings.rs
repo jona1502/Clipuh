@@ -1,3 +1,4 @@
+use clipper_core::recording::QualityProfile;
 use clipper_storage::{
     AppConfig,
     config::{EncoderPreference, ReplayMode, Theme, VideoCodec},
@@ -28,6 +29,16 @@ fn group(title: &'static str, rows: Vec<Row>) -> Div {
 
 fn text(value: impl Into<SharedString>) -> AnyElement {
     value_text(value).into_any_element()
+}
+
+fn path_text(path: String) -> AnyElement {
+    div()
+        .max_w(gpui::px(420.))
+        .overflow_hidden()
+        .text_ellipsis()
+        .whitespace_nowrap()
+        .child(value_text(path))
+        .into_any_element()
 }
 
 fn toggle(on: bool) -> AnyElement {
@@ -65,10 +76,15 @@ pub(super) fn content(config: &AppConfig) -> Div {
             vec![
                 (
                     "Resolution",
-                    None,
+                    Some("Resolution, frame rate and quality change on the Dashboard."),
                     text(format!("{}×{}", video.width, video.height)),
                 ),
                 ("Frame rate", None, text(format!("{} fps", video.fps))),
+                (
+                    "Quality",
+                    None,
+                    text(QualityProfile::from(config.recording.quality).label()),
+                ),
                 ("Codec", None, text(codec)),
                 ("Encoder", None, text(encoder)),
                 (
@@ -110,28 +126,21 @@ pub(super) fn content(config: &AppConfig) -> Div {
             ],
         ));
 
-    // Path is shown only when the config directory can be resolved.
-    if let Ok(path) = config_path() {
-        root = root.child(group(
-            "Storage",
-            vec![(
-                "Settings file",
-                None,
-                div()
-                    .max_w(gpui::px(420.))
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .whitespace_nowrap()
-                    .child(value_text(path.display().to_string()))
-                    .into_any_element(),
-            )],
-        ));
-    } else {
-        root = root.child(group(
-            "Storage",
-            vec![("Settings file", None, text("Unavailable"))],
-        ));
-    }
+    let recordings = match config.recording_options() {
+        Ok(options) => path_text(options.output_directory.display().to_string()),
+        Err(error) => text(error.to_string()),
+    };
+    let settings_file = match config_path() {
+        Ok(path) => path_text(path.display().to_string()),
+        Err(_) => text("Unavailable"),
+    };
+    root = root.child(group(
+        "Storage",
+        vec![
+            ("Recordings folder", None, recordings),
+            ("Settings file", None, settings_file),
+        ],
+    ));
 
     root.child(group(
         "App",
@@ -163,10 +172,7 @@ pub(super) fn content(config: &AppConfig) -> Div {
             ),
         ],
     ))
-    .child(
-        div()
-            .text_xs()
-            .text_color(rgb(theme::TEXT_TERTIARY))
-            .child("Settings are read from settings.toml. Editing in the app is coming later."),
-    )
+    .child(div().text_xs().text_color(rgb(theme::TEXT_TERTIARY)).child(
+        "Other settings are read from settings.toml; editing them in the app is coming later.",
+    ))
 }

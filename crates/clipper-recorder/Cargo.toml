@@ -1,0 +1,16 @@
+[package]
+name = "clipper-recorder"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+clipper-core.workspace = true
+async-channel.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+clipper-platform.workspace = true
+clipper-capture.workspace = true
+clipper-encoder.workspace = true
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_System_SystemInformation"] }
