@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt;
 
-use clipper_core::recording::{AAC_BITRATE_BPS, RecordingAudioOptions};
+use clipper_core::recording::{AAC_TRACK_BITRATE_BPS, RecordingAudioOptions};
 use clipper_core::storage_estimate::{
     EstimateError, HybridEstimate, estimate_hybrid, estimate_size,
 };
@@ -70,7 +70,7 @@ impl AppConfig {
             ..Default::default()
         }
         .encoded_track_count();
-        let audio_bps = u64::from(audio_tracks) * u64::from(AAC_BITRATE_BPS);
+        let audio_bps = u64::from(audio_tracks) * u64::from(AAC_TRACK_BITRATE_BPS);
         // Current MP4 estimates exclude container overhead until it is measured.
         const CONTAINER_OVERHEAD_BASIS_POINTS: u16 = 0;
 

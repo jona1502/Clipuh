@@ -8,6 +8,8 @@ recorder. It does not measure files, disk space or replay-buffer occupancy.
 - Video uses `H264Tuning::new` with the configured quality profile, base bitrate
   and FPS. Performance and Balanced retain the base rate; Quality applies the
   existing 1.5x target and cap. Resolution and FPS do not multiply a known rate.
+  Available mode combinations still follow the recorder's H.264 limits; 4K
+  is limited to 60 FPS.
 - Audio uses the shared `AAC_BITRATE_BPS` constant and
   `RecordingAudioOptions::encoded_track_count()`. The current recorder creates
   one mix when desktop or microphone is enabled, plus an isolated track for each

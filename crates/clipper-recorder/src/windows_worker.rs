@@ -520,7 +520,7 @@ fn build_recording(
         &d3d,
         &config,
         &partial,
-        options.audio.encoded_track_count() as usize,
+        options.audio.track_count(),
     )
     .map_err(|error| encoder_message(&error))?;
 

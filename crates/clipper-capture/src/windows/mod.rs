@@ -493,6 +493,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    #[ignore = "needs a monitor"]
     fn lists_at_least_one_monitor() {
         let sources = list_sources().expect("list");
         let monitor = sources
@@ -503,6 +504,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs a D3D11 GPU device"]
     fn invalid_window_is_unavailable() {
         let d3d = D3DContext::new().expect("d3d");
         let source = CaptureSource {
@@ -517,6 +519,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs a GPU and a monitor"]
     fn monitor_capture_delivers_frame() {
         let d3d = D3DContext::new().expect("d3d");
         let source = list_sources()

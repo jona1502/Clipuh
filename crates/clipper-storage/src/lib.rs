@@ -4,6 +4,6 @@ pub mod storage_projection;
 pub use config::{
     AppConfig, ConfigError, ConfigValidationError, NOTIFICATION_DURATION_SECONDS,
     NotificationSettings, QualityPreset, VIDEO_FPS, VIDEO_RESOLUTIONS, config_path,
-    default_recording_directory,
+    default_recording_directory, video_mode_supported,
 };
 pub use storage_projection::{StorageProjection, StorageProjectionError};
