@@ -10,8 +10,8 @@ use clipper_platform::windows::hotkey::HotkeyHandle;
 use clipper_storage::AppConfig;
 use gpui::prelude::*;
 use gpui::{
-    App, Context, Div, FocusHandle, FontWeight, KeyBinding, KeyDownEvent, NoAction, Render, Task,
-    Window, actions, div, px, rgb, rgba,
+    App, Context, Div, Entity, FocusHandle, FontWeight, KeyBinding, KeyDownEvent, NoAction, Render,
+    Task, Window, actions, div, px, rgb, rgba,
 };
 
 use crate::components::{Tone, badge, kbd, list_item, shortcut, status_dot};
@@ -69,6 +69,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("enter", Confirm, dropdown),
         KeyBinding::new("space", Confirm, dropdown),
         KeyBinding::new("escape", Dismiss, dropdown),
+        KeyBinding::new("space", editor::TogglePlayback, Some(editor::CONTEXT)),
+        KeyBinding::new("i", editor::SetIn, Some(editor::CONTEXT)),
+        KeyBinding::new("o", editor::SetOut, Some(editor::CONTEXT)),
     ]);
     // gpui runs key bindings before `on_key_down`. While the hotkey recorder has
     // focus, its (deeper) NoAction bindings cancel the window bindings so every
@@ -219,6 +222,8 @@ pub struct ClipperWindow {
     /// The open capture dropdown and its highlighted row.
     capture_menu: Option<(CaptureMenu, usize)>,
     capture_focus: [FocusHandle; 4],
+    /// The clip open in the Editor page; its player only runs while that page is shown.
+    editor: Option<Entity<editor::ClipEditor>>,
 }
 
 impl ClipperWindow {
@@ -346,6 +351,7 @@ impl ClipperWindow {
             // After the four sidebar items in tab order.
             capture_focus: [4, 5, 6, 7]
                 .map(|index| cx.focus_handle().tab_index(index).tab_stop(true)),
+            editor: None,
         };
         this.storage_projection_cache.refresh(&this.config);
         this.send(RecorderCommand::RefreshSources);
@@ -404,12 +410,41 @@ impl ClipperWindow {
         }
     }
 
+    /// Opens `path` in the Editor page, replacing (and releasing) any open clip.
+    pub(super) fn open_in_editor(
+        &mut self,
+        path: std::path::PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let same = self
+            .editor
+            .as_ref()
+            .is_some_and(|editor| editor.read(cx).path() == path);
+        if !same {
+            if let Some(old) = self.editor.take() {
+                old.update(cx, |old, _| old.release_images(window));
+            }
+            self.editor = Some(cx.new(|cx| editor::ClipEditor::new(path, window, cx)));
+        }
+        self.navigate(Page::Editor, window, cx);
+    }
+
     fn navigate(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
         // An open capture menu belongs to the page being left.
         self.capture_menu = None;
         let palette_was_open = self.palette.take().is_some();
         if palette_was_open {
             window.focus(&self.focus);
+        }
+        if self.active_page != page
+            && let Some(editor) = &self.editor
+        {
+            if page == Page::Editor {
+                editor.update(cx, |editor, cx| editor.resume(window, cx));
+            } else if self.active_page == Page::Editor {
+                editor.update(cx, |editor, cx| editor.suspend(window, cx));
+            }
         }
         if self.active_page != page || palette_was_open {
             self.active_page = page;
@@ -628,8 +663,11 @@ impl ClipperWindow {
     fn page_content(&self, window: &Window, cx: &mut Context<Self>) -> Div {
         match self.active_page {
             Page::Dashboard => dashboard::content(self, window, cx),
-            Page::Clips => clips::content(self),
-            Page::Editor => editor::content(),
+            Page::Clips => clips::content(self, cx),
+            Page::Editor => match &self.editor {
+                Some(editor) => div().child(editor.clone()),
+                None => editor::empty(),
+            },
             Page::Settings => settings::content(self, cx),
         }
     }
