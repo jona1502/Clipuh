@@ -1,3 +1,5 @@
+// Release builds are GUI-only; debug builds keep the console for logs.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #![forbid(unsafe_code)]
 
 #[cfg(windows)]
