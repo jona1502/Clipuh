@@ -3,9 +3,9 @@ use gpui::{Div, div, px, rgb};
 
 use super::ClipperWindow;
 use crate::components::{ButtonVariant, button, empty_state, panel};
-use crate::notifications::run_explorer;
 use crate::state::{SavedClip, format_elapsed};
 use crate::theme;
+use clipper_platform::windows::shell;
 
 pub(super) fn content(window: &ClipperWindow) -> Div {
     let clips = &window.recording.saved_clips;
@@ -96,7 +96,11 @@ fn row(index: usize, clip: &SavedClip) -> Div {
                         None,
                         true,
                     )
-                    .on_click(move |_, _, _| run_explorer(&open)),
+                    .on_click(move |_, _, _| {
+                        if let Err(err) = shell::open_path(&open) {
+                            eprintln!("clips: open failed: {err}");
+                        }
+                    }),
                 )
                 .child(
                     button(
@@ -106,7 +110,11 @@ fn row(index: usize, clip: &SavedClip) -> Div {
                         None,
                         true,
                     )
-                    .on_click(move |_, _, _| run_explorer(format!("/select,{}", folder.display()))),
+                    .on_click(move |_, _, _| {
+                        if let Err(err) = shell::reveal_in_folder(&folder) {
+                            eprintln!("clips: open folder failed: {err}");
+                        }
+                    }),
                 ),
         )
 }

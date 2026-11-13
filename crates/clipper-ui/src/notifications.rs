@@ -1,15 +1,14 @@
 //! Non-activating toast window shown when a clip is being saved, saved or failed.
 
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::Duration;
 
-use clipper_platform::windows::notify;
+use clipper_platform::windows::{notify, shell};
 use clipper_storage::NotificationSettings;
 use gpui::prelude::*;
 use gpui::{
-    App, Bounds, Context, SharedString, Task, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowHandle, WindowKind, WindowOptions, div, point, px, rgb, size,
+    App, Bounds, Context, Div, SharedString, Stateful, Task, Window, WindowBackgroundAppearance,
+    WindowBounds, WindowHandle, WindowKind, WindowOptions, div, point, px, rgb, size,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
@@ -32,9 +31,22 @@ struct Plan {
 }
 
 const SAVING_TIMEOUT: Duration = Duration::from_secs(15);
-const TOAST_W: f32 = 360.0;
-const TOAST_H: f32 = 96.0;
 const MARGIN: f32 = 16.0;
+/// How often an expired toast re-checks whether the pointer has left it.
+const HOVER_POLL: Duration = Duration::from_millis(250);
+// Toast layout in logical px (scaled by DPI when shown). Every row has an
+// explicit height, so the window height derives from these and content fits.
+const TOAST_W: f32 = 360.0;
+const PAD: f32 = 12.0;
+const BORDER: f32 = 1.0;
+const GAP: f32 = 6.0;
+const TITLE_H: f32 = 20.0;
+const DESC_LINES: usize = 2;
+const DESC_LINE_H: f32 = 16.0;
+const DESC_H: f32 = DESC_LINES as f32 * DESC_LINE_H;
+const ACTION_H: f32 = 28.0;
+const ICON_W: f32 = 18.0;
+const TOAST_H: f32 = (PAD + BORDER) * 2.0 + TITLE_H + GAP + DESC_H + GAP + ACTION_H;
 
 /// `None` means do nothing at all (no window, no sound).
 fn plan(
@@ -62,15 +74,11 @@ fn plan(
 /// Owns at most one toast window.
 pub struct Notifier {
     window: Option<WindowHandle<ToastView>>,
-    hide_timer: Option<Task<()>>,
 }
 
 impl Notifier {
     pub fn new() -> Self {
-        Self {
-            window: None,
-            hide_timer: None,
-        }
+        Self { window: None }
     }
 
     pub fn show(&mut self, toast: Toast, settings: &NotificationSettings, cx: &mut App) {
@@ -85,32 +93,38 @@ impl Notifier {
         }
         let open_clip = settings.open_clip_action;
 
+        // A removed window makes `update` fail, which falls through to reopening.
         let reused = self.window.is_some_and(|handle| {
             let toast = toast.clone();
             handle
-                .update(cx, |view, _, cx| {
+                .update(cx, |view, window, cx| {
                     view.toast = toast;
                     view.open_clip = open_clip;
+                    view.hide_after = plan.hide_after;
+                    view.start_timer(window, cx);
                     cx.notify();
                 })
                 .is_ok()
         });
         if !reused {
-            self.window = open_toast(toast, open_clip, cx);
+            self.window = open_toast(toast, open_clip, plan.hide_after, cx);
         }
-        let Some(handle) = self.window else {
-            self.hide_timer = None;
-            return;
-        };
-        // Replacing the task cancels the previous timer.
-        self.hide_timer = Some(cx.spawn(async move |cx| {
-            cx.background_executor().timer(plan.hide_after).await;
-            let _ = handle.update(cx, |_, window, _| window.remove_window());
-        }));
     }
 }
 
-fn open_toast(toast: Toast, open_clip: bool, cx: &mut App) -> Option<WindowHandle<ToastView>> {
+fn hwnd_of(window: &Window) -> Option<isize> {
+    match HasWindowHandle::window_handle(window).map(|h| h.as_raw()) {
+        Ok(RawWindowHandle::Win32(h)) => Some(h.hwnd.get()),
+        _ => None,
+    }
+}
+
+fn open_toast(
+    toast: Toast,
+    open_clip: bool,
+    hide_after: Duration,
+    cx: &mut App,
+) -> Option<WindowHandle<ToastView>> {
     let Some(display) = cx.primary_display() else {
         eprintln!("notifications: no primary display");
         return None;
@@ -135,7 +149,18 @@ fn open_toast(toast: Toast, open_clip: bool, cx: &mut App) -> Option<WindowHandl
         window_background: WindowBackgroundAppearance::Opaque,
         ..Default::default()
     };
-    let handle = match cx.open_window(options, |_, cx| cx.new(|_| ToastView { toast, open_clip })) {
+    let handle = match cx.open_window(options, |window, cx| {
+        cx.new(|cx| {
+            let mut view = ToastView {
+                toast,
+                open_clip,
+                hide_after,
+                hide_task: None,
+            };
+            view.start_timer(window, cx);
+            view
+        })
+    }) {
         Ok(h) => h,
         Err(err) => {
             eprintln!("notifications: open_window failed: {err}");
@@ -143,42 +168,91 @@ fn open_toast(toast: Toast, open_clip: bool, cx: &mut App) -> Option<WindowHandl
         }
     };
     let hwnd = handle
-        .update(cx, |_, window, _| {
-            match window.window_handle().map(|h| h.as_raw()) {
-                Ok(RawWindowHandle::Win32(h)) => Some(h.hwnd.get()),
-                _ => None,
-            }
-        })
+        .update(cx, |_, window, _| hwnd_of(window))
         .ok()
         .flatten();
-    let shown = match hwnd {
-        Some(hwnd) => {
-            notify::show_without_activation(hwnd, TOAST_W as i32, TOAST_H as i32, MARGIN as i32)
-                .map_err(|e| e.to_string())
+    // Sizing sends WM_SIZE synchronously. Inside this update the app is
+    // borrowed, so GPUI drops the resize and keeps laying the toast out at the
+    // hidden window's default size: everything below the title ends up
+    // outside the 360x118 window. A task runs outside the update.
+    cx.spawn(async move |cx| {
+        let shown = match hwnd {
+            Some(hwnd) => {
+                notify::show_without_activation(hwnd, TOAST_W as i32, TOAST_H as i32, MARGIN as i32)
+                    .map_err(|e| e.to_string())
+            }
+            None => Err("no Win32 window handle".to_string()),
+        };
+        if let Err(err) = shown {
+            eprintln!("notifications: could not show toast: {err}");
+            let _ = handle.update(cx, |_, window, _| window.remove_window());
         }
-        None => Err("no Win32 window handle".to_string()),
-    };
-    if let Err(err) = shown {
-        eprintln!("notifications: could not show toast: {err}");
-        let _ = handle.update(cx, |_, window, _| window.remove_window());
-        return None;
-    }
+    })
+    .detach();
     Some(handle)
 }
 
 struct ToastView {
     toast: Toast,
     open_clip: bool,
+    hide_after: Duration,
+    /// Dropping the task cancels the auto-hide.
+    hide_task: Option<Task<()>>,
 }
 
-pub(crate) fn run_explorer(arg: impl AsRef<std::ffi::OsStr>) {
-    if let Err(err) = Command::new("explorer").arg(arg).spawn() {
-        eprintln!("notifications: explorer failed: {err}");
+impl ToastView {
+    /// (Re)starts the auto-hide countdown with the full `hide_after`.
+    /// (Re)starts the auto-hide countdown with the full `hide_after`. While the
+    /// pointer is over the toast it stays open. Checked with Win32 because the
+    /// non-activated toast gets no reliable hover-leave events from GPUI.
+    fn start_timer(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let after = self.hide_after;
+        self.hide_task = Some(cx.spawn_in(window, async move |_, cx| {
+            cx.background_executor().timer(after).await;
+            loop {
+                let Ok(hovered) =
+                    cx.update(|window, _| hwnd_of(window).is_some_and(notify::cursor_over_window))
+                else {
+                    return;
+                };
+                if !hovered {
+                    break;
+                }
+                cx.background_executor().timer(HOVER_POLL).await;
+            }
+            let _ = cx.update(|window, _| window.remove_window());
+        }));
+    }
+
+    /// Closes the toast on success, else shows the error in place.
+    fn finish_action(
+        &mut self,
+        result: std::io::Result<()>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Err(err) = result else {
+            window.remove_window();
+            return;
+        };
+        let message = if err.kind() == std::io::ErrorKind::NotFound {
+            "Clip file not found. It may have been moved or deleted.".to_string()
+        } else {
+            err.to_string()
+        };
+        self.toast = Toast::Failed { message };
+        self.start_timer(window, cx);
+        cx.notify();
     }
 }
 
+/// Pins a button to the action row: fixed height, never shrinks or wraps.
+fn compact(b: Stateful<Div>) -> Stateful<Div> {
+    b.flex_none().h(px(ACTION_H)).whitespace_nowrap()
+}
+
 impl Render for ToastView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let (title, description, tone): (&str, SharedString, Tone) = match &self.toast {
             Toast::Saving => (
                 "Saving clip…",
@@ -187,17 +261,22 @@ impl Render for ToastView {
             ),
             Toast::Saved { duration, .. } => (
                 "Clip saved",
-                format!("Your last {} seconds were saved.", duration.as_secs()).into(),
+                format!("Last {} seconds captured", duration.as_secs()).into(),
                 Tone::Success,
             ),
-            Toast::Failed { message } => ("Clip failed", message.clone().into(), Tone::Danger),
+            Toast::Failed { message } => ("Clip not saved", message.clone().into(), Tone::Danger),
         };
 
-        let mut actions = div().flex().gap_2();
+        let mut actions = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .h(px(ACTION_H))
+            .pl(px(ICON_W));
         if let Toast::Saved { path, .. } = &self.toast {
             if self.open_clip {
                 let p = path.clone();
-                actions = actions.child(
+                actions = actions.child(compact(
                     button(
                         "toast-open-clip",
                         "Open Clip",
@@ -205,14 +284,13 @@ impl Render for ToastView {
                         None,
                         true,
                     )
-                    .on_click(move |_, window, _| {
-                        run_explorer(&p);
-                        window.remove_window();
-                    }),
-                );
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.finish_action(shell::open_path(&p), window, cx);
+                    })),
+                ));
             }
             let p = path.clone();
-            actions = actions.child(
+            actions = actions.child(compact(
                 button(
                     "toast-open-folder",
                     "Open Folder",
@@ -220,19 +298,28 @@ impl Render for ToastView {
                     None,
                     true,
                 )
-                .on_click(move |_, window, _| {
-                    run_explorer(format!("/select,{}", p.display()));
-                    window.remove_window();
-                }),
-            );
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.finish_action(shell::reveal_in_folder(&p), window, cx);
+                })),
+            ));
         }
+        actions = actions.child(div().flex_1()).child(
+            compact(
+                button("toast-dismiss", "×", ButtonVariant::Ghost, None, true)
+                    .w(px(ACTION_H))
+                    .px_0()
+                    .justify_center(),
+            )
+            .on_click(|_, window, _| window.remove_window()),
+        );
 
         div()
+            .id("toast")
             .size_full()
             .flex()
             .flex_col()
-            .gap_2()
-            .p_3()
+            .justify_between()
+            .p(px(PAD))
             .rounded_xl()
             .border_1()
             .border_color(rgb(theme::BORDER_STRONG))
@@ -243,23 +330,33 @@ impl Render for ToastView {
                 div()
                     .flex()
                     .items_center()
-                    .gap_2()
-                    .child(status_dot(tone))
-                    .child(div().flex_1().text_sm().child(title))
+                    .h(px(TITLE_H))
                     .child(
                         div()
-                            .id("toast-close")
-                            .px_1()
-                            .cursor_pointer()
-                            .text_color(rgb(theme::TEXT_TERTIARY))
-                            .hover(|s| s.text_color(rgb(theme::TEXT)))
-                            .on_click(|_, window, _| window.remove_window())
-                            .child("×"),
+                            .w(px(ICON_W))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .child(status_dot(tone)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_sm()
+                            .line_height(px(TITLE_H))
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .child(title),
                     ),
             )
             .child(
                 div()
+                    .h(px(DESC_H))
+                    .pl(px(ICON_W))
+                    .overflow_hidden()
                     .text_xs()
+                    .line_height(px(DESC_LINE_H))
+                    .line_clamp(DESC_LINES)
                     .text_color(rgb(theme::TEXT_SECONDARY))
                     .child(description),
             )
@@ -290,6 +387,13 @@ mod tests {
         Toast::Failed {
             message: "x".into(),
         }
+    }
+
+    #[test]
+    fn toast_height_fits_rows() {
+        let rows = TITLE_H + DESC_H + ACTION_H + 2.0 * GAP + 2.0 * (PAD + BORDER);
+        assert!(TOAST_H >= rows);
+        assert_eq!(DESC_H, DESC_LINES as f32 * DESC_LINE_H);
     }
 
     #[test]
