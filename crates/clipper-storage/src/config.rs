@@ -1,8 +1,9 @@
 use clipper_core::hotkey::{DEFAULT_SAVE_REPLAY, Hotkey};
 use clipper_core::recording::{
-    QualityProfile, RecordingAudioOptions, RecordingOptions, h264_supports,
+    QualityProfile, REPLAY_DURATIONS_SECONDS, RecordingAudioOptions, RecordingOptions,
+    ReplayOptions, h264_supports,
 };
-use directories::{ProjectDirs, UserDirs};
+use directories::{BaseDirs, ProjectDirs, UserDirs};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt;
@@ -11,6 +12,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 /// Output resolutions offered by the recorder: 720p, 900p, 1080p, 1440p, 4K.
 pub const VIDEO_RESOLUTIONS: [(u32, u32); 5] = [
@@ -30,10 +32,10 @@ pub fn video_mode_supported(width: u32, height: u32, fps: u32) -> bool {
         && h264_supports(width, height, fps)
 }
 const MAX_BITRATE_MBPS: u32 = 100;
-const MIN_REPLAY_DURATION_SECONDS: u32 = 5;
-const MAX_REPLAY_DURATION_SECONDS: u32 = 300;
 const MIN_REPLAY_MEMORY_MEGABYTES: u32 = 16;
 const MAX_REPLAY_MEMORY_MEGABYTES: u32 = 512;
+/// Allowed replay disk cache limit, in MiB.
+pub const REPLAY_DISK_LIMIT_MEGABYTES: std::ops::RangeInclusive<u32> = 256..=65536;
 /// Allowed notification display time, in seconds.
 pub const NOTIFICATION_DURATION_SECONDS: std::ops::RangeInclusive<u32> = 2..=10;
 
@@ -95,12 +97,24 @@ impl AppConfig {
             ));
         }
 
-        if !(MIN_REPLAY_DURATION_SECONDS..=MAX_REPLAY_DURATION_SECONDS)
-            .contains(&self.replay.duration_seconds)
-        {
+        if !REPLAY_DURATIONS_SECONDS.contains(&self.replay.duration_seconds) {
             issues.push(ValidationIssue::new(
                 "replay.duration_seconds",
-                "must be between 5 and 300 seconds",
+                "must be 15, 30, 60, 120 or 300 seconds",
+            ));
+        }
+        if !REPLAY_DISK_LIMIT_MEGABYTES.contains(&self.replay.disk_limit_megabytes) {
+            issues.push(ValidationIssue::new(
+                "replay.disk_limit_megabytes",
+                "must be between 256 and 65536 MiB",
+            ));
+        }
+        if let Some(directory) = &self.replay.cache_directory
+            && !directory.is_absolute()
+        {
+            issues.push(ValidationIssue::new(
+                "replay.cache_directory",
+                "must be an absolute path",
             ));
         }
         if !(MIN_REPLAY_MEMORY_MEGABYTES..=MAX_REPLAY_MEMORY_MEGABYTES)
@@ -222,6 +236,24 @@ impl AppConfig {
         }
     }
 
+    /// Resolves the settings needed to start the instant replay buffer.
+    ///
+    /// Without a configured cache directory, the default
+    /// `%LOCALAPPDATA%\Clipper\replay-cache` is used.
+    pub fn replay_options(&self) -> Result<ReplayOptions, ConfigError> {
+        let cache_directory = match &self.replay.cache_directory {
+            Some(directory) => directory.clone(),
+            None => default_replay_cache_directory()?,
+        };
+        Ok(ReplayOptions {
+            recording: self.recording_options()?,
+            duration: Duration::from_secs(u64::from(self.replay.duration_seconds)),
+            memory_limit_bytes: u64::from(self.replay.memory_limit_megabytes) * 1024 * 1024,
+            cache_directory: Some(cache_directory),
+            disk_limit_bytes: u64::from(self.replay.disk_limit_megabytes) * 1024 * 1024,
+        })
+    }
+
     /// Saves this configuration to the per-user settings path.
     pub fn save(&self) -> Result<(), ConfigError> {
         self.save_to(&config_path()?)
@@ -263,6 +295,12 @@ impl AppConfig {
                 .find(|&&fps| h264_supports(width, height, fps))
         {
             self.video.fps = fps;
+        }
+        // Older versions allowed any replay duration in 5..=300 s. Snap such
+        // values to the nearest preset instead of failing startup; the
+        // normalized value is persisted on the next settings change.
+        if (5..=300).contains(&self.replay.duration_seconds) {
+            self.replay.duration_seconds = nearest_replay_duration(self.replay.duration_seconds);
         }
     }
 
@@ -322,6 +360,13 @@ pub struct ReplaySettings {
     /// RAM budget for Hybrid replay mode; older footage must spill to disk.
     pub memory_limit_megabytes: u32,
     pub hotkey: String,
+    /// Start the replay buffer automatically when the app starts.
+    pub enabled: bool,
+    /// Absolute directory for temporary SSD segments; `None` means
+    /// `%LOCALAPPDATA%\Clipper\replay-cache`.
+    pub cache_directory: Option<PathBuf>,
+    /// Upper bound for temporary SSD segments, in MiB.
+    pub disk_limit_megabytes: u32,
 }
 
 impl Default for ReplaySettings {
@@ -330,6 +375,9 @@ impl Default for ReplaySettings {
             mode: ReplayMode::Hybrid,
             duration_seconds: 60,
             memory_limit_megabytes: 64,
+            enabled: false,
+            cache_directory: None,
+            disk_limit_megabytes: 4096,
             hotkey: DEFAULT_SAVE_REPLAY.to_owned(),
         }
     }
@@ -508,6 +556,22 @@ pub fn default_recording_directory() -> Result<PathBuf, ConfigError> {
         .map(Path::to_path_buf)
         .unwrap_or_else(|| user_dirs.home_dir().join("Videos"));
     Ok(videos.join("Clipper"))
+}
+
+/// Returns the default replay SSD cache directory
+/// (`%LOCALAPPDATA%\Clipper\replay-cache`).
+pub fn default_replay_cache_directory() -> Result<PathBuf, ConfigError> {
+    let base = BaseDirs::new().ok_or(ConfigError::NoConfigDirectory)?;
+    Ok(base.data_local_dir().join("Clipper").join("replay-cache"))
+}
+
+/// Returns the allowed replay duration closest to `seconds` (ties go lower).
+pub fn nearest_replay_duration(seconds: u32) -> u32 {
+    REPLAY_DURATIONS_SECONDS
+        .iter()
+        .copied()
+        .min_by_key(|preset| preset.abs_diff(seconds))
+        .unwrap_or(60)
 }
 
 /// Returns the settings file path in the current user's config directory.
@@ -1200,5 +1264,97 @@ hotkey = \"F9\"
         let path = temp.path("custom.toml");
         config.save_to(&path).expect("save");
         assert_eq!(AppConfig::load_from(&path).expect("load"), config);
+    }
+
+    #[test]
+    fn replay_defaults_and_legacy_files_load() {
+        let config = AppConfig::default();
+        assert!(!config.replay.enabled);
+        assert_eq!(config.replay.cache_directory, None);
+        assert_eq!(config.replay.disk_limit_megabytes, 4096);
+        let temp = TestDir::new();
+        let path = temp.path("legacy.toml");
+        fs::write(&path, "[replay]\nduration_seconds = 60\n").expect("write");
+        assert_eq!(
+            AppConfig::load_from(&path).expect("load").replay,
+            config.replay
+        );
+    }
+
+    #[test]
+    fn replay_settings_round_trip() {
+        let temp = TestDir::new();
+        let mut config = AppConfig::default();
+        config.replay.enabled = true;
+        config.replay.duration_seconds = 120;
+        config.replay.disk_limit_megabytes = 8192;
+        config.replay.cache_directory = Some(temp.path("cache"));
+        let path = temp.path("replay.toml");
+        config.save_to(&path).expect("save");
+        assert_eq!(AppConfig::load_from(&path).expect("load"), config);
+    }
+
+    #[test]
+    fn legacy_replay_duration_is_normalized_on_load() {
+        for (old, new) in [
+            (5, 15),
+            (22, 15),
+            (23, 30),
+            (45, 30),
+            (46, 60),
+            (200, 120),
+            (300, 300),
+        ] {
+            let temp = TestDir::new();
+            let path = temp.path("old.toml");
+            fs::write(&path, format!("[replay]\nduration_seconds = {old}\n")).expect("write");
+            let loaded = AppConfig::load_from(&path).expect("load");
+            assert_eq!(loaded.replay.duration_seconds, new, "{old}");
+        }
+        let temp = TestDir::new();
+        let path = temp.path("bad.toml");
+        fs::write(&path, "[replay]\nduration_seconds = 4\n").expect("write");
+        assert!(AppConfig::load_from(&path).is_err());
+    }
+
+    #[test]
+    fn replay_validation_rejects_bad_values() {
+        let mut config = AppConfig::default();
+        config.replay.duration_seconds = 45;
+        config.replay.disk_limit_megabytes = 255;
+        config.replay.cache_directory = Some(PathBuf::from("relative"));
+        let err = config.validate().expect_err("invalid");
+        let fields: Vec<_> = err.issues().iter().map(ValidationIssue::field).collect();
+        assert!(fields.contains(&"replay.duration_seconds"));
+        assert!(fields.contains(&"replay.disk_limit_megabytes"));
+        assert!(fields.contains(&"replay.cache_directory"));
+        config.replay.duration_seconds = 60;
+        config.replay.cache_directory = None;
+        config.replay.disk_limit_megabytes = 65537;
+        assert!(config.validate().is_err());
+        config.replay.disk_limit_megabytes = 65536;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn replay_options_follow_settings() {
+        let temp = TestDir::new();
+        let mut config = AppConfig::default();
+        config.recording.output_directory = Some(temp.path("clips"));
+        config.replay.duration_seconds = 30;
+        config.replay.memory_limit_megabytes = 128;
+        config.replay.disk_limit_megabytes = 1024;
+        config.replay.cache_directory = Some(temp.path("cache"));
+        let options = config.replay_options().expect("options");
+        assert_eq!(options.duration, Duration::from_secs(30));
+        assert_eq!(options.memory_limit_bytes, 128 * 1024 * 1024);
+        assert_eq!(options.disk_limit_bytes, 1024 * 1024 * 1024);
+        assert_eq!(options.cache_directory, Some(temp.path("cache")));
+        assert_eq!(options.recording.output_directory, temp.path("clips"));
+
+        config.replay.cache_directory = None;
+        let options = config.replay_options().expect("options");
+        let cache = options.cache_directory.expect("default cache");
+        assert!(cache.ends_with(Path::new("Clipper").join("replay-cache")));
     }
 }

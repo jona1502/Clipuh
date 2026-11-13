@@ -1,10 +1,10 @@
 use clipper_core::hotkey::{Hotkey, HotkeyError, Key, Modifiers};
-use clipper_core::recording::QualityProfile;
+use clipper_core::recording::{QualityProfile, REPLAY_DURATIONS_SECONDS, RecorderCommand};
 use clipper_platform::windows::hotkey::RegisterError;
 use clipper_storage::{
     NOTIFICATION_DURATION_SECONDS, NotificationSettings,
     config::{EncoderPreference, ReplayMode, Theme, VideoCodec},
-    config_path,
+    config_path, default_replay_cache_directory,
 };
 use gpui::prelude::*;
 use gpui::{
@@ -16,7 +16,29 @@ use super::{ClipperWindow, HOTKEY_CONTEXT};
 use crate::components::{
     ButtonVariant, button, chip, kbd, panel, property_row, section_header, switch, value_text,
 };
+use crate::state::ReplayPhase;
 use crate::theme;
+
+/// RAM budgets offered for the replay buffer, in MiB.
+const REPLAY_MEMORY_PRESETS_MB: [u32; 5] = [32, 64, 128, 256, 512];
+/// Disk cache limits offered for the replay buffer, in MiB.
+const REPLAY_DISK_PRESETS_MB: [u32; 6] = [1024, 2048, 4096, 8192, 16384, 32768];
+
+fn size_label(megabytes: u32) -> String {
+    if megabytes >= 1024 && megabytes.is_multiple_of(1024) {
+        format!("{} GB", megabytes / 1024)
+    } else {
+        format!("{megabytes} MB")
+    }
+}
+
+fn duration_label(seconds: u32) -> String {
+    if seconds >= 60 && seconds.is_multiple_of(60) {
+        format!("{} min", seconds / 60)
+    } else {
+        format!("{seconds} s")
+    }
+}
 
 /// Recording mode for the save-replay shortcut.
 pub(super) struct HotkeyRecorder {
@@ -419,29 +441,79 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
         .children(durations)
         .into_any_element();
 
-    let replay_enabled = window.recording.settings_enabled();
-    let replay_durations = [30u32, 60, 120, 300]
+    let replay_durations = REPLAY_DURATIONS_SECONDS
         .into_iter()
         .map(|seconds| {
             chip(
                 ("replay-duration", seconds as usize),
-                format!("{seconds} s"),
+                duration_label(seconds),
                 replay.duration_seconds == seconds,
-                replay_enabled,
+                true,
             )
-            .when(replay_enabled, |this| {
-                this.on_click(cx.listener(move |this, _, _, cx| {
-                    this.config.replay.duration_seconds = seconds;
-                    this.persist_config(cx);
-                }))
-            })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.config.replay.duration_seconds = seconds;
+                // Applied live; the buffer keeps capturing.
+                if matches!(
+                    this.recording.replay.phase,
+                    ReplayPhase::Starting | ReplayPhase::Running { .. }
+                ) {
+                    this.send(RecorderCommand::SetReplayDuration(
+                        std::time::Duration::from_secs(u64::from(seconds)),
+                    ));
+                }
+                this.persist_config(cx);
+            }))
         })
         .collect::<Vec<_>>();
-    let replay_duration_chips = div()
-        .flex()
-        .gap_1p5()
-        .children(replay_durations)
+    let replay_memory = REPLAY_MEMORY_PRESETS_MB
+        .into_iter()
+        .map(|megabytes| {
+            chip(
+                ("replay-memory", megabytes as usize),
+                size_label(megabytes),
+                replay.memory_limit_megabytes == megabytes,
+                true,
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.config.replay.memory_limit_megabytes = megabytes;
+                this.persist_config(cx);
+            }))
+        })
+        .collect::<Vec<_>>();
+    let replay_disk = REPLAY_DISK_PRESETS_MB
+        .into_iter()
+        .map(|megabytes| {
+            chip(
+                ("replay-disk", megabytes as usize),
+                size_label(megabytes),
+                replay.disk_limit_megabytes == megabytes,
+                true,
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.config.replay.disk_limit_megabytes = megabytes;
+                this.persist_config(cx);
+            }))
+        })
+        .collect::<Vec<_>>();
+    let chips =
+        |items: Vec<gpui::Stateful<Div>>| div().flex().gap_1p5().children(items).into_any_element();
+    let replay_on = matches!(
+        window.recording.replay.phase,
+        ReplayPhase::Starting | ReplayPhase::Running { .. }
+    ) || (window.recording.replay.is_off() && replay.enabled);
+    let replay_toggle = div()
+        .id("replay-enabled")
+        .cursor_pointer()
+        .on_click(cx.listener(|this, _, _, cx| this.toggle_replay(cx)))
+        .child(switch(replay_on))
         .into_any_element();
+    let cache_directory = match &replay.cache_directory {
+        Some(path) => path_text(path.display().to_string()),
+        None => match default_replay_cache_directory() {
+            Ok(path) => path_text(path.display().to_string()),
+            Err(error) => text(error.to_string()),
+        },
+    };
 
     let mut root = div()
         .flex()
@@ -521,16 +593,31 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
         .child(group(
             "Replay",
             vec![
+                (
+                    "Instant replay",
+                    Some("Starts automatically with Clipper. Needs a source on the Dashboard."),
+                    replay_toggle,
+                ),
                 ("Mode", None, text(mode)),
                 (
                     "Duration",
-                    Some("Storage estimate applies to the next recording."),
-                    replay_duration_chips,
+                    Some("Applies immediately, even while replay is running."),
+                    chips(replay_durations),
                 ),
                 (
                     "Memory budget",
-                    Some("RAM allowance for the theoretical replay estimate."),
-                    text(format!("{} MiB", replay.memory_limit_megabytes)),
+                    Some("Older footage spills to disk. Applies the next time replay starts."),
+                    chips(replay_memory),
+                ),
+                (
+                    "Disk cache limit",
+                    Some("Temporary SSD storage. Applies the next time replay starts."),
+                    chips(replay_disk),
+                ),
+                (
+                    "Cache folder",
+                    Some("Temporary files, cleaned up automatically."),
+                    cache_directory,
                 ),
             ],
         ))

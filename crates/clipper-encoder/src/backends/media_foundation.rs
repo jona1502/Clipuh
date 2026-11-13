@@ -68,7 +68,7 @@ fn code_is(error: &WinError, code: u32) -> bool {
 }
 
 /// Maps disk/permission failures; everything else stays a Windows error.
-fn map_error(error: WinError) -> EncoderError {
+pub(crate) fn map_error(error: WinError) -> EncoderError {
     // HRESULT_FROM_WIN32(ERROR_DISK_FULL) / (ERROR_HANDLE_DISK_FULL)
     if code_is(&error, 0x8007_0070) || code_is(&error, 0x8007_0027) {
         EncoderError::DiskFull
@@ -81,7 +81,7 @@ fn map_error(error: WinError) -> EncoderError {
 
 /// Like [`map_error`], but format negotiation failures become
 /// `UnsupportedFormat(detail)`.
-fn map_format_error(error: WinError, detail: &str) -> EncoderError {
+pub(crate) fn map_format_error(error: WinError, detail: &str) -> EncoderError {
     let format_failure = [
         MF_E_INVALIDMEDIATYPE,
         MF_E_UNSUPPORTED_D3D_TYPE,
@@ -121,7 +121,7 @@ impl Drop for MediaFoundation {
     }
 }
 
-fn allocated_string(attributes: &IMFAttributes, key: &GUID) -> Option<String> {
+pub(crate) fn allocated_string(attributes: &IMFAttributes, key: &GUID) -> Option<String> {
     let mut buffer = PWSTR::null();
     let mut length = 0u32;
     // SAFETY: out-pointers reference live locals; on success the returned
@@ -134,7 +134,7 @@ fn allocated_string(attributes: &IMFAttributes, key: &GUID) -> Option<String> {
     text
 }
 
-fn has_attribute(attributes: &IMFAttributes, key: &GUID) -> bool {
+pub(crate) fn has_attribute(attributes: &IMFAttributes, key: &GUID) -> bool {
     // SAFETY: valid interface and key pointer.
     unsafe { attributes.GetItemType(key) }.is_ok()
 }
@@ -203,9 +203,9 @@ pub enum SubmitOutcome {
 }
 
 /// One pooled sample, travelling between the free list and Media Foundation.
-struct Slot {
-    id: usize,
-    sample: IMFSample,
+pub(crate) struct Slot {
+    pub(crate) id: usize,
+    pub(crate) sample: IMFSample,
 }
 
 // SAFETY: Media Foundation samples are free-threaded COM objects (they are
@@ -213,13 +213,13 @@ struct Slot {
 // interfaces !Send conservatively.
 unsafe impl Send for Slot {}
 
-struct Shared {
-    free: Mutex<Vec<Slot>>,
-    closed: AtomicBool,
+pub(crate) struct Shared {
+    pub(crate) free: Mutex<Vec<Slot>>,
+    pub(crate) closed: AtomicBool,
 }
 
 impl Shared {
-    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Slot>> {
+    pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Slot>> {
         self.free
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -229,8 +229,8 @@ impl Shared {
 /// Receives tracked samples back from Media Foundation once the encoder has
 /// released them, and returns them to the free list.
 #[implement(IMFAsyncCallback)]
-struct ReturnCallback {
-    shared: Arc<Shared>,
+pub(crate) struct ReturnCallback {
+    pub(crate) shared: Arc<Shared>,
 }
 
 impl IMFAsyncCallback_Impl for ReturnCallback_Impl {
@@ -256,7 +256,7 @@ impl IMFAsyncCallback_Impl for ReturnCallback_Impl {
 }
 
 #[derive(Clone, Copy)]
-enum Property {
+pub(crate) enum Property {
     U32(u32),
     Bool(bool),
 }
@@ -294,7 +294,7 @@ impl Property {
 }
 
 /// CODECAPI properties for the encoder, from the platform-independent tuning.
-fn codec_properties(tuning: &H264Tuning) -> Vec<(GUID, Property)> {
+pub(crate) fn codec_properties(tuning: &H264Tuning) -> Vec<(GUID, Property)> {
     let mode = match tuning.rate_control {
         RateControl::Cbr => eAVEncCommonRateControlMode_CBR,
         RateControl::PeakConstrainedVbr => eAVEncCommonRateControlMode_PeakConstrainedVBR,
@@ -333,11 +333,11 @@ fn codec_properties(tuning: &H264Tuning) -> Vec<(GUID, Property)> {
     properties
 }
 
-fn pack(hi: u32, lo: u32) -> u64 {
+pub(crate) fn pack(hi: u32, lo: u32) -> u64 {
     (u64::from(hi) << 32) | u64::from(lo)
 }
 
-fn video_type(
+pub(crate) fn video_type(
     subtype: &GUID,
     (width, height): (u32, u32),
     fps: u32,
@@ -376,7 +376,7 @@ fn find_encoder(writer: &IMFSinkWriter, stream: u32) -> Option<IMFTransform> {
 
 /// Applies each property the encoder supports; individual rejections are
 /// ignored so only options the real encoder understands take effect.
-fn apply_codec_properties(transform: &IMFTransform, properties: &[(GUID, Property)]) {
+pub(crate) fn apply_codec_properties(transform: &IMFTransform, properties: &[(GUID, Property)]) {
     let Ok(api) = transform.cast::<ICodecAPI>() else {
         return;
     };
@@ -462,7 +462,7 @@ fn create_pool(d3d: &D3DContext, (width, height): (u32, u32)) -> Result<Pool, En
     })
 }
 
-fn build_sample(texture: &ID3D11Texture2D, id: usize) -> Result<IMFSample, WinError> {
+pub(crate) fn build_sample(texture: &ID3D11Texture2D, id: usize) -> Result<IMFSample, WinError> {
     // SAFETY: plain FFI on live objects created here.
     unsafe {
         let tracked = MFCreateTrackedSample()?;

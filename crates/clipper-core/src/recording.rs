@@ -165,6 +165,49 @@ impl Default for RecordingAudioOptions {
     }
 }
 
+/// Allowed replay lengths offered in settings, in seconds.
+pub const REPLAY_DURATIONS_SECONDS: [u32; 5] = [15, 30, 60, 120, 300];
+
+/// Everything the recorder needs to run the instant replay buffer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplayOptions {
+    /// Video/audio encoding settings; `output_directory` receives saved clips.
+    pub recording: RecordingOptions,
+    pub duration: Duration,
+    /// RAM budget for encoded packets in bytes (not the process size).
+    pub memory_limit_bytes: u64,
+    /// App-owned cache root for temporary SSD segments. `None` = RAM only.
+    pub cache_directory: Option<PathBuf>,
+    /// Upper bound for temporary SSD segment bytes.
+    pub disk_limit_bytes: u64,
+}
+
+/// Where buffered replay footage lives.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReplayTier {
+    #[default]
+    Ram,
+    /// Older footage spilled to temporary SSD segments.
+    Hybrid,
+    /// SSD unavailable: RAM only, the replay may be shorter than configured.
+    RamOnlyDegraded,
+}
+
+/// Replay buffer status, sent about once per second while it runs.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ReplayStatus {
+    /// Footage currently available for a save.
+    pub buffered: Duration,
+    pub configured: Duration,
+    pub ram_bytes: u64,
+    pub disk_bytes: u64,
+    pub tier: ReplayTier,
+    pub exports_in_flight: usize,
+    pub stats: RecordingStats,
+    /// Human readable warning (e.g. SSD tier failed), if any.
+    pub warning: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RecorderCommand {
     RefreshSources,
@@ -178,6 +221,16 @@ pub enum RecorderCommand {
         options: RecordingOptions,
     },
     StopRecording,
+    /// Start the instant replay buffer. Mutually exclusive with a manual
+    /// recording (one capture/encoder session at a time).
+    StartReplay {
+        source: CaptureSource,
+        options: ReplayOptions,
+    },
+    /// Stop the replay buffer. Running exports still finish.
+    StopReplay,
+    /// Change the replay length live, without restarting capture.
+    SetReplayDuration(Duration),
     /// Save the last seconds of the replay buffer as a clip. Never blocks the
     /// sender; the outcome arrives as a `Replay*` event.
     SaveReplay,
@@ -240,6 +293,16 @@ pub enum RecorderEvent {
     /// Non-fatal error (e.g. source enumeration failed, invalid command).
     Error {
         message: String,
+    },
+    /// The replay buffer is capturing; `encoder` is the hardware encoder name.
+    ReplayStarted {
+        encoder: String,
+    },
+    ReplayStatus(ReplayStatus),
+    /// The replay buffer stopped; `error` is set when it stopped on a failure
+    /// (capture lost, encoder failure, audio device removed...).
+    ReplayStopped {
+        error: Option<String>,
     },
     /// A replay save was accepted and the clip is being written.
     ReplaySaving,

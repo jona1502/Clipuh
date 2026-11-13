@@ -728,6 +728,7 @@ version = "0.1.0"
 dependencies = [
  "clipper-core",
  "clipper-platform",
+ "clipper-replay",
  "windows",
  "windows-core",
 ]
@@ -751,12 +752,16 @@ dependencies = [
  "clipper-core",
  "clipper-encoder",
  "clipper-platform",
+ "clipper-replay",
  "windows",
 ]
 
 [[package]]
 name = "clipper-replay"
 version = "0.1.0"
+dependencies = [
+ "windows",
+]
 
 [[package]]
 name = "clipper-storage"

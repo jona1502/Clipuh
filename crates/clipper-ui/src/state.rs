@@ -4,9 +4,12 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clipper_core::recording::{
-    CaptureSource, RecorderEvent, RecordingStats, SourceKind, StopReason,
+    CaptureSource, RecorderEvent, RecordingStats, ReplayStatus, ReplayTier, SourceKind, StopReason,
 };
 use clipper_storage::{AppConfig, config::VideoCodec, storage_projection::StorageProjection};
+
+/// Most saved replay clips kept in the session list.
+pub const MAX_SAVED_CLIPS: usize = 200;
 
 /// Orders background saves by UI intent, including when a newer save fails.
 #[derive(Debug, Default)]
@@ -222,8 +225,117 @@ pub struct Finished {
     pub reason: StopReason,
 }
 
+/// Instant replay buffer lifecycle.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ReplayPhase {
+    #[default]
+    Off,
+    Starting,
+    Running {
+        encoder: String,
+    },
+    /// Stop was requested; running exports still finish.
+    Stopping,
+}
+
+#[derive(Debug, Default)]
+pub struct ReplayState {
+    pub phase: ReplayPhase,
+    /// Latest status while running; cleared when the buffer stops.
+    pub status: Option<ReplayStatus>,
+    /// Why the replay stopped or could not start, in plain words.
+    pub error: Option<String>,
+}
+
+impl ReplayState {
+    pub fn is_off(&self) -> bool {
+        self.phase == ReplayPhase::Off
+    }
+
+    pub fn is_running(&self) -> bool {
+        matches!(self.phase, ReplayPhase::Running { .. })
+    }
+
+    pub fn begin_start(&mut self) {
+        self.phase = ReplayPhase::Starting;
+        self.status = None;
+        self.error = None;
+    }
+
+    pub fn begin_stop(&mut self) {
+        if self.is_running() {
+            self.phase = ReplayPhase::Stopping;
+        }
+    }
+
+    fn reset(&mut self) {
+        self.phase = ReplayPhase::Off;
+        self.status = None;
+    }
+}
+
+/// A replay clip saved during this session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SavedClip {
+    pub path: PathBuf,
+    pub duration: Duration,
+}
+
+impl SavedClip {
+    pub fn name(&self) -> String {
+        self.path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.path.display().to_string())
+    }
+}
+
+/// Turns a worker-provided stop reason into a sentence for the user.
+pub fn replay_stop_message(raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return "Replay stopped unexpectedly.".into();
+    }
+    let mut message = if raw.starts_with("Replay") {
+        raw.to_owned()
+    } else {
+        let mut chars = raw.chars();
+        let first = chars.next().map(|c| c.to_lowercase().to_string());
+        format!(
+            "Replay stopped: {}{}",
+            first.unwrap_or_default(),
+            chars.as_str()
+        )
+    };
+    if !message.ends_with(['.', '!', '?']) {
+        message.push('.');
+    }
+    message
+}
+
+pub fn tier_label(tier: ReplayTier) -> &'static str {
+    match tier {
+        ReplayTier::Ram => "RAM",
+        ReplayTier::Hybrid => "Hybrid RAM + SSD",
+        ReplayTier::RamOnlyDegraded => "RAM only - SSD unavailable",
+    }
+}
+
+/// Formats a byte count as whole megabytes, or gigabytes from 1 GB up.
+pub fn format_megabytes(bytes: u64) -> String {
+    const MB: u64 = 1024 * 1024;
+    if bytes >= 1024 * MB {
+        format!("{:.1} GB", bytes as f64 / (1024 * MB) as f64)
+    } else {
+        format!("{} MB", bytes / MB)
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct RecordingState {
+    pub replay: ReplayState,
+    /// Replay clips saved this session, newest first (bounded).
+    pub saved_clips: Vec<SavedClip>,
     pub sources: Vec<CaptureSource>,
     pub selected: Option<(SourceKind, u64)>,
     pub phase: Phase,
@@ -275,12 +387,41 @@ impl RecordingState {
             }
             // Non-fatal errors (e.g. a failed source refresh) never change the
             // run phase: only RecordingStarted/Finished/Failed/Stopped do.
-            RecorderEvent::Error { message } => self.error = Some(message),
-            // Replay outcomes surface as toasts, not recording state.
-            RecorderEvent::ReplaySaving
-            | RecorderEvent::ReplaySaved { .. }
-            | RecorderEvent::ReplaySaveFailed { .. } => {}
+            // A command rejected while replay is starting means it never started.
+            RecorderEvent::Error { message } => {
+                if self.replay.phase == ReplayPhase::Starting {
+                    self.replay.reset();
+                    self.replay.error = Some(replay_stop_message(&message));
+                } else {
+                    self.error = Some(message);
+                }
+            }
+            RecorderEvent::ReplayStarted { encoder } => {
+                self.replay.phase = ReplayPhase::Running { encoder };
+                self.replay.status = None;
+                self.replay.error = None;
+            }
+            // A late status after the buffer stopped must not revive it.
+            RecorderEvent::ReplayStatus(status) => {
+                if self.replay.is_running() {
+                    self.replay.status = Some(status);
+                }
+            }
+            RecorderEvent::ReplayStopped { error } => {
+                self.replay.reset();
+                if let Some(error) = error {
+                    self.replay.error = Some(replay_stop_message(&error));
+                }
+            }
+            // Save progress and failures surface as toasts.
+            RecorderEvent::ReplaySaving | RecorderEvent::ReplaySaveFailed { .. } => {}
+            RecorderEvent::ReplaySaved { path, duration } => {
+                self.saved_clips.retain(|clip| clip.path != path);
+                self.saved_clips.insert(0, SavedClip { path, duration });
+                self.saved_clips.truncate(MAX_SAVED_CLIPS);
+            }
             RecorderEvent::Stopped => {
+                self.replay.reset();
                 self.reset_run();
                 self.error = Some("The recorder stopped. Restart Clipper to record again.".into());
             }
@@ -303,7 +444,12 @@ impl RecordingState {
     }
 
     pub fn can_start(&self) -> bool {
-        self.phase == Phase::Idle && self.selected_source().is_some()
+        self.phase == Phase::Idle && self.replay.is_off() && self.selected_source().is_some()
+    }
+
+    /// Replay and manual recording share one capture session.
+    pub fn can_start_replay(&self) -> bool {
+        self.can_start()
     }
 
     pub fn can_stop(&self) -> bool {
@@ -312,7 +458,7 @@ impl RecordingState {
 
     /// Settings and source selection are locked while a run is active.
     pub fn settings_enabled(&self) -> bool {
-        self.phase == Phase::Idle
+        self.phase == Phase::Idle && self.replay.is_off()
     }
 
     pub fn begin_stop(&mut self) {
@@ -336,9 +482,32 @@ impl RecordingState {
     }
 
     pub fn start_hint(&self) -> Option<&'static str> {
+        if !self.replay.is_off() && self.phase == Phase::Idle {
+            return Some("Turn off instant replay to record manually.");
+        }
         match self.phase {
             Phase::Idle if self.selected_source().is_none() => Some("Select a source to record."),
             _ => None,
+        }
+    }
+
+    pub fn replay_hint(&self) -> Option<&'static str> {
+        if self.phase != Phase::Idle {
+            return Some("Stop the recording to use instant replay.");
+        }
+        if self.replay.is_off() && self.selected_source().is_none() {
+            return Some("Select a source below to start instant replay.");
+        }
+        None
+    }
+
+    /// Status for the sidebar and top bar: recording first, then replay.
+    pub fn overall_label(&self) -> &'static str {
+        match (self.phase, &self.replay.phase) {
+            (Phase::Idle, ReplayPhase::Starting) => "Replay starting\u{2026}",
+            (Phase::Idle, ReplayPhase::Running { .. }) => "Replay on",
+            (Phase::Idle, ReplayPhase::Stopping) => "Replay stopping\u{2026}",
+            _ => self.status_label(),
         }
     }
 
@@ -663,5 +832,138 @@ mod tests {
             })
             .unwrap();
         assert_eq!(saved, vec!["new"]);
+    }
+
+    fn state_with_source() -> RecordingState {
+        let mut s = RecordingState::default();
+        s.apply(RecorderEvent::SourcesListed(vec![src(
+            SourceKind::Monitor,
+            1,
+        )]));
+        s.select(SourceKind::Monitor, 1);
+        s
+    }
+
+    #[test]
+    fn replay_lifecycle_and_status() {
+        let mut s = state_with_source();
+        assert!(s.can_start_replay() && s.can_start());
+        s.replay.begin_start();
+        assert_eq!(s.replay.phase, ReplayPhase::Starting);
+        assert!(!s.can_start() && !s.can_start_replay() && !s.settings_enabled());
+        s.apply(RecorderEvent::ReplayStarted {
+            encoder: "NVENC".into(),
+        });
+        assert!(s.replay.is_running());
+        let status = ReplayStatus {
+            buffered: Duration::from_secs(12),
+            ..Default::default()
+        };
+        s.apply(RecorderEvent::ReplayStatus(status.clone()));
+        assert_eq!(s.replay.status, Some(status));
+        assert!(!s.can_start());
+        assert!(s.start_hint().is_some());
+        s.replay.begin_stop();
+        assert_eq!(s.replay.phase, ReplayPhase::Stopping);
+        s.apply(RecorderEvent::ReplayStopped { error: None });
+        assert!(s.replay.is_off() && s.replay.status.is_none() && s.replay.error.is_none());
+        assert!(s.can_start());
+        // A late status does not revive the buffer.
+        s.apply(RecorderEvent::ReplayStatus(ReplayStatus::default()));
+        assert!(s.replay.status.is_none());
+    }
+
+    #[test]
+    fn replay_stop_with_error_shows_it_and_goes_off() {
+        let mut s = state_with_source();
+        s.replay.begin_start();
+        s.apply(RecorderEvent::ReplayStarted {
+            encoder: "hw".into(),
+        });
+        s.apply(RecorderEvent::ReplayStopped {
+            error: Some("The capture source was closed".into()),
+        });
+        assert!(s.replay.is_off());
+        assert_eq!(
+            s.replay.error.as_deref(),
+            Some("Replay stopped: the capture source was closed.")
+        );
+        s.replay.begin_start();
+        assert_eq!(s.replay.error, None);
+    }
+
+    #[test]
+    fn rejected_replay_start_returns_to_off() {
+        let mut s = state_with_source();
+        s.replay.begin_start();
+        s.apply(RecorderEvent::Error {
+            message: "Replay buffer: no encoder".into(),
+        });
+        assert!(s.replay.is_off());
+        assert_eq!(
+            s.replay.error.as_deref(),
+            Some("Replay buffer: no encoder.")
+        );
+        assert_eq!(s.error, None);
+    }
+
+    #[test]
+    fn replay_and_recording_exclude_each_other() {
+        let mut s = state_with_source();
+        s.begin_start();
+        assert!(!s.can_start_replay());
+        assert!(s.replay_hint().is_some());
+        s.apply(RecorderEvent::RecordingFailed {
+            message: "x".into(),
+        });
+        s.replay.phase = ReplayPhase::Running {
+            encoder: "hw".into(),
+        };
+        assert!(!s.can_start());
+        assert_eq!(s.overall_label(), "Replay on");
+    }
+
+    #[test]
+    fn recorder_stop_turns_replay_off() {
+        let mut s = state_with_source();
+        s.replay.phase = ReplayPhase::Running {
+            encoder: "hw".into(),
+        };
+        s.apply(RecorderEvent::Stopped);
+        assert!(s.replay.is_off());
+    }
+
+    #[test]
+    fn saved_clips_are_newest_first_deduplicated_and_bounded() {
+        let mut s = RecordingState::default();
+        let saved = |name: String| RecorderEvent::ReplaySaved {
+            path: name.into(),
+            duration: Duration::from_secs(30),
+        };
+        s.apply(saved("a.mp4".into()));
+        s.apply(saved("b.mp4".into()));
+        s.apply(saved("a.mp4".into()));
+        let names: Vec<_> = s.saved_clips.iter().map(SavedClip::name).collect();
+        assert_eq!(names, ["a.mp4", "b.mp4"]);
+        for i in 0..MAX_SAVED_CLIPS + 20 {
+            s.apply(saved(format!("c{i}.mp4")));
+        }
+        assert_eq!(s.saved_clips.len(), MAX_SAVED_CLIPS);
+        assert_eq!(
+            s.saved_clips[0].name(),
+            format!("c{}.mp4", MAX_SAVED_CLIPS + 19)
+        );
+    }
+
+    #[test]
+    fn replay_formatting() {
+        assert_eq!(replay_stop_message(""), "Replay stopped unexpectedly.");
+        assert_eq!(
+            replay_stop_message("Replay is already running."),
+            "Replay is already running."
+        );
+        assert_eq!(format_megabytes(5 * 1024 * 1024), "5 MB");
+        assert_eq!(format_megabytes(3 * 1024 * 1024 * 1024 / 2), "1.5 GB");
+        assert_eq!(tier_label(ReplayTier::Hybrid), "Hybrid RAM + SSD");
     }
 }

@@ -16,7 +16,9 @@ use gpui::{
 
 use crate::components::{Tone, badge, kbd, list_item, shortcut, status_dot};
 use crate::notifications::{Notifier, Toast};
-use crate::state::{Phase, RecordingState, StorageProjectionCache, StorageProjectionRun};
+use crate::state::{
+    Phase, RecordingState, ReplayPhase, StorageProjectionCache, StorageProjectionRun,
+};
 use crate::theme;
 
 actions!(
@@ -212,6 +214,8 @@ pub struct ClipperWindow {
     audio_levels: (f32, f32),
     audio_testing: bool,
     audio_test_path: Option<String>,
+    /// Replay was enabled in the config and has not been auto-started yet.
+    replay_autostart_pending: bool,
     /// The open capture dropdown and its highlighted row.
     capture_menu: Option<(CaptureMenu, usize)>,
     capture_focus: [FocusHandle; 4],
@@ -240,6 +244,7 @@ impl ClipperWindow {
                     }),
                     _ => None,
                 };
+                let sources_listed = matches!(event, RecorderEvent::SourcesListed(_));
                 let updated = this.update(cx, |this, cx| {
                     this.storage_projection_run.apply_event(&event);
                     match &event {
@@ -266,6 +271,9 @@ impl ClipperWindow {
                         _ => {}
                     }
                     this.recording.apply(event);
+                    if sources_listed {
+                        this.maybe_autostart_replay();
+                    }
                     if let Some(toast) = toast {
                         this.notifier.show(toast, &this.config.notifications, cx);
                     }
@@ -280,7 +288,7 @@ impl ClipperWindow {
                 this.audio_testing = false;
                 this.audio_levels = (0.0, 0.0);
                 this.storage_projection_run.clear();
-                if this.recording.phase != Phase::Idle {
+                if this.recording.phase != Phase::Idle || !this.recording.replay.is_off() {
                     this.recording.apply(RecorderEvent::Stopped);
                 }
                 cx.notify();
@@ -302,6 +310,7 @@ impl ClipperWindow {
             .hotkey
             .parse()
             .unwrap_or_else(|_| Hotkey::default_save_replay());
+        let replay_autostart_pending = config.replay.enabled;
         let focus = cx.focus_handle();
         window.focus(&focus);
         let nav_focus = (0..Page::ALL.len())
@@ -332,6 +341,7 @@ impl ClipperWindow {
             audio_levels: (0.0, 0.0),
             audio_testing: false,
             audio_test_path: None,
+            replay_autostart_pending,
             capture_menu: None,
             // After the four sidebar items in tab order.
             capture_focus: [4, 5, 6, 7]
@@ -384,7 +394,11 @@ impl ClipperWindow {
 
     fn status_tone(&self) -> Tone {
         match self.recording.phase {
-            Phase::Idle => Tone::Neutral,
+            Phase::Idle => match self.recording.replay.phase {
+                ReplayPhase::Off => Tone::Neutral,
+                ReplayPhase::Running { .. } => Tone::Success,
+                ReplayPhase::Starting | ReplayPhase::Stopping => Tone::Warning,
+            },
             Phase::Starting => Tone::Warning,
             Phase::Recording | Phase::Stopping => Tone::Danger,
         }
@@ -575,7 +589,7 @@ impl ClipperWindow {
                     .text_xs()
                     .text_color(rgb(theme::TEXT_TERTIARY))
                     .child(status_dot(self.status_tone()))
-                    .child(self.recording.status_label()),
+                    .child(self.recording.overall_label()),
             )
     }
 
@@ -608,13 +622,13 @@ impl ClipperWindow {
                             .child(page.subtitle()),
                     ),
             )
-            .child(badge(self.recording.status_label(), self.status_tone()))
+            .child(badge(self.recording.overall_label(), self.status_tone()))
     }
 
     fn page_content(&self, window: &Window, cx: &mut Context<Self>) -> Div {
         match self.active_page {
             Page::Dashboard => dashboard::content(self, window, cx),
-            Page::Clips => clips::content(),
+            Page::Clips => clips::content(self),
             Page::Editor => editor::content(),
             Page::Settings => settings::content(self, cx),
         }

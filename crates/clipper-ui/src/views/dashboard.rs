@@ -10,9 +10,12 @@ use gpui::{AnyElement, Context, Div, FontWeight, SharedString, Window, div, px, 
 use super::{CaptureMenu, ClipperWindow, Confirm, Dismiss, SelectNext, SelectPrevious};
 use crate::components::{
     ButtonVariant, DropdownOption, Tone, button, dropdown, empty_state, kbd, list_item, panel,
-    property_row, section_header, stat_tile, status_dot, step, value_text,
+    property_row, section_header, stat_tile, status_dot, step, switch, value_text,
 };
-use crate::state::{Phase, format_decimal_size, format_elapsed, format_mib, resolution_label};
+use crate::state::{
+    Phase, ReplayPhase, format_decimal_size, format_elapsed, format_megabytes, format_mib,
+    resolution_label, tier_label,
+};
 use crate::theme;
 
 pub(super) fn content(
@@ -31,6 +34,7 @@ pub(super) fn content(
                 .clone()
                 .map(|message| error_banner(message, cx)),
         )
+        .child(replay(window, cx))
         .child(recording(window, cx))
         .child(sources(window, cx))
         .child(capture_settings(window, win, cx))
@@ -65,6 +69,166 @@ fn error_banner(message: String, cx: &mut Context<ClipperWindow>) -> Div {
                 }),
             ),
         )
+}
+
+fn replay(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
+    let state = &window.recording;
+    let replay = &state.replay;
+    let config = &window.config.replay;
+    let (title, tone) = match replay.phase {
+        ReplayPhase::Off => ("Instant replay is off", Tone::Neutral),
+        ReplayPhase::Starting => ("Starting instant replay\u{2026}", Tone::Warning),
+        ReplayPhase::Running { .. } => ("Instant replay is on", Tone::Success),
+        ReplayPhase::Stopping => ("Stopping instant replay\u{2026}", Tone::Warning),
+    };
+    let detail: Option<SharedString> = match &replay.phase {
+        ReplayPhase::Running { encoder } => Some(encoder.clone().into()),
+        ReplayPhase::Off => state.replay_hint().map(Into::into).or_else(|| {
+            Some(
+                format!(
+                    "Keeps the last {} s ready to save.",
+                    config.duration_seconds
+                )
+                .into(),
+            )
+        }),
+        _ => None,
+    };
+    let toggle_enabled = match replay.phase {
+        ReplayPhase::Off => state.can_start_replay(),
+        ReplayPhase::Running { .. } => true,
+        ReplayPhase::Starting | ReplayPhase::Stopping => false,
+    };
+    let on = matches!(
+        replay.phase,
+        ReplayPhase::Starting | ReplayPhase::Running { .. }
+    );
+    let toggle = div()
+        .id("replay-toggle")
+        .when(!toggle_enabled, |this| this.opacity(0.45))
+        .when(toggle_enabled, |this| {
+            this.cursor_pointer()
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_replay(cx)))
+        })
+        .child(switch(on));
+    let save_enabled = replay.is_running();
+    let save = button(
+        "save-replay",
+        "Save replay",
+        ButtonVariant::Secondary,
+        None,
+        save_enabled,
+    )
+    .when(save_enabled, |this| {
+        this.on_click(cx.listener(|this, _, _, cx| {
+            this.send(RecorderCommand::SaveReplay);
+            cx.notify();
+        }))
+    });
+
+    let header = div()
+        .px_4()
+        .py_3()
+        .flex()
+        .items_center()
+        .gap_3()
+        .child(status_dot(tone))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(title),
+                )
+                .children(detail.map(|detail| {
+                    div()
+                        .text_xs()
+                        .text_color(rgb(theme::TEXT_TERTIARY))
+                        .truncate()
+                        .child(detail)
+                })),
+        )
+        .child(save)
+        .child(toggle);
+
+    let mut card = panel().child(header);
+    if replay.is_running() {
+        let metric = |value: String| value_text(value);
+        let (buffered, configured, ram, disk, tier, exports) = match &replay.status {
+            Some(status) => (
+                format_elapsed(status.buffered),
+                format_elapsed(status.configured),
+                format_megabytes(status.ram_bytes),
+                format_megabytes(status.disk_bytes),
+                tier_label(status.tier).to_owned(),
+                match status.exports_in_flight {
+                    0 => "None".to_owned(),
+                    n => format!("{n} saving"),
+                },
+            ),
+            None => (
+                "\u{2014}".to_owned(),
+                format_elapsed(std::time::Duration::from_secs(u64::from(
+                    config.duration_seconds,
+                ))),
+                "\u{2014}".to_owned(),
+                "\u{2014}".to_owned(),
+                "\u{2014}".to_owned(),
+                "\u{2014}".to_owned(),
+            ),
+        };
+        card = card
+            .child(property_row(
+                "Buffered",
+                Some("Footage available to save right now.".into()),
+                metric(format!("{buffered} / {configured}")),
+                false,
+            ))
+            .child(property_row("Memory", None, metric(ram), false))
+            .child(property_row("Disk cache", None, metric(disk), false))
+            .child(property_row("Storage", None, metric(tier), false))
+            .child(property_row(
+                "Saves in progress",
+                None,
+                metric(exports),
+                false,
+            ));
+        if let Some(warning) = replay
+            .status
+            .as_ref()
+            .and_then(|status| status.warning.clone())
+        {
+            card = card.child(replay_notice(warning, Tone::Warning));
+        }
+    }
+    if let Some(error) = replay.error.clone() {
+        card = card.child(replay_notice(error, Tone::Danger));
+    }
+
+    section(
+        "Instant replay",
+        Some(format!("Save: {}", config.hotkey).into()),
+    )
+    .child(card)
+}
+
+fn replay_notice(message: String, tone: Tone) -> Div {
+    div()
+        .px_4()
+        .py_3()
+        .flex()
+        .items_center()
+        .gap_3()
+        .border_t_1()
+        .border_color(rgb(theme::BORDER))
+        .child(status_dot(tone))
+        .child(div().flex_1().min_w_0().text_sm().child(message))
 }
 
 fn recording(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
@@ -818,6 +982,83 @@ impl ClipperWindow {
                 .start_accepted(self.storage_projection_cache.snapshot());
             self.recording.begin_start();
         }
+    }
+
+    /// Starts replay with the selected source. Does not touch the config.
+    fn start_replay(&mut self) -> bool {
+        if self.audio_testing {
+            self.recording
+                .fail("Stop the audio test before starting instant replay.".into());
+            return false;
+        }
+        let Some(source) = self.recording.selected_source().cloned() else {
+            return false;
+        };
+        if !self.recording.can_start_replay() {
+            return false;
+        }
+        let options = match self.config.replay_options() {
+            Ok(options) => options,
+            Err(error) => {
+                self.recording.fail(error.to_string());
+                return false;
+            }
+        };
+        if self.send(RecorderCommand::StartReplay { source, options }) {
+            self.recording.replay.begin_start();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn stop_replay(&mut self) -> bool {
+        if self.send(RecorderCommand::StopReplay) {
+            self.recording.replay.begin_stop();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Turns replay on or off and remembers the choice. When it cannot start
+    /// right now (no source, recording active) only the preference changes, so
+    /// it starts on the next launch.
+    pub(super) fn toggle_replay(&mut self, cx: &mut Context<Self>) {
+        let enabled = match self.recording.replay.phase {
+            ReplayPhase::Running { .. } => {
+                self.stop_replay();
+                false
+            }
+            ReplayPhase::Off if self.recording.can_start_replay() => self.start_replay(),
+            ReplayPhase::Off => !self.config.replay.enabled,
+            ReplayPhase::Starting | ReplayPhase::Stopping => return,
+        };
+        if self.config.replay.enabled != enabled {
+            self.config.replay.enabled = enabled;
+            self.persist_config(cx);
+        }
+        cx.notify();
+    }
+
+    /// Once per launch, starts replay if it was left enabled: with the selected
+    /// source, else the first (primary) monitor.
+    pub(super) fn maybe_autostart_replay(&mut self) {
+        if !self.replay_autostart_pending || self.recording.sources.is_empty() {
+            return;
+        }
+        self.replay_autostart_pending = false;
+        if self.recording.selected_source().is_none()
+            && let Some(monitor) = self
+                .recording
+                .sources
+                .iter()
+                .find(|source| source.kind == SourceKind::Monitor)
+                .map(|source| source.id)
+        {
+            self.recording.select(SourceKind::Monitor, monitor);
+        }
+        self.start_replay();
     }
 }
 

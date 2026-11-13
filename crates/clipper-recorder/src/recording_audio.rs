@@ -9,12 +9,34 @@ use clipper_audio::{
 };
 use clipper_core::recording::RecordingAudioOptions;
 use clipper_encoder::backends::media_foundation::HardwareEncoder;
+use clipper_encoder::backends::packet_encoder::PacketEncoder;
+
+/// Destination of mixed AAC-ready audio: the MP4 sink writer of a manual
+/// recording or the packet encoder feeding the replay buffer.
+pub trait AudioSink {
+    fn submit_audio(&mut self, track: usize, samples: &[f32], time: i64) -> Result<(), String>;
+}
+
+impl AudioSink for HardwareEncoder {
+    fn submit_audio(&mut self, track: usize, samples: &[f32], time: i64) -> Result<(), String> {
+        HardwareEncoder::submit_audio(self, track, samples, time).map_err(|e| e.to_string())
+    }
+}
+
+impl AudioSink for PacketEncoder {
+    fn submit_audio(&mut self, track: usize, samples: &[f32], time: i64) -> Result<(), String> {
+        PacketEncoder::submit_audio(self, track, samples, time).map_err(|e| e.to_string())
+    }
+}
 
 pub struct RecordingAudio {
     capture: AudioCapture,
     mixer: TimelineMixer,
     origin: i64,
     initial_dropped: u64,
+    /// Replay: dropped and late audio is counted and rendered as silence
+    /// instead of failing the session.
+    tolerant: bool,
 }
 
 impl RecordingAudio {
@@ -105,6 +127,7 @@ impl RecordingAudio {
             mixer,
             origin,
             initial_dropped,
+            tolerant: false,
         }))
     }
 
@@ -125,9 +148,49 @@ impl RecordingAudio {
         self.origin
     }
 
+    /// Instant replay mode: audio gaps become silence plus a counter (see
+    /// [`RecordingAudio::glitched_frames`]). Source loss still fails `pump`.
+    pub fn set_tolerant(&mut self, tolerant: bool) {
+        self.tolerant = tolerant;
+    }
+
+    /// Audio frames lost to ring overflow or the mixing window since start.
+    pub fn glitched_frames(&self) -> u64 {
+        self.capture
+            .dropped_frames()
+            .saturating_sub(self.initial_dropped)
+            + self.mixer.late_frames()
+    }
+
+    /// Reads and throws away pending audio (no video yet, nothing to align
+    /// it to) so the capture rings never back up. Reports source failure.
+    pub fn discard(&mut self) -> Result<(), String> {
+        self.capture.read_frames(|_| {});
+        if self.capture.had_source_failure() {
+            return Err("An audio source failed; recording is incomplete.".into());
+        }
+        while let Ok(event) = self.capture.events().try_recv() {
+            match event {
+                AudioEvent::Failed { message, .. } => {
+                    return Err(format!("Audio capture failed: {message}"));
+                }
+                AudioEvent::SourceLost { reason, .. } => {
+                    return Err(format!("Audio source lost: {reason}"));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Starts the audio timeline at the first video sample (`qpc` ticks).
+    pub fn start_at(&mut self, qpc: i64) {
+        self.mixer.skip_to(qpc);
+    }
+
     pub fn pump(
         &mut self,
-        encoder: &mut HardwareEncoder,
+        encoder: &mut dyn AudioSink,
         finish: bool,
         video_end: i64,
     ) -> Result<(), String> {
@@ -149,7 +212,7 @@ impl RecordingAudio {
             .capture
             .dropped_frames()
             .saturating_sub(self.initial_dropped);
-        if dropped > 0 {
+        if dropped > 0 && !self.tolerant {
             return Err(format!(
                 "Audio capture dropped {dropped} frames; recording is incomplete."
             ));
@@ -174,9 +237,7 @@ impl RecordingAudio {
             qpc_now_ticks().saturating_sub(800_000).min(video_limit)
         };
         self.mixer.render_until(end, |track, time, samples| {
-            encoder
-                .submit_audio(track, samples, time)
-                .map_err(|e| e.to_string())
+            encoder.submit_audio(track, samples, time)
         })?;
         if finish && !self.mixer.all_sources_received() {
             return Err(
@@ -184,7 +245,7 @@ impl RecordingAudio {
                     .into(),
             );
         }
-        if self.mixer.late_frames() > 0 {
+        if self.mixer.late_frames() > 0 && !self.tolerant {
             return Err(format!(
                 "Audio packets missed the bounded mixing window ({} frames); clip is not reported as successful.",
                 self.mixer.late_frames()
