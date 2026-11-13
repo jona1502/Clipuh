@@ -10,3 +10,4 @@ toml.workspace = true
 directories.workspace = true
 
 clipper-core.workspace = true
+clipper-encoder.workspace = true

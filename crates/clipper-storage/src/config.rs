@@ -10,9 +10,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Output resolutions offered by the recorder: 720p, 1080p, 1440p, 4K.
-pub const VIDEO_RESOLUTIONS: [(u32, u32); 4] =
-    [(1280, 720), (1920, 1080), (2560, 1440), (3840, 2160)];
+/// Output resolutions offered by the recorder: 720p, 900p, 1080p, 1440p, 4K.
+pub const VIDEO_RESOLUTIONS: [(u32, u32); 5] = [
+    (1280, 720),
+    (1600, 900),
+    (1920, 1080),
+    (2560, 1440),
+    (3840, 2160),
+];
 /// Frame rates offered by the recorder.
 pub const VIDEO_FPS: [u32; 3] = [30, 60, 120];
 const MAX_BITRATE_MBPS: u32 = 100;
@@ -56,7 +61,7 @@ impl AppConfig {
         if !VIDEO_RESOLUTIONS.contains(&(self.video.width, self.video.height)) {
             issues.push(ValidationIssue::new(
                 "video.width",
-                "resolution must be 1280x720, 1920x1080, 2560x1440 or 3840x2160",
+                "resolution must be 1280x720, 1600x900, 1920x1080, 2560x1440 or 3840x2160",
             ));
         }
         if !VIDEO_FPS.contains(&self.video.fps) {
@@ -762,6 +767,11 @@ mod tests {
                 assert!(config.validate().is_ok(), "{width}x{height}@{fps}");
             }
         }
+
+        let mut config = AppConfig::default();
+        config.video.width = 1600;
+        config.video.height = 900;
+        assert!(config.validate().is_ok(), "1600x900");
     }
 
     #[test]
@@ -800,6 +810,97 @@ mod tests {
             (1920, 1080, 30)
         );
         assert_eq!(options.bitrate_mbps, 16);
+    }
+
+    #[test]
+    fn default_storage_projection_estimates_exact_video_audio_and_hybrid_bytes() {
+        let projection = AppConfig::default()
+            .storage_projection()
+            .expect("default config projects");
+
+        assert_eq!(projection.video_bps, 16_000_000);
+        assert_eq!(projection.audio_bps, 576_000);
+        assert_eq!(projection.audio_tracks, 3);
+        assert!(projection.variable_bitrate);
+        assert_eq!(
+            projection.sizes,
+            [62_160_000, 124_320_000, 248_640_000, 621_600_000]
+        );
+        assert_eq!(projection.replay_duration_seconds, 60);
+        assert_eq!(
+            projection.replay,
+            clipper_core::storage_estimate::HybridEstimate {
+                total_bytes: 124_320_000,
+                ram_budget_bytes: 67_108_864,
+                estimated_ram_bytes: 67_108_864,
+                estimated_ssd_bytes: 57_211_136,
+            }
+        );
+    }
+
+    #[test]
+    fn storage_projection_uses_encoder_profile_bitrate_and_rate_control() {
+        let mut config = AppConfig::default();
+        config.recording.quality = QualityPreset::Performance;
+        let performance = config.storage_projection().expect("performance projects");
+        assert_eq!(performance.video_bps, 16_000_000);
+        assert!(!performance.variable_bitrate);
+
+        config.recording.quality = QualityPreset::Quality;
+        let quality = config.storage_projection().expect("quality projects");
+        assert_eq!(quality.video_bps, 24_000_000);
+        assert!(quality.variable_bitrate);
+        assert_eq!(quality.sizes[1], 184_320_000);
+    }
+
+    #[test]
+    fn storage_projection_audio_tracks_follow_current_sources_and_ignore_future_flags() {
+        for (desktop, microphone, separate_tracks, tracks, audio_bps, sixty_second_bytes) in [
+            (false, false, true, 0, 0, 120_000_000),
+            (true, true, false, 1, 192_000, 121_440_000),
+            (false, true, true, 2, 384_000, 122_880_000),
+            (true, true, true, 3, 576_000, 124_320_000),
+        ] {
+            let mut config = AppConfig::default();
+            config.audio.desktop = desktop;
+            config.audio.microphone = microphone;
+            config.audio.separate_tracks = separate_tracks;
+            // These are future process-capture preferences and do not create tracks.
+            config.audio.game = true;
+            config.audio.discord = true;
+
+            let projection = config.storage_projection().expect("audio config projects");
+            assert_eq!(projection.audio_tracks, tracks);
+            assert_eq!(projection.audio_bps, audio_bps);
+            assert_eq!(projection.sizes[1], sixty_second_bytes);
+        }
+    }
+
+    #[test]
+    fn storage_projection_keeps_target_bitrate_independent_of_fps_and_resolution() {
+        for (width, height) in VIDEO_RESOLUTIONS {
+            for fps in VIDEO_FPS {
+                let mut config = AppConfig::default();
+                config.video.width = width;
+                config.video.height = height;
+                config.video.fps = fps;
+                let projection = config.storage_projection().expect("video config projects");
+
+                assert_eq!(projection.video_bps, 16_000_000, "{width}x{height}@{fps}");
+                assert_eq!(projection.sizes[1], 124_320_000, "{width}x{height}@{fps}");
+            }
+        }
+    }
+
+    #[test]
+    fn storage_projection_rejects_invalid_config() {
+        let mut config = AppConfig::default();
+        config.video.fps = 0;
+
+        let error = config
+            .storage_projection()
+            .expect_err("invalid config cannot be projected");
+        assert!(error.to_string().contains("video.fps"));
     }
 
     #[test]

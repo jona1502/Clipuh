@@ -9,6 +9,9 @@ use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::time::Duration;
 
+/// AAC audio bitrate in bits per second for each encoded track.
+pub const AAC_BITRATE_BPS: u32 = 192_000;
+
 /// What kind of surface a [`CaptureSource`] refers to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SourceKind {
@@ -88,6 +91,21 @@ pub struct RecordingAudioOptions {
     pub microphone_gain_percent: u16,
     pub desktop_gain_percent: u16,
     pub separate_tracks: bool,
+}
+
+impl RecordingAudioOptions {
+    /// Number of AAC tracks the current desktop/microphone recorder creates.
+    pub fn encoded_track_count(&self) -> u32 {
+        if !self.desktop && !self.microphone {
+            return 0;
+        }
+
+        1 + if self.separate_tracks {
+            u32::from(self.desktop) + u32::from(self.microphone)
+        } else {
+            0
+        }
+    }
 }
 
 impl Default for RecordingAudioOptions {
@@ -276,6 +294,33 @@ mod tests {
         assert_eq!(QualityProfile::Balanced.bitrate_bps(16), 16_000_000);
         assert_eq!(QualityProfile::Quality.bitrate_bps(16), 24_000_000);
         assert_eq!(QualityProfile::Quality.bitrate_bps(u32::MAX), 150_000_000);
+    }
+
+    #[test]
+    fn encoded_track_count_matches_enabled_sources_and_separation() {
+        for (desktop, microphone, separate_tracks, expected) in [
+            (false, false, false, 0),
+            (false, false, true, 0),
+            (true, false, false, 1),
+            (false, true, false, 1),
+            (true, true, false, 1),
+            (true, false, true, 2),
+            (false, true, true, 2),
+            (true, true, true, 3),
+        ] {
+            let options = RecordingAudioOptions {
+                desktop,
+                microphone,
+                separate_tracks,
+                ..Default::default()
+            };
+
+            assert_eq!(
+                options.encoded_track_count(),
+                expected,
+                "desktop={desktop}, microphone={microphone}, separate_tracks={separate_tracks}"
+            );
+        }
     }
 
     #[test]

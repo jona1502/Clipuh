@@ -520,15 +520,7 @@ fn build_recording(
         &d3d,
         &config,
         &partial,
-        if options.audio.desktop || options.audio.microphone {
-            1 + if options.audio.separate_tracks {
-                usize::from(options.audio.desktop) + usize::from(options.audio.microphone)
-            } else {
-                0
-            }
-        } else {
-            0
-        },
+        options.audio.encoded_track_count() as usize,
     )
     .map_err(|error| encoder_message(&error))?;
 
