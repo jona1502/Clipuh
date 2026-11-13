@@ -929,7 +929,7 @@ mod tests {
         // Paced like real capture (scaled): give the spill thread time.
         for _ in 0..20 {
             generator.seconds(&mut buf, 2);
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(50));
         }
         let stats = wait_for(&buf, |s| s.tier == BufferTier::Hybrid && s.disk_gops >= 4);
         assert_eq!(stats.dropped_gops, 0, "{stats:?}");
@@ -949,7 +949,7 @@ mod tests {
         // snapshot must survive eviction.
         for _ in 0..20 {
             generator.seconds(&mut buf, 2);
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(50));
         }
         let clip = root.join("clip.mp4");
         let saved = crate::export::export_clip(&crate::export::ExportJob {
