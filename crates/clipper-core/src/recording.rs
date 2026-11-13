@@ -77,6 +77,44 @@ pub struct RecordingOptions {
     pub output_directory: PathBuf,
 }
 
+impl RecordingOptions {
+    /// Video bitrate the encoder targets for these options (quality preset applied).
+    pub fn video_bitrate_bps(&self) -> u32 {
+        self.profile.bitrate_bps(self.bitrate_mbps)
+    }
+
+    /// Total audio bitrate written to the file.
+    pub fn audio_bitrate_bps(&self) -> u32 {
+        AAC_TRACK_BITRATE_BPS * self.audio.track_count() as u32
+    }
+
+    /// Estimated file size in decimal megabytes for `seconds` of recording.
+    /// An estimate: VBR presets vary around their average bitrate.
+    pub fn estimated_megabytes(&self, seconds: f64) -> f64 {
+        estimated_megabytes(
+            f64::from(self.video_bitrate_bps()) / 1e6,
+            f64::from(self.audio_bitrate_bps()) / 1e6,
+            seconds,
+        )
+    }
+}
+
+/// AAC bitrate of every audio track the encoder writes (stereo, 48 kHz).
+pub const AAC_TRACK_BITRATE_BPS: u32 = 192_000;
+
+/// `(video Mbps + audio Mbps) * seconds / 8`, in decimal megabytes.
+pub fn estimated_megabytes(video_mbps: f64, audio_mbps: f64, seconds: f64) -> f64 {
+    (video_mbps + audio_mbps) * seconds / 8.0
+}
+
+/// H.264 Level 5.2 limits (the highest common hardware level): at most
+/// 36 864 macroblocks per frame and 2 073 600 per second. 4K at 120 fps
+/// exceeds them, so hardware encoders reject it.
+pub fn h264_supports(width: u32, height: u32, fps: u32) -> bool {
+    let macroblocks = u64::from(width.div_ceil(16)) * u64::from(height.div_ceil(16));
+    macroblocks <= 36_864 && macroblocks * u64::from(fps) <= 2_073_600
+}
+
 /// Recording uses one endpoint playback mix plus an optional microphone.
 /// Process-isolated game/Discord capture is not wired into the recorder yet.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -88,6 +126,22 @@ pub struct RecordingAudioOptions {
     pub microphone_gain_percent: u16,
     pub desktop_gain_percent: u16,
     pub separate_tracks: bool,
+}
+
+impl RecordingAudioOptions {
+    /// Audio tracks in the file: the mix, plus one isolated track per enabled
+    /// source when `separate_tracks` is on; none when no source is enabled.
+    pub fn track_count(&self) -> usize {
+        if !(self.desktop || self.microphone) {
+            return 0;
+        }
+        let isolated = if self.separate_tracks {
+            usize::from(self.desktop) + usize::from(self.microphone)
+        } else {
+            0
+        };
+        1 + isolated
+    }
 }
 
 impl Default for RecordingAudioOptions {
@@ -269,6 +323,33 @@ pub fn recorder_channels(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storage_estimate_uses_decimal_megabytes() {
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        assert!(close(estimated_megabytes(16.0, 0.0, 60.0), 120.0));
+        assert!(close(estimated_megabytes(16.0, 0.384, 60.0), 122.88));
+        assert!(close(estimated_megabytes(8.0, 0.256, 30.0), 30.96));
+    }
+
+    #[test]
+    fn audio_track_count_matches_the_encoder_layout() {
+        let mut audio = RecordingAudioOptions::default();
+        assert_eq!(audio.track_count(), 3);
+        audio.separate_tracks = false;
+        assert_eq!(audio.track_count(), 1);
+        audio.desktop = false;
+        audio.microphone = false;
+        assert_eq!(audio.track_count(), 0);
+    }
+
+    #[test]
+    fn h264_level_limits_reject_4k_at_120() {
+        assert!(h264_supports(3840, 2160, 60));
+        assert!(!h264_supports(3840, 2160, 120));
+        assert!(h264_supports(2560, 1440, 120));
+        assert!(h264_supports(1600, 900, 120));
+    }
 
     #[test]
     fn quality_profile_scales_bitrate_and_caps_it() {

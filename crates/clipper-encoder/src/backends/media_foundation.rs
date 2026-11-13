@@ -487,7 +487,10 @@ fn add_audio_stream(writer: &IMFSinkWriter) -> Result<u32, WinError> {
         output.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, 2)?;
         output.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, 48_000)?;
         output.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16)?;
-        output.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 24_000)?;
+        output.SetUINT32(
+            &MF_MT_AUDIO_AVG_BYTES_PER_SECOND,
+            clipper_core::recording::AAC_TRACK_BITRATE_BPS / 8,
+        )?;
         output.SetUINT32(&MF_MT_AAC_PAYLOAD_TYPE, 0)?;
         output.SetUINT32(&MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0x29)?;
         let stream = writer.AddStream(&output)?;
