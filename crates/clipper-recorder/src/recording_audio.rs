@@ -9,6 +9,25 @@ use clipper_audio::{
 };
 use clipper_core::recording::RecordingAudioOptions;
 use clipper_encoder::backends::media_foundation::HardwareEncoder;
+use clipper_encoder::backends::packet_encoder::PacketEncoder;
+
+/// Destination of mixed AAC-ready audio: the MP4 sink writer of a manual
+/// recording or the packet encoder feeding the replay buffer.
+pub trait AudioSink {
+    fn submit_audio(&mut self, track: usize, samples: &[f32], time: i64) -> Result<(), String>;
+}
+
+impl AudioSink for HardwareEncoder {
+    fn submit_audio(&mut self, track: usize, samples: &[f32], time: i64) -> Result<(), String> {
+        HardwareEncoder::submit_audio(self, track, samples, time).map_err(|e| e.to_string())
+    }
+}
+
+impl AudioSink for PacketEncoder {
+    fn submit_audio(&mut self, track: usize, samples: &[f32], time: i64) -> Result<(), String> {
+        PacketEncoder::submit_audio(self, track, samples, time).map_err(|e| e.to_string())
+    }
+}
 
 pub struct RecordingAudio {
     capture: AudioCapture,
@@ -127,7 +146,7 @@ impl RecordingAudio {
 
     pub fn pump(
         &mut self,
-        encoder: &mut HardwareEncoder,
+        encoder: &mut dyn AudioSink,
         finish: bool,
         video_end: i64,
     ) -> Result<(), String> {
@@ -174,9 +193,7 @@ impl RecordingAudio {
             qpc_now_ticks().saturating_sub(800_000).min(video_limit)
         };
         self.mixer.render_until(end, |track, time, samples| {
-            encoder
-                .submit_audio(track, samples, time)
-                .map_err(|e| e.to_string())
+            encoder.submit_audio(track, samples, time)
         })?;
         if finish && !self.mixer.all_sources_received() {
             return Err(

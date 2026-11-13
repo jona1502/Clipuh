@@ -12,23 +12,28 @@ use clipper_capture::windows::{CaptureSession, CaptureSignal, list_sources};
 use clipper_core::pipeline::{FramePacer, RateMeter, recording_file_name};
 use clipper_core::recording::{
     CaptureSource, REPLAY_NOT_RUNNING, RecorderCommand, RecorderEndpoint, RecorderEvent,
-    RecordingOptions, RecordingStats, StopReason,
+    RecordingOptions, RecordingStats, ReplayOptions, StopReason,
 };
 use clipper_encoder::backends::media_foundation::{
     EncoderConfig, EncoderError, HardwareEncoder, MediaFoundation, SubmitOutcome,
 };
 use clipper_platform::windows::{ComApartment, D3DContext};
+use clipper_replay::error::ReplayError;
+use clipper_replay::export::{ExportJob, Exporter, SavedClip};
 use windows::Win32::System::SystemInformation::GetLocalTime;
 
 use crate::emit;
 use crate::logic::{
-    Counters, Lifecycle, StopOutcome, classify_stop, fit_output_size, partial_path,
-    unique_file_name,
+    ClipNames, Counters, Lifecycle, StopOutcome, classify_stop, fit_output_size, partial_path,
+    replay_failure_text, replay_file_name, unique_file_name, validate_replay_options,
 };
 use crate::recording_audio::{AudioTest, RecordingAudio};
+use crate::replay_session::{ReplaySession, WAKE_WAIT};
 
 const MAX_WAIT: Duration = Duration::from_millis(250);
 const STATS_WINDOW: Duration = Duration::from_secs(1);
+/// Clips that may wait behind the running export.
+const EXPORT_QUEUE: usize = 3;
 
 struct Recording {
     // Field order matters for implicit drops: capture first, then encoder,
@@ -130,7 +135,18 @@ struct Worker<'a> {
     // Field order is drop order: the recording and Media Foundation must be
     // released before the COM apartment is left.
     recording: Option<Recording>,
+    replay: Option<ReplaySession>,
     audio_test: Option<AudioTest>,
+    /// Spawned on the first save and kept across replay sessions, so
+    /// stopping the replay never cancels a running export.
+    exporter: Option<Exporter>,
+    /// Clip names of queued and running exports.
+    clip_names: ClipNames,
+    /// Folder of the running replay's clips.
+    replay_output: PathBuf,
+    /// Set before shutdown joins the exporter: late completion events must
+    /// not block on a UI queue nobody drains.
+    shutting_down: Arc<AtomicBool>,
     media_foundation: Option<MediaFoundation>,
     _com: Option<ComApartment>,
 }
@@ -153,14 +169,19 @@ pub fn run(endpoint: &RecorderEndpoint) {
         lifecycle: Lifecycle::new(),
         init_error,
         recording: None,
+        replay: None,
         audio_test: None,
+        exporter: None,
+        clip_names: ClipNames::default(),
+        replay_output: PathBuf::new(),
+        shutting_down: Arc::new(AtomicBool::new(false)),
         media_foundation: None,
         _com: com,
     };
 
     let mut running = true;
     while running {
-        if worker.recording.is_none() && worker.audio_test.is_none() {
+        if worker.recording.is_none() && worker.audio_test.is_none() && worker.replay.is_none() {
             match endpoint.commands.recv() {
                 Ok(command) => running = worker.handle(command),
                 Err(_) => break,
@@ -168,6 +189,7 @@ pub fn run(endpoint: &RecorderEndpoint) {
             continue;
         }
         worker.service_recording();
+        worker.service_replay();
         worker.service_audio_test();
         loop {
             match endpoint.commands.try_recv() {
@@ -186,7 +208,12 @@ pub fn run(endpoint: &RecorderEndpoint) {
         }
     }
     worker.stop_recording(StopReason::Shutdown, None);
+    worker.stop_replay(None, false);
     worker.stop_audio_test(None);
+    // The exporter drop waits for the running export; its completion events
+    // must not block on a full UI queue from here on.
+    worker.shutting_down.store(true, Ordering::Release);
+    drop(worker.exporter.take());
 }
 
 impl Worker<'_> {
@@ -207,7 +234,12 @@ impl Worker<'_> {
                 options,
                 output_directory,
             } => {
-                if self.recording.is_some() || self.audio_test.is_some() {
+                if self.replay.is_some() {
+                    self.send(RecorderEvent::AudioTestFinished {
+                        path: None,
+                        error: Some(STOP_REPLAY_FIRST.into()),
+                    });
+                } else if self.recording.is_some() || self.audio_test.is_some() {
                     self.error("Stop the current recording or audio test first.");
                 } else {
                     match AudioTest::start(&options, &output_directory) {
@@ -226,6 +258,7 @@ impl Worker<'_> {
             RecorderCommand::Shutdown => {
                 self.stop_audio_test(None);
                 self.stop_recording(StopReason::Shutdown, None);
+                self.stop_replay(None, false);
                 return false;
             }
             RecorderCommand::RefreshSources => match list_sources() {
@@ -233,7 +266,11 @@ impl Worker<'_> {
                 Err(error) => self.error(format!("could not list capture sources: {error}")),
             },
             RecorderCommand::StartRecording { source, options } => {
-                if self.audio_test.is_some() {
+                if self.replay.is_some() {
+                    self.send(RecorderEvent::RecordingFailed {
+                        message: STOP_REPLAY_FIRST.into(),
+                    });
+                } else if self.audio_test.is_some() {
                     self.error("Stop the audio test first.");
                 } else {
                     self.start_recording(&source, &options);
@@ -243,25 +280,193 @@ impl Worker<'_> {
                 Ok(()) => self.stop_recording_started(StopReason::User, None),
                 Err(message) => self.error(message),
             },
-            // TODO(recorder integration agent): run the replay session.
-            RecorderCommand::StartReplay { .. }
-            | RecorderCommand::StopReplay
-            | RecorderCommand::SetReplayDuration(_) => {
-                self.error("Instant replay is not available yet.");
+            RecorderCommand::StartReplay { source, options } => {
+                self.start_replay(&source, &options);
             }
-            // A real replay engine will emit ReplaySaving then ReplaySaved/ReplaySaveFailed here.
-            RecorderCommand::SaveReplay => {
-                // Repeated hotkeys must not stall capture/audio when the UI
-                // notification queue is full. This rejection is best effort.
-                let _ = self
-                    .endpoint
-                    .events
-                    .try_send(RecorderEvent::ReplaySaveFailed {
-                        message: REPLAY_NOT_RUNNING.into(),
-                    });
+            RecorderCommand::StopReplay => self.stop_replay(None, true),
+            RecorderCommand::SetReplayDuration(duration) => {
+                // Ignored while idle and for out-of-range values.
+                if let Some(replay) = &mut self.replay {
+                    replay.set_duration(duration);
+                }
             }
+            RecorderCommand::SaveReplay => self.save_replay(),
         }
         true
+    }
+
+    /// Best-effort notification: never blocks the worker on a full UI queue.
+    fn notify(&self, event: RecorderEvent) {
+        let _ = self.endpoint.events.try_send(event);
+    }
+
+    fn start_replay(&mut self, source: &CaptureSource, options: &ReplayOptions) {
+        if let Some(replay) = &self.replay {
+            // Idempotent: the UI is waiting for the running state.
+            self.send(RecorderEvent::ReplayStarted {
+                encoder: replay.encoder_name().to_owned(),
+            });
+            return;
+        }
+        let stopped = |error: String| RecorderEvent::ReplayStopped { error: Some(error) };
+        if self.recording.is_some() || self.audio_test.is_some() {
+            self.send(stopped("stop the current recording first".into()));
+            return;
+        }
+        if let Err(message) = validate_replay_options(options) {
+            self.send(stopped(message));
+            return;
+        }
+        match self.try_start_replay(source, options) {
+            Ok(replay) => {
+                let encoder = replay.encoder_name().to_owned();
+                self.replay_output = options.recording.output_directory.clone();
+                self.replay = Some(replay);
+                self.send(RecorderEvent::ReplayStarted { encoder });
+            }
+            Err(message) => self.send(stopped(message)),
+        }
+    }
+
+    fn try_start_replay(
+        &mut self,
+        source: &CaptureSource,
+        options: &ReplayOptions,
+    ) -> Result<ReplaySession, String> {
+        if let Some(message) = &self.init_error {
+            return Err(replay_failure_text(message));
+        }
+        if self.media_foundation.is_none() {
+            let mf = MediaFoundation::start()
+                .map_err(|error| replay_failure_text(&encoder_message(&error)))?;
+            self.media_foundation = Some(mf);
+        }
+        let Some(mf) = self.media_foundation.as_ref() else {
+            return Err("Media Foundation is not available".into());
+        };
+        ReplaySession::start(mf, source, options)
+    }
+
+    /// Stops the replay buffer (also when idle, so the UI stays consistent)
+    /// and reports it. Running exports are not touched.
+    fn stop_replay(&mut self, error: Option<String>, report: bool) {
+        let had_session = self.replay.take().is_some();
+        if report || (had_session && error.is_some()) {
+            self.send(RecorderEvent::ReplayStopped { error });
+        }
+    }
+
+    fn service_replay(&mut self) {
+        let Some(replay) = self.replay.as_mut() else {
+            return;
+        };
+        match replay.wake.recv_timeout(WAKE_WAIT) {
+            Ok(()) | Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => std::thread::sleep(Duration::from_millis(10)),
+        }
+        if let Err(message) = replay.pump() {
+            self.stop_replay(Some(message), true);
+            return;
+        }
+        if replay.source_closed() {
+            self.stop_replay(Some("the capture source was closed".into()), true);
+            return;
+        }
+        if replay.status_due() {
+            let in_flight = self.exporter.as_ref().map_or(0, Exporter::in_flight);
+            // Never block on status: drop it if the UI queue is full.
+            let _ = self
+                .endpoint
+                .events
+                .try_send(RecorderEvent::ReplayStatus(replay.status(in_flight)));
+        }
+    }
+
+    fn save_failed(&self, message: impl Into<String>) {
+        self.notify(RecorderEvent::ReplaySaveFailed {
+            message: message.into(),
+        });
+    }
+
+    /// Snapshots the buffer (Arc clones, no file I/O) and queues the export.
+    fn save_replay(&mut self) {
+        let Some(replay) = self.replay.as_mut() else {
+            self.save_failed(REPLAY_NOT_RUNNING);
+            return;
+        };
+        let snapshot = match replay.snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(ReplayError::NotReady) => {
+                self.save_failed("The replay buffer is still filling; try again in a moment.");
+                return;
+            }
+            Err(error) => {
+                self.save_failed(error.to_string());
+                return;
+            }
+        };
+        let directory = self.replay_output.clone();
+        if let Err(error) = fs::create_dir_all(&directory) {
+            self.save_failed(format!(
+                "Could not create the clip folder {}: {error}",
+                directory.display()
+            ));
+            return;
+        }
+        if self.exporter.is_none() {
+            match Exporter::spawn(EXPORT_QUEUE) {
+                Ok(exporter) => self.exporter = Some(exporter),
+                Err(error) => {
+                    self.save_failed(format!("Could not start the clip exporter: {error}"));
+                    return;
+                }
+            }
+        }
+        let Some(exporter) = self.exporter.as_ref() else {
+            return;
+        };
+        let name = self.clip_names.reserve(&replay_clip_base(), |candidate| {
+            let path = directory.join(candidate);
+            path.exists() || partial_path(&path).exists()
+        });
+        let job = ExportJob {
+            snapshot,
+            final_path: directory.join(&name),
+        };
+        let events = self.endpoint.events.clone();
+        let names = self.clip_names.clone();
+        let shutting_down = Arc::clone(&self.shutting_down);
+        let reserved = name.clone();
+        let done = Box::new(move |result: Result<SavedClip, ReplayError>| {
+            // Runs on the export thread, only after export_clip returned:
+            // the file is finalized and renamed on Ok.
+            let event = match result {
+                Ok(saved) => RecorderEvent::ReplaySaved {
+                    path: saved.path,
+                    duration: saved.duration,
+                },
+                Err(error) => RecorderEvent::ReplaySaveFailed {
+                    message: error.to_string(),
+                },
+            };
+            names.release(&reserved);
+            if shutting_down.load(Ordering::Acquire) {
+                let _ = events.try_send(event);
+            } else {
+                // Fails only when every receiver is gone; never hangs.
+                let _ = events.send_blocking(event);
+            }
+        });
+        match exporter.try_submit(job, done) {
+            Ok(()) => self.notify(RecorderEvent::ReplaySaving),
+            Err(error) => {
+                self.clip_names.release(&name);
+                self.save_failed(match error {
+                    ReplayError::Busy => "Already saving clips; try again in a moment.".to_owned(),
+                    other => other.to_string(),
+                });
+            }
+        }
     }
 
     fn stop_audio_test(&mut self, failure: Option<String>) {
@@ -566,7 +771,7 @@ fn build_recording(
 }
 
 /// Runs on a WGC thread: must never block or allocate.
-fn signal_handler(
+pub(crate) fn signal_handler(
     wake: SyncSender<()>,
     source_closed: Arc<AtomicBool>,
 ) -> Box<dyn Fn(CaptureSignal) + Send + Sync + 'static> {
@@ -579,8 +784,24 @@ fn signal_handler(
     })
 }
 
-fn round_up_even(value: u32) -> u32 {
+pub(crate) fn round_up_even(value: u32) -> u32 {
     value.max(2).saturating_add(1) & !1
+}
+
+const STOP_REPLAY_FIRST: &str = "Stop instant replay first.";
+
+#[allow(unsafe_code)]
+fn replay_clip_base() -> String {
+    // SAFETY: GetLocalTime takes no arguments and only returns a value.
+    let now = unsafe { GetLocalTime() };
+    replay_file_name(
+        now.wYear,
+        now.wMonth,
+        now.wDay,
+        now.wHour,
+        now.wMinute,
+        now.wSecond,
+    )
 }
 
 #[allow(unsafe_code)]
@@ -623,7 +844,7 @@ fn precheck_writable(partial: &Path) -> Result<(), String> {
     }
 }
 
-fn encoder_message(error: &EncoderError) -> String {
+pub(crate) fn encoder_message(error: &EncoderError) -> String {
     match error {
         EncoderError::DiskFull => "not enough disk space to keep recording".into(),
         EncoderError::AccessDenied => "no permission to write the output file".into(),

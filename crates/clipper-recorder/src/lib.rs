@@ -12,6 +12,8 @@ mod logic;
 #[cfg(windows)]
 mod recording_audio;
 #[cfg(windows)]
+mod replay_session;
+#[cfg(windows)]
 mod windows_worker;
 
 use std::thread::JoinHandle;
@@ -111,6 +113,13 @@ fn run(endpoint: &RecorderEndpoint) {
             });
             continue;
         }
+        if command == RecorderCommand::StopReplay {
+            emit(endpoint, RecorderEvent::ReplayStopped { error: None });
+            continue;
+        }
+        if matches!(command, RecorderCommand::SetReplayDuration(_)) {
+            continue;
+        }
         emit(
             endpoint,
             RecorderEvent::Error {
@@ -184,6 +193,30 @@ mod tests {
         }
         handle.send(RecorderCommand::Shutdown).unwrap();
         assert_eq!(next(&handle), RecorderEvent::Stopped);
+    }
+
+    #[test]
+    fn stop_replay_while_idle_is_idempotent() {
+        let recorder = Recorder::spawn(4, 8).unwrap();
+        let handle = recorder.handle();
+        for _ in 0..2 {
+            handle.send(RecorderCommand::StopReplay).unwrap();
+            assert_eq!(next(&handle), RecorderEvent::ReplayStopped { error: None });
+        }
+    }
+
+    #[test]
+    fn set_replay_duration_while_idle_is_ignored() {
+        let recorder = Recorder::spawn(4, 8).unwrap();
+        let handle = recorder.handle();
+        handle
+            .send(RecorderCommand::SetReplayDuration(Duration::from_secs(60)))
+            .unwrap();
+        // The next answer belongs to the next command: nothing was emitted
+        // for the duration change.
+        handle.send(RecorderCommand::SaveReplay).unwrap();
+        assert_eq!(next(&handle), not_running());
+        assert!(handle.events().try_recv().is_err());
     }
 
     #[test]
