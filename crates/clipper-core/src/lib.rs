@@ -1,6 +1,9 @@
 //! Platform-independent application lifecycle: state, commands and backend events.
 #![forbid(unsafe_code)]
 
+pub mod pipeline;
+pub mod recording;
+
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 

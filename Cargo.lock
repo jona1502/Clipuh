@@ -684,6 +684,8 @@ dependencies = [
 name = "clipper-app"
 version = "0.1.0"
 dependencies = [
+ "clipper-core",
+ "clipper-recorder",
  "clipper-storage",
  "clipper-ui",
  "gpui",
@@ -696,10 +698,18 @@ version = "0.1.0"
 [[package]]
 name = "clipper-capture"
 version = "0.1.0"
+dependencies = [
+ "clipper-core",
+ "clipper-platform",
+ "windows",
+]
 
 [[package]]
 name = "clipper-core"
 version = "0.1.0"
+dependencies = [
+ "async-channel 2.5.0",
+]
 
 [[package]]
 name = "clipper-editor"
@@ -708,10 +718,31 @@ version = "0.1.0"
 [[package]]
 name = "clipper-encoder"
 version = "0.1.0"
+dependencies = [
+ "clipper-core",
+ "clipper-platform",
+ "windows",
+ "windows-core",
+]
 
 [[package]]
 name = "clipper-platform"
 version = "0.1.0"
+dependencies = [
+ "windows",
+]
+
+[[package]]
+name = "clipper-recorder"
+version = "0.1.0"
+dependencies = [
+ "async-channel 2.5.0",
+ "clipper-capture",
+ "clipper-core",
+ "clipper-encoder",
+ "clipper-platform",
+ "windows",
+]
 
 [[package]]
 name = "clipper-replay"
@@ -721,6 +752,7 @@ version = "0.1.0"
 name = "clipper-storage"
 version = "0.1.0"
 dependencies = [
+ "clipper-core",
  "directories",
  "serde",
  "toml 0.8.23",
@@ -730,6 +762,8 @@ dependencies = [
 name = "clipper-ui"
 version = "0.1.0"
 dependencies = [
+ "clipper-core",
+ "clipper-storage",
  "gpui",
 ]
 

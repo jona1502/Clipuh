@@ -12,7 +12,15 @@ publish = false
 clipper-core = { path = "crates/clipper-core" }
 clipper-ui = { path = "crates/clipper-ui" }
 clipper-storage = { path = "crates/clipper-storage" }
-gpui = { version = "=0.2.2", default-features = false, features = ["windows-manifest"] }
+clipper-platform = { path = "crates/clipper-platform" }
+clipper-capture = { path = "crates/clipper-capture" }
+clipper-encoder = { path = "crates/clipper-encoder" }
+clipper-recorder = { path = "crates/clipper-recorder" }
+# Same versions GPUI already pulls in, so no duplicate compilation.
+async-channel = "2.5"
+windows = "0.61.3"
+windows-core = "0.61.2"
+gpui ={ version = "=0.2.2", default-features = false, features = ["windows-manifest"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 directories = "6"
