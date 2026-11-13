@@ -408,19 +408,34 @@ struct RawVideo {
     duration: i64,
 }
 
+/// Largest reorder depth the assigner grows to.
+const MAX_REORDER_DEPTH: usize = 8;
+
 /// Decode timestamp assignment. Uses the encoder's DecodeTimestamp when
 /// present. Without it and with B-frames the decode order differs from the
 /// presentation order, so dts is derived: with reorder depth R the dts of the
 /// i-th emitted packet is the i-th smallest pts minus R frames of lead-in
 /// for the first R packets (can therefore be below the first pts by up to
-/// R frame durations). Finally dts is nudged to be strictly increasing.
+/// R frame durations).
+///
+/// The presentation timestamp is never changed. When the encoder ignores the
+/// "no B-frames" setting (depth 0 but pts goes backwards in output order) the
+/// assigner switches to derived mode; when the real reorder depth exceeds the
+/// configured one the depth grows. Packets whose dts cannot be kept below
+/// their pts and above the previous dts (only the ones right at such a
+/// switch) are returned with `dts <= previous dts` so the replay buffer
+/// rejects exactly those packets instead of corrupting timestamps.
 struct DtsAssigner {
     depth: usize,
     frame_ticks: i64,
-    index: usize,
     first_pts: Option<i64>,
     heap: BinaryHeap<Reverse<i64>>,
     last: Option<i64>,
+    last_pts: Option<i64>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    switches: u32,
+    #[cfg_attr(not(test), allow(dead_code))]
+    violations: u32,
 }
 
 impl DtsAssigner {
@@ -428,34 +443,62 @@ impl DtsAssigner {
         Self {
             depth,
             frame_ticks,
-            index: 0,
             first_pts: None,
             heap: BinaryHeap::new(),
             last: None,
+            last_pts: None,
+            switches: 0,
+            violations: 0,
+        }
+    }
+
+    /// i-th smallest pts, with `depth` frames of lead-in at the start.
+    fn derive(&mut self, pts: i64) -> i64 {
+        let first = *self.first_pts.get_or_insert(pts);
+        self.heap.push(Reverse(pts));
+        if self.heap.len() > self.depth {
+            self.heap.pop().map_or(pts, |Reverse(min)| min)
+        } else {
+            first - (self.depth + 1 - self.heap.len()) as i64 * self.frame_ticks
         }
     }
 
     fn assign(&mut self, pts: i64, external: Option<i64>) -> i64 {
+        let previous_pts = self.last_pts.replace(pts);
+        let derived = external.is_none();
         let mut dts = match external {
             Some(dts) => dts,
-            None if self.depth == 0 => pts,
-            None => {
-                let first = *self.first_pts.get_or_insert(pts);
-                self.heap.push(Reverse(pts));
-                if self.index >= self.depth {
-                    self.heap.pop().map_or(pts, |Reverse(min)| min)
+            None if self.depth == 0 => {
+                if let Some(previous) = previous_pts.filter(|previous| pts < *previous) {
+                    // B-frames although none were configured.
+                    self.depth = 2;
+                    self.switches += 1;
+                    self.first_pts = Some(previous);
+                    self.heap.push(Reverse(previous));
+                    self.derive(pts)
                 } else {
-                    first - (self.depth - self.index) as i64 * self.frame_ticks
+                    pts
                 }
             }
+            None => self.derive(pts),
         };
         if let Some(last) = self.last
             && dts <= last
         {
-            dts = last + 1;
+            let next = last + 1;
+            if next <= pts || !derived {
+                dts = next;
+            } else {
+                // The real reorder depth is larger than assumed.
+                self.violations += 1;
+                self.depth = (self.depth + 1).min(MAX_REORDER_DEPTH);
+                dts = dts.min(pts);
+            }
         }
-        self.last = Some(dts);
-        self.index += 1;
+        if derived {
+            dts = dts.min(pts);
+        }
+        self.last = Some(self.last.map_or(dts, |last| last.max(dts)));
         dts
     }
 }
@@ -801,7 +844,7 @@ impl VideoStage {
             clean_point: clean,
             sps: unit.sps,
             pps: unit.pps,
-            pts: pts.max(dts),
+            pts,
             dts,
             duration: duration.unwrap_or(self.frame_ticks),
         });
@@ -820,6 +863,28 @@ struct AudioStage {
     produced: i64,
     first_time: Option<i64>,
     last_pts: Option<i64>,
+    /// Output times replaced by the input-derived time.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pts_corrections: u64,
+}
+
+/// Input-derived time of the `produced`-th AAC frame (exact, no per-frame
+/// rounding error).
+fn aac_expected_time(first_time: i64, produced: i64) -> i64 {
+    first_time
+        + (i128::from(produced) * i128::from(AAC_FRAME_SAMPLES) * i128::from(TICKS_PER_SECOND)
+            / i128::from(SAMPLE_RATE)) as i64
+}
+
+/// Presentation time of an AAC access unit: the MFT's output time unless it is
+/// missing or more than one AAC frame away from the input-derived `expected`
+/// time, in which case `expected` is used. Returns whether it was corrected.
+fn aac_presentation_time(output: Option<i64>, expected: i64) -> (i64, bool) {
+    match output {
+        Some(time) if (time - expected).abs() <= AAC_FRAME_TICKS => (time, false),
+        Some(_) => (expected, true),
+        None => (expected, false),
+    }
 }
 
 fn audio_type(subtype: &GUID, bits: u32, aac: bool) -> Result<IMFMediaType, WinError> {
@@ -902,6 +967,7 @@ impl AudioStage {
                 produced: 0,
                 first_time: None,
                 last_pts: None,
+                pts_corrections: 0,
             })
         }
     }
@@ -950,8 +1016,9 @@ impl AudioStage {
                     .ok()
                     .filter(|d| *d > 0)
                     .unwrap_or(AAC_FRAME_TICKS);
-                let expected = self.first_time.unwrap_or(0) + self.produced * AAC_FRAME_TICKS;
-                let mut pts = time.unwrap_or(expected);
+                let expected = aac_expected_time(self.first_time.unwrap_or(0), self.produced);
+                let (mut pts, corrected) = aac_presentation_time(time, expected);
+                self.pts_corrections += u64::from(corrected);
                 // Strictly increasing per track (documented nudge of 1 tick).
                 if let Some(last) = self.last_pts
                     && pts <= last
@@ -1710,6 +1777,74 @@ mod tests {
         let mut assigner = DtsAssigner::new(0, 10);
         assert_eq!(assigner.assign(5, Some(5)), 5);
         assert_eq!(assigner.assign(5, Some(5)), 6);
+    }
+
+    #[test]
+    fn encoder_ignoring_no_b_frames_switches_to_derived_dts() {
+        // Configured without B-frames, but the encoder emits I0 P3 B1 B2 ...
+        let mut assigner = DtsAssigner::new(0, 10);
+        let pts: Vec<i64> = (0..30)
+            .flat_map(|g| [g * 30 + 30, g * 30 + 10, g * 30 + 20])
+            .collect();
+        let mut stream = vec![0i64];
+        stream.extend(pts);
+        let dts: Vec<i64> = stream.iter().map(|p| assigner.assign(*p, None)).collect();
+        assert_eq!(assigner.switches, 1);
+        assert!(assigner.depth >= 2);
+        // Only the packet right at the switch can be unrepresentable; every
+        // later packet keeps dts strictly increasing and never above pts.
+        let settled = 8;
+        assert!(
+            dts[settled..].windows(2).all(|w| w[1] > w[0]),
+            "{dts:?}"
+        );
+        assert!(
+            stream[settled..]
+                .iter()
+                .zip(&dts[settled..])
+                .all(|(p, d)| d <= p),
+            "{dts:?}"
+        );
+        assert_eq!(dts[0], 0, "packets before the switch keep their dts");
+    }
+
+    #[test]
+    fn reorder_deeper_than_configured_grows_the_depth_not_the_pts() {
+        // Depth 1 configured, pyramid stream needs more: P4 B2 B1 B3 P8 ...
+        let mut assigner = DtsAssigner::new(1, 10);
+        let mut stream = vec![0i64];
+        for g in 0..20 {
+            let base = g * 40;
+            stream.extend([base + 40, base + 20, base + 10, base + 30]);
+        }
+        let dts: Vec<i64> = stream.iter().map(|p| assigner.assign(*p, None)).collect();
+        assert!(assigner.violations > 0 && assigner.depth >= 2, "{dts:?}");
+        let tail = stream.len() - 20;
+        assert!(dts[tail..].windows(2).all(|w| w[1] > w[0]), "{dts:?}");
+        assert!(
+            stream[tail..].iter().zip(&dts[tail..]).all(|(p, d)| d <= p),
+            "{dts:?}"
+        );
+    }
+
+    #[test]
+    fn aac_time_follows_the_output_unless_it_diverges_by_a_frame() {
+        let first = 1_000_000;
+        let expected = aac_expected_time(first, 100);
+        assert_eq!(aac_expected_time(first, 0), first);
+        // 100 frames of 1024 samples at 48 kHz, exactly.
+        assert_eq!(expected, first + 21_333_333);
+        assert_eq!(aac_presentation_time(Some(expected + 5), expected), (expected + 5, false));
+        assert_eq!(
+            aac_presentation_time(Some(expected + AAC_FRAME_TICKS), expected),
+            (expected + AAC_FRAME_TICKS, false)
+        );
+        assert_eq!(
+            aac_presentation_time(Some(expected + AAC_FRAME_TICKS + 1), expected),
+            (expected, true)
+        );
+        assert_eq!(aac_presentation_time(Some(0), expected), (expected, true));
+        assert_eq!(aac_presentation_time(None, expected), (expected, false));
     }
 
     #[test]
