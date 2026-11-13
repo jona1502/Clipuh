@@ -2,7 +2,8 @@ use clipper_core::recording::{
     CaptureSource, QualityProfile, RecorderCommand, RecordingStats, SourceKind,
 };
 use clipper_storage::config::ReplayMode;
-use clipper_storage::{AppConfig, VIDEO_FPS, VIDEO_RESOLUTIONS, video_mode_supported};
+use clipper_storage::storage_projection::StorageProjection;
+use clipper_storage::{VIDEO_FPS, VIDEO_RESOLUTIONS, video_mode_supported};
 use gpui::prelude::*;
 use gpui::{AnyElement, Context, Div, FontWeight, SharedString, Window, div, px, rgb};
 
@@ -11,7 +12,7 @@ use crate::components::{
     ButtonVariant, DropdownOption, Tone, button, dropdown, empty_state, kbd, list_item, panel,
     property_row, section_header, stat_tile, status_dot, step, value_text,
 };
-use crate::state::{Phase, format_elapsed, resolution_label};
+use crate::state::{Phase, format_decimal_size, format_elapsed, format_mib, resolution_label};
 use crate::theme;
 
 pub(super) fn content(
@@ -251,10 +252,14 @@ fn source_row(
         .into_any_element()
 }
 
-const CAPTURE_MENUS: [CaptureMenu; 3] = [
+/// Base bitrates offered in the capture settings.
+const VIDEO_BITRATES_MBPS: [u32; 5] = [8, 16, 24, 32, 50];
+
+const CAPTURE_MENUS: [CaptureMenu; 4] = [
     CaptureMenu::Resolution,
     CaptureMenu::FrameRate,
     CaptureMenu::Quality,
+    CaptureMenu::Bitrate,
 ];
 
 fn option(label: String, detail: Option<String>, reason: Option<String>) -> DropdownOption {
@@ -312,13 +317,17 @@ fn quality_options(base_mbps: u32) -> Vec<DropdownOption> {
         .collect()
 }
 
-/// (value, detail, 30 s line) for the Storage card.
-fn storage_summary(config: &AppConfig) -> (String, String, String) {
-    (
-        format!("~{:.0} MB/min", config.estimated_megabytes(60.0)),
-        "Estimate · video + audio".into(),
-        format!("30 s ≈ {:.0} MB", config.estimated_megabytes(30.0)),
-    )
+fn bitrate_options() -> Vec<DropdownOption> {
+    VIDEO_BITRATES_MBPS
+        .into_iter()
+        .map(|mbps| {
+            option(
+                format!("{mbps} Mbps"),
+                Some("Quality preset adjusts the target".into()),
+                None,
+            )
+        })
+        .collect()
 }
 
 fn capture_settings(window: &ClipperWindow, win: &Window, cx: &mut Context<ClipperWindow>) -> Div {
@@ -378,6 +387,7 @@ impl ClipperWindow {
             CaptureMenu::Resolution => resolution_options(video.fps),
             CaptureMenu::FrameRate => fps_options(video.width, video.height),
             CaptureMenu::Quality => quality_options(video.bitrate_mbps),
+            CaptureMenu::Bitrate => bitrate_options(),
         }
     }
 
@@ -391,6 +401,9 @@ impl ClipperWindow {
             CaptureMenu::Quality => QualityProfile::ALL
                 .iter()
                 .position(|p| *p == QualityProfile::from(self.config.recording.quality)),
+            CaptureMenu::Bitrate => VIDEO_BITRATES_MBPS
+                .iter()
+                .position(|b| *b == video.bitrate_mbps),
         }
         .unwrap_or(0)
     }
@@ -428,6 +441,7 @@ impl ClipperWindow {
             CaptureMenu::Quality => {
                 self.config.recording.quality = QualityProfile::ALL[index].into()
             }
+            CaptureMenu::Bitrate => self.config.video.bitrate_mbps = VIDEO_BITRATES_MBPS[index],
         }
         self.persist_config(cx);
     }
@@ -453,73 +467,277 @@ impl ClipperWindow {
 }
 
 fn overview(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
-    let config = &window.config;
-    let mode = match config.replay.mode {
-        ReplayMode::Hybrid => "Hybrid",
+    let configured = window.storage_projection_cache.projection();
+    let pending = window.storage_projection_run.pending();
+    let active = window.storage_projection_run.active();
+    let run_projection = window.storage_projection_run.displayed();
+    let projection = run_projection
+        .map(|snapshot| snapshot.projection())
+        .or(configured);
+    let is_pending = pending.is_some();
+    let is_active = active.is_some();
+    let differs_from_next =
+        active.is_some_and(|snapshot| !snapshot.matches_key(window.storage_projection_cache.key()));
+
+    let status = if is_pending {
+        "Starting with this estimate"
+    } else if differs_from_next {
+        "Active estimate · next settings differ"
+    } else if is_active {
+        "Active estimate · next settings match"
+    } else {
+        "Next recording"
     };
+
     let encoder = window
         .recording
         .encoder
         .clone()
-        .unwrap_or_else(|| "Auto (hardware)".to_owned());
-    let mbps = QualityProfile::from(config.recording.quality)
-        .bitrate_bps(config.video.bitrate_mbps)
-        / 1_000_000;
-    let (storage, storage_detail, storage_30s) = storage_summary(config);
+        .unwrap_or_else(|| "Auto".to_owned());
+    let encoder_tile = stat_tile(
+        "Encoder",
+        "H.264",
+        format!(
+            "{encoder} · {}",
+            format_video_rate(projection.map_or(
+                u64::from(window.config.video.bitrate_mbps) * 1_000_000,
+                |projection| projection.video_bps,
+            ))
+        ),
+    );
+
     let card = |tile: Div| tile.flex_grow().flex_basis(px(180.)).min_w(px(180.)).p_3();
-    let keys = config
+    let keys = window
+        .config
         .replay
         .hotkey
         .split('+')
         .map(|key| kbd(key.trim().to_owned()));
+
+    let storage_tile = if let Some(projection) = projection {
+        let sizes = projection.sizes;
+        let mut tile = panel()
+            .flex_1()
+            .min_w_0()
+            .p_4()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme::TEXT_TERTIARY))
+                    .child("Storage estimate"),
+            )
+            .child(
+                div()
+                    .text_lg()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(format!("{} / min", format_decimal_size(sizes[1]))),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme::TEXT_SECONDARY))
+                    .child(format!(
+                        "30 s {} · 1 min {}",
+                        format_decimal_size(sizes[0]),
+                        format_decimal_size(sizes[1]),
+                    )),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme::TEXT_SECONDARY))
+                    .child(format!(
+                        "2 min {} · 5 min {}",
+                        format_decimal_size(sizes[2]),
+                        format_decimal_size(sizes[3]),
+                    )),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme::TEXT_TERTIARY))
+                    .child(target_rate_description(projection)),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme::TEXT_TERTIARY))
+                    .child(projection_assumptions(projection)),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme::TEXT_TERTIARY))
+                    .child(status),
+            );
+        if is_active && differs_from_next {
+            if let Some(next) = configured {
+                tile = tile.child(div().text_xs().text_color(rgb(theme::TEXT_TERTIARY)).child(
+                    format!(
+                        "Next: {} · {} fps · {} · {} / min · replay {} s / {} RAM",
+                        resolution_label(window.config.video.width, window.config.video.height),
+                        window.config.video.fps,
+                        format_video_rate(next.video_bps),
+                        format_decimal_size(next.sizes[1]),
+                        next.replay_duration_seconds,
+                        format_mib(next.replay.ram_budget_bytes),
+                    ),
+                ));
+            } else if let Some(error) = window.storage_projection_cache.error() {
+                tile = tile.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(theme::TEXT_TERTIARY))
+                        .child(format!("Next estimate unavailable: {error}")),
+                );
+            }
+        }
+        tile
+    } else {
+        panel()
+            .flex_1()
+            .min_w_0()
+            .p_4()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme::TEXT_TERTIARY))
+                    .child("Storage estimate"),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme::TEXT_SECONDARY))
+                    .child(
+                        window
+                            .storage_projection_cache
+                            .error()
+                            .unwrap_or("Unavailable")
+                            .to_owned(),
+                    ),
+            )
+    };
+
+    let mode = match window.config.replay.mode {
+        ReplayMode::Hybrid => "Hybrid",
+    };
+    let replay_details = if let Some(projection) = projection {
+        let replay = projection.replay;
+        div()
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            .text_xs()
+            .text_color(rgb(theme::TEXT_TERTIARY))
+            .child(format!(
+                "{} total · RAM budget {} · SSD {} theoretical",
+                // Total and SSD are estimates from the same target-rate projection.
+                format_decimal_size(replay.total_bytes),
+                format_mib(replay.ram_budget_bytes),
+                format_decimal_size(replay.estimated_ssd_bytes),
+            ))
+            .child(replay_assumptions(projection))
+            .child("Replay engine unavailable in this build; no live buffer or disk usage is measured.")
+    } else {
+        div()
+            .text_xs()
+            .text_color(rgb(theme::TEXT_TERTIARY))
+            .child("Estimate unavailable; replay engine is not available in this build.")
+    };
+    let replay_tile = stat_tile(
+        "Replay buffer",
+        format!(
+            "{} s",
+            projection.map_or(window.config.replay.duration_seconds.into(), |projection| {
+                projection.replay_duration_seconds
+            },)
+        ),
+        format!("{mode} · Save: {}", window.config.replay.hotkey),
+    )
+    .child(
+        div()
+            .pt_2()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                button(
+                    "save-replay",
+                    "Save replay",
+                    ButtonVariant::Secondary,
+                    None,
+                    true,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.send(RecorderCommand::SaveReplay);
+                    cx.notify();
+                })),
+            )
+            .child(div().flex().gap_1().children(keys)),
+    )
+    .child(replay_details);
 
     section("Configuration", None).child(
         div()
             .flex()
             .flex_wrap()
             .gap_3()
-            .child(card(stat_tile(
-                "Encoder",
-                "H.264",
-                format!("{encoder} · {mbps} Mbps"),
-            )))
-            .child(card(
-                stat_tile("Storage", storage, storage_detail).child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(theme::TEXT_TERTIARY))
-                        .child(storage_30s),
-                ),
-            ))
-            .child(card(
-                stat_tile(
-                    "Replay buffer",
-                    format!("{} seconds", config.replay.duration_seconds),
-                    format!("{mode} · Not available yet"),
-                )
-                .child(
-                    div()
-                        .pt_2()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            button(
-                                "save-replay",
-                                "Save replay",
-                                ButtonVariant::Secondary,
-                                None,
-                                true,
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.send(RecorderCommand::SaveReplay);
-                                cx.notify();
-                            })),
-                        )
-                        .child(div().flex().gap_1().children(keys)),
-                ),
-            )),
+            .child(card(encoder_tile))
+            .child(card(storage_tile))
+            .child(card(replay_tile)),
     )
+}
+
+fn target_rate_description(projection: StorageProjection) -> String {
+    let audio = if projection.audio_tracks == 0 {
+        "no AAC tracks".to_owned()
+    } else {
+        let per_track = projection.audio_bps / u64::from(projection.audio_tracks);
+        format!(
+            "{} × {} AAC",
+            projection.audio_tracks,
+            format_audio_rate(per_track),
+        )
+    };
+    format!(
+        "{} video · {audio}",
+        format_video_rate(projection.video_bps)
+    )
+}
+
+fn projection_assumptions(projection: StorageProjection) -> &'static str {
+    if projection.variable_bitrate {
+        "VBR target · excludes container overhead"
+    } else {
+        "Target bitrate · excludes container overhead"
+    }
+}
+
+fn replay_assumptions(projection: StorageProjection) -> &'static str {
+    if projection.variable_bitrate {
+        "At target video/AAC rate · VBR · no container overhead"
+    } else {
+        "At target video/AAC rate · no container overhead"
+    }
+}
+
+fn format_video_rate(bits_per_second: u64) -> String {
+    let mbps = bits_per_second as f64 / 1_000_000.0;
+    if mbps.fract().abs() < 0.05 {
+        format!("{mbps:.0} Mbps")
+    } else {
+        format!("{mbps:.1} Mbps")
+    }
+}
+
+fn format_audio_rate(bits_per_second: u64) -> String {
+    format!("{} kbps", bits_per_second / 1_000)
 }
 
 fn performance(window: &ClipperWindow) -> Div {
@@ -596,6 +814,8 @@ impl ClipperWindow {
             }
         };
         if self.send(RecorderCommand::StartRecording { source, options }) {
+            self.storage_projection_run
+                .start_accepted(self.storage_projection_cache.snapshot());
             self.recording.begin_start();
         }
     }
@@ -636,13 +856,5 @@ mod tests {
             .map(|o| o.detail.unwrap().to_string())
             .collect();
         assert_eq!(details, ["16 Mbps CBR", "16 Mbps VBR", "24 Mbps VBR"]);
-    }
-
-    #[test]
-    fn storage_estimate_is_labelled() {
-        let (value, detail, half) = storage_summary(&AppConfig::default());
-        assert!(value.starts_with("~") && value.ends_with(" MB/min"));
-        assert!(detail.starts_with("Estimate"));
-        assert!(half.starts_with("30 s ≈ "));
     }
 }

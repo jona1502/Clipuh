@@ -820,6 +820,11 @@ mod tests {
                 );
             }
         }
+
+        let mut config = AppConfig::default();
+        config.video.width = 1600;
+        config.video.height = 900;
+        assert!(config.validate().is_ok(), "1600x900");
     }
 
     fn with_mode(width: u32, height: u32, fps: u32) -> AppConfig {
@@ -901,6 +906,102 @@ mod tests {
             (1920, 1080, 30)
         );
         assert_eq!(options.bitrate_mbps, 16);
+    }
+
+    #[test]
+    fn default_storage_projection_estimates_exact_video_audio_and_hybrid_bytes() {
+        let projection = AppConfig::default()
+            .storage_projection()
+            .expect("default config projects");
+
+        assert_eq!(projection.video_bps, 16_000_000);
+        assert_eq!(projection.audio_bps, 576_000);
+        assert_eq!(projection.audio_tracks, 3);
+        assert!(projection.variable_bitrate);
+        assert_eq!(
+            projection.sizes,
+            [62_160_000, 124_320_000, 248_640_000, 621_600_000]
+        );
+        assert_eq!(projection.replay_duration_seconds, 60);
+        assert_eq!(
+            projection.replay,
+            clipper_core::storage_estimate::HybridEstimate {
+                total_bytes: 124_320_000,
+                ram_budget_bytes: 67_108_864,
+                estimated_ram_bytes: 67_108_864,
+                estimated_ssd_bytes: 57_211_136,
+            }
+        );
+    }
+
+    #[test]
+    fn storage_projection_uses_encoder_profile_bitrate_and_rate_control() {
+        let mut config = AppConfig::default();
+        config.recording.quality = QualityPreset::Performance;
+        let performance = config.storage_projection().expect("performance projects");
+        assert_eq!(performance.video_bps, 16_000_000);
+        assert!(!performance.variable_bitrate);
+
+        config.video.bitrate_mbps = 20;
+        config.recording.quality = QualityPreset::Quality;
+        let quality = config.storage_projection().expect("quality projects");
+        assert_eq!(quality.video_bps, 30_000_000);
+        assert!(quality.variable_bitrate);
+        assert_eq!(quality.sizes[1], 229_320_000);
+    }
+
+    #[test]
+    fn storage_projection_audio_tracks_follow_current_sources_and_ignore_future_flags() {
+        for (desktop, microphone, separate_tracks, tracks, audio_bps, sixty_second_bytes) in [
+            (false, false, true, 0, 0, 120_000_000),
+            (true, true, false, 1, 192_000, 121_440_000),
+            (false, true, true, 2, 384_000, 122_880_000),
+            (true, true, true, 3, 576_000, 124_320_000),
+        ] {
+            let mut config = AppConfig::default();
+            config.audio.desktop = desktop;
+            config.audio.microphone = microphone;
+            config.audio.separate_tracks = separate_tracks;
+            // These are future process-capture preferences and do not create tracks.
+            config.audio.game = true;
+            config.audio.discord = true;
+
+            let projection = config.storage_projection().expect("audio config projects");
+            assert_eq!(projection.audio_tracks, tracks);
+            assert_eq!(projection.audio_bps, audio_bps);
+            assert_eq!(projection.sizes[1], sixty_second_bytes);
+        }
+    }
+
+    #[test]
+    fn storage_projection_keeps_target_bitrate_independent_of_fps_and_resolution() {
+        for (width, height) in VIDEO_RESOLUTIONS {
+            for fps in VIDEO_FPS {
+                if !video_mode_supported(width, height, fps) {
+                    continue;
+                }
+
+                let mut config = AppConfig::default();
+                config.video.width = width;
+                config.video.height = height;
+                config.video.fps = fps;
+                let projection = config.storage_projection().expect("video config projects");
+
+                assert_eq!(projection.video_bps, 16_000_000, "{width}x{height}@{fps}");
+                assert_eq!(projection.sizes[1], 124_320_000, "{width}x{height}@{fps}");
+            }
+        }
+    }
+
+    #[test]
+    fn storage_projection_rejects_invalid_config() {
+        let mut config = AppConfig::default();
+        config.video.fps = 0;
+
+        let error = config
+            .storage_projection()
+            .expect_err("invalid config cannot be projected");
+        assert!(error.to_string().contains("video.fps"));
     }
 
     #[test]

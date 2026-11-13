@@ -9,6 +9,11 @@ use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::time::Duration;
 
+/// AAC audio bitrate in bits per second for each encoded track (stereo, 48 kHz).
+pub const AAC_TRACK_BITRATE_BPS: u32 = 192_000;
+/// Compatibility alias for [`AAC_TRACK_BITRATE_BPS`].
+pub const AAC_BITRATE_BPS: u32 = AAC_TRACK_BITRATE_BPS;
+
 /// What kind of surface a [`CaptureSource`] refers to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SourceKind {
@@ -99,9 +104,6 @@ impl RecordingOptions {
     }
 }
 
-/// AAC bitrate of every audio track the encoder writes (stereo, 48 kHz).
-pub const AAC_TRACK_BITRATE_BPS: u32 = 192_000;
-
 /// `(video Mbps + audio Mbps) * seconds / 8`, in decimal megabytes.
 pub fn estimated_megabytes(video_mbps: f64, audio_mbps: f64, seconds: f64) -> f64 {
     (video_mbps + audio_mbps) * seconds / 8.0
@@ -141,6 +143,11 @@ impl RecordingAudioOptions {
             0
         };
         1 + isolated
+    }
+
+    /// Number of AAC tracks the current desktop/microphone recorder creates.
+    pub fn encoded_track_count(&self) -> u32 {
+        self.track_count() as u32
     }
 }
 
@@ -357,6 +364,34 @@ mod tests {
         assert_eq!(QualityProfile::Balanced.bitrate_bps(16), 16_000_000);
         assert_eq!(QualityProfile::Quality.bitrate_bps(16), 24_000_000);
         assert_eq!(QualityProfile::Quality.bitrate_bps(u32::MAX), 150_000_000);
+    }
+
+    #[test]
+    fn encoded_track_count_matches_enabled_sources_and_separation() {
+        for (desktop, microphone, separate_tracks, expected) in [
+            (false, false, false, 0),
+            (false, false, true, 0),
+            (true, false, false, 1),
+            (false, true, false, 1),
+            (true, true, false, 1),
+            (true, false, true, 2),
+            (false, true, true, 2),
+            (true, true, true, 3),
+        ] {
+            let options = RecordingAudioOptions {
+                desktop,
+                microphone,
+                separate_tracks,
+                ..Default::default()
+            };
+
+            assert_eq!(
+                options.encoded_track_count(),
+                expected,
+                "desktop={desktop}, microphone={microphone}, separate_tracks={separate_tracks}"
+            );
+            assert_eq!(options.track_count(), expected as usize);
+        }
     }
 
     #[test]
