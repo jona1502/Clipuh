@@ -112,6 +112,10 @@ impl RecordingState {
             RecorderEvent::ReplaySaving
             | RecorderEvent::ReplaySaved { .. }
             | RecorderEvent::ReplaySaveFailed { .. } => {}
+            // TODO(replay UI agent): track replay buffer state.
+            RecorderEvent::ReplayStarted { .. }
+            | RecorderEvent::ReplayStatus(_)
+            | RecorderEvent::ReplayStopped { .. } => {}
             RecorderEvent::Stopped => {
                 self.reset_run();
                 self.error = Some("The recorder stopped. Restart Clipper to record again.".into());

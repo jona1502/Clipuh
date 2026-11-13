@@ -243,6 +243,12 @@ impl Worker<'_> {
                 Ok(()) => self.stop_recording_started(StopReason::User, None),
                 Err(message) => self.error(message),
             },
+            // TODO(recorder integration agent): run the replay session.
+            RecorderCommand::StartReplay { .. }
+            | RecorderCommand::StopReplay
+            | RecorderCommand::SetReplayDuration(_) => {
+                self.error("Instant replay is not available yet.");
+            }
             // A real replay engine will emit ReplaySaving then ReplaySaved/ReplaySaveFailed here.
             RecorderCommand::SaveReplay => {
                 // Repeated hotkeys must not stall capture/audio when the UI
