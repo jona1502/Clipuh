@@ -193,6 +193,7 @@ pub fn format_elapsed(elapsed: Duration) -> String {
 pub fn resolution_label(width: u32, height: u32) -> String {
     match (width, height) {
         (1280, 720) => "720p".into(),
+        (1600, 900) => "900p".into(),
         (1920, 1080) => "1080p".into(),
         (2560, 1440) => "1440p".into(),
         (3840, 2160) => "4K".into(),

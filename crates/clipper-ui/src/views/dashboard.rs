@@ -2,19 +2,23 @@ use clipper_core::recording::{
     CaptureSource, QualityProfile, RecorderCommand, RecordingStats, SourceKind,
 };
 use clipper_storage::config::ReplayMode;
-use clipper_storage::{VIDEO_FPS, VIDEO_RESOLUTIONS};
+use clipper_storage::{AppConfig, VIDEO_FPS, VIDEO_RESOLUTIONS, video_mode_supported};
 use gpui::prelude::*;
-use gpui::{AnyElement, Context, Div, FontWeight, SharedString, div, px, rgb};
+use gpui::{AnyElement, Context, Div, FontWeight, SharedString, Window, div, px, rgb};
 
-use super::ClipperWindow;
+use super::{CaptureMenu, ClipperWindow, Confirm, Dismiss, SelectNext, SelectPrevious};
 use crate::components::{
-    ButtonVariant, Tone, button, chip, empty_state, list_item, panel, property_row, section_header,
-    stat_tile, status_dot, value_text,
+    ButtonVariant, DropdownOption, Tone, button, dropdown, empty_state, kbd, list_item, panel,
+    property_row, section_header, stat_tile, status_dot, step, value_text,
 };
 use crate::state::{Phase, format_elapsed, resolution_label};
 use crate::theme;
 
-pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
+pub(super) fn content(
+    window: &ClipperWindow,
+    win: &Window,
+    cx: &mut Context<ClipperWindow>,
+) -> Div {
     div()
         .flex()
         .flex_col()
@@ -28,7 +32,7 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
         )
         .child(recording(window, cx))
         .child(sources(window, cx))
-        .child(capture_settings(window, cx))
+        .child(capture_settings(window, win, cx))
         .child(overview(window, cx))
         .child(performance(window))
         .child(recent_clips())
@@ -247,88 +251,209 @@ fn source_row(
         .into_any_element()
 }
 
-fn capture_settings(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
-    let enabled = window.recording.settings_enabled();
-    let config = &window.config;
-    let current = (config.video.width, config.video.height);
+const CAPTURE_MENUS: [CaptureMenu; 3] = [
+    CaptureMenu::Resolution,
+    CaptureMenu::FrameRate,
+    CaptureMenu::Quality,
+];
 
-    let resolutions = VIDEO_RESOLUTIONS.into_iter().map(|(w, h)| {
-        chip(
-            ("res", h),
-            resolution_label(w, h),
-            current == (w, h),
-            enabled,
-        )
-        .when(enabled, |this| {
-            this.on_click(cx.listener(move |this, _, _, cx| {
-                this.config.video.width = w;
-                this.config.video.height = h;
-                this.persist_config(cx);
-            }))
-        })
-    });
-    let fps = VIDEO_FPS.into_iter().map(|value| {
-        chip(
-            ("fps", value),
-            format!("{value} fps"),
-            config.video.fps == value,
-            enabled,
-        )
-        .when(enabled, |this| {
-            this.on_click(cx.listener(move |this, _, _, cx| {
-                this.config.video.fps = value;
-                this.persist_config(cx);
-            }))
-        })
-    });
-    let current_quality = QualityProfile::from(config.recording.quality);
-    let quality = QualityProfile::ALL
+fn option(label: String, detail: Option<String>, reason: Option<String>) -> DropdownOption {
+    DropdownOption {
+        label: label.into(),
+        detail: detail.map(Into::into),
+        enabled: reason.is_none(),
+        reason: reason.map(Into::into),
+    }
+}
+
+fn resolution_options(fps: u32) -> Vec<DropdownOption> {
+    VIDEO_RESOLUTIONS
         .into_iter()
-        .enumerate()
-        .map(|(index, profile)| {
-            chip(
-                ("quality", index),
-                profile.label(),
-                current_quality == profile,
-                enabled,
+        .map(|(w, h)| {
+            option(
+                resolution_label(w, h),
+                Some(format!("{w} × {h}")),
+                (!video_mode_supported(w, h, fps)).then(|| format!("Not supported at {fps} fps")),
             )
-            .when(enabled, |this| {
-                this.on_click(cx.listener(move |this, _, _, cx| {
-                    this.config.recording.quality = profile.into();
-                    this.persist_config(cx);
-                }))
-            })
-        });
+        })
+        .collect()
+}
 
-    let chips = |items: Vec<gpui::Stateful<Div>>| div().flex().gap_1p5().children(items);
-    let note = (!enabled).then(|| "Locked while recording".into());
+fn fps_options(width: u32, height: u32) -> Vec<DropdownOption> {
+    VIDEO_FPS
+        .into_iter()
+        .map(|fps| {
+            option(
+                format!("{fps} FPS"),
+                None,
+                (!video_mode_supported(width, height, fps))
+                    .then(|| format!("Not supported at {}", resolution_label(width, height))),
+            )
+        })
+        .collect()
+}
 
-    section("Capture settings", note).child(
-        panel()
-            .child(property_row(
-                "Resolution",
+fn quality_options(base_mbps: u32) -> Vec<DropdownOption> {
+    QualityProfile::ALL
+        .into_iter()
+        .map(|profile| {
+            let mode = if profile == QualityProfile::Performance {
+                "CBR"
+            } else {
+                "VBR"
+            };
+            let mbps = profile.bitrate_bps(base_mbps) / 1_000_000;
+            option(
+                profile.label().into(),
+                Some(format!("{mbps} Mbps {mode}")),
                 None,
-                chips(resolutions.collect()),
-                true,
-            ))
-            .child(property_row(
-                "Frame rate",
-                None,
-                chips(fps.collect()),
-                false,
-            ))
-            .child(property_row(
-                "Quality",
-                None,
-                chips(quality.collect()),
-                false,
-            )),
+            )
+        })
+        .collect()
+}
+
+/// (value, detail, 30 s line) for the Storage card.
+fn storage_summary(config: &AppConfig) -> (String, String, String) {
+    (
+        format!("~{:.0} MB/min", config.estimated_megabytes(60.0)),
+        "Estimate · video + audio".into(),
+        format!("30 s ≈ {:.0} MB", config.estimated_megabytes(30.0)),
     )
+}
+
+fn capture_settings(window: &ClipperWindow, win: &Window, cx: &mut Context<ClipperWindow>) -> Div {
+    let note = (!window.recording.settings_enabled())
+        .then(|| "Changes apply to the next recording.".into());
+    let cards = CAPTURE_MENUS.into_iter().enumerate().map(|(index, menu)| {
+        let options = window.capture_options(menu);
+        let selected = window.capture_selected(menu);
+        let focus = &window.capture_focus[index];
+        let highlighted = window
+            .capture_menu
+            .filter(|(open, _)| *open == menu)
+            .map(|(_, highlighted)| highlighted);
+        let entity = cx.entity();
+        let (toggle, select, dismiss) = (entity.clone(), entity.clone(), entity);
+        div()
+            .flex_grow()
+            .flex_basis(px(180.))
+            .min_w(px(180.))
+            .flex()
+            .flex_col()
+            .gap_1p5()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme::TEXT_TERTIARY))
+                    .child(menu.label()),
+            )
+            .child(dropdown(
+                ("capture-menu", index),
+                &options,
+                selected,
+                highlighted,
+                focus,
+                focus.is_focused(win),
+                true,
+                move |_, app| toggle.update(app, |this, cx| this.capture_toggle(menu, cx)),
+                move |i, _, app| select.update(app, |this, cx| this.capture_apply(menu, i, cx)),
+                move |_, app| dismiss.update(app, |this, cx| this.capture_close(cx)),
+            ))
+            .on_action(cx.listener(move |this, _: &Confirm, _, cx| this.capture_confirm(menu, cx)))
+            .on_action(
+                cx.listener(move |this, _: &SelectNext, _, cx| this.capture_step(menu, 1, cx)),
+            )
+            .on_action(
+                cx.listener(move |this, _: &SelectPrevious, _, cx| this.capture_step(menu, -1, cx)),
+            )
+            .on_action(cx.listener(|this, _: &Dismiss, _, cx| this.capture_close(cx)))
+    });
+    section("Capture settings", note).child(div().flex().flex_wrap().gap_3().children(cards))
+}
+
+impl ClipperWindow {
+    fn capture_options(&self, menu: CaptureMenu) -> Vec<DropdownOption> {
+        let video = &self.config.video;
+        match menu {
+            CaptureMenu::Resolution => resolution_options(video.fps),
+            CaptureMenu::FrameRate => fps_options(video.width, video.height),
+            CaptureMenu::Quality => quality_options(video.bitrate_mbps),
+        }
+    }
+
+    fn capture_selected(&self, menu: CaptureMenu) -> usize {
+        let video = &self.config.video;
+        match menu {
+            CaptureMenu::Resolution => VIDEO_RESOLUTIONS
+                .iter()
+                .position(|r| *r == (video.width, video.height)),
+            CaptureMenu::FrameRate => VIDEO_FPS.iter().position(|f| *f == video.fps),
+            CaptureMenu::Quality => QualityProfile::ALL
+                .iter()
+                .position(|p| *p == QualityProfile::from(self.config.recording.quality)),
+        }
+        .unwrap_or(0)
+    }
+
+    fn capture_toggle(&mut self, menu: CaptureMenu, cx: &mut Context<Self>) {
+        if matches!(self.capture_menu, Some((open, _)) if open == menu) {
+            self.capture_close(cx);
+        } else {
+            self.capture_menu = Some((menu, self.capture_selected(menu)));
+            cx.notify();
+        }
+    }
+
+    pub(super) fn capture_close(&mut self, cx: &mut Context<Self>) {
+        if self.capture_menu.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn capture_apply(&mut self, menu: CaptureMenu, index: usize, cx: &mut Context<Self>) {
+        self.capture_menu = None;
+        let enabled = self
+            .capture_options(menu)
+            .get(index)
+            .is_some_and(|o| o.enabled);
+        if !enabled {
+            cx.notify();
+            return;
+        }
+        match menu {
+            CaptureMenu::Resolution => {
+                (self.config.video.width, self.config.video.height) = VIDEO_RESOLUTIONS[index];
+            }
+            CaptureMenu::FrameRate => self.config.video.fps = VIDEO_FPS[index],
+            CaptureMenu::Quality => {
+                self.config.recording.quality = QualityProfile::ALL[index].into()
+            }
+        }
+        self.persist_config(cx);
+    }
+
+    fn capture_confirm(&mut self, menu: CaptureMenu, cx: &mut Context<Self>) {
+        match self.capture_menu {
+            Some((open, highlighted)) if open == menu => self.capture_apply(menu, highlighted, cx),
+            _ => self.capture_toggle(menu, cx),
+        }
+    }
+
+    fn capture_step(&mut self, menu: CaptureMenu, delta: isize, cx: &mut Context<Self>) {
+        let Some((open, from)) = self.capture_menu.filter(|(open, _)| *open == menu) else {
+            self.capture_toggle(menu, cx);
+            return;
+        };
+        let next = step(&self.capture_options(open), from, delta);
+        if next != from {
+            self.capture_menu = Some((menu, next));
+            cx.notify();
+        }
+    }
 }
 
 fn overview(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
     let config = &window.config;
-    let video = &config.video;
     let mode = match config.replay.mode {
         ReplayMode::Hybrid => "Hybrid",
     };
@@ -336,45 +461,64 @@ fn overview(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
         .recording
         .encoder
         .clone()
-        .unwrap_or_else(|| "Auto".to_owned());
-    let mb_per_minute = video.bitrate_mbps * 60 / 8;
+        .unwrap_or_else(|| "Auto (hardware)".to_owned());
+    let mbps = QualityProfile::from(config.recording.quality)
+        .bitrate_bps(config.video.bitrate_mbps)
+        / 1_000_000;
+    let (storage, storage_detail, storage_30s) = storage_summary(config);
+    let card = |tile: Div| tile.flex_grow().flex_basis(px(180.)).min_w(px(180.)).p_3();
+    let keys = config
+        .replay
+        .hotkey
+        .split('+')
+        .map(|key| kbd(key.trim().to_owned()));
 
     section("Configuration", None).child(
         div()
             .flex()
+            .flex_wrap()
             .gap_3()
-            .child(stat_tile(
+            .child(card(stat_tile(
                 "Encoder",
                 "H.264",
-                format!("{encoder} · {} Mbps", video.bitrate_mbps),
+                format!("{encoder} · {mbps} Mbps"),
+            )))
+            .child(card(
+                stat_tile("Storage", storage, storage_detail).child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(theme::TEXT_TERTIARY))
+                        .child(storage_30s),
+                ),
             ))
-            .child(stat_tile(
-                "Storage",
-                format!("~{mb_per_minute} MB/min"),
-                "Estimate from bitrate",
-            ))
-            .child(
+            .child(card(
                 stat_tile(
                     "Replay buffer",
-                    format!("{} s", config.replay.duration_seconds),
-                    format!("{mode} · Save: {}", config.replay.hotkey),
+                    format!("{} seconds", config.replay.duration_seconds),
+                    format!("{mode} · Not available yet"),
                 )
                 .child(
-                    div().pt_2().child(
-                        button(
-                            "save-replay",
-                            "Save replay",
-                            ButtonVariant::Secondary,
-                            None,
-                            true,
+                    div()
+                        .pt_2()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            button(
+                                "save-replay",
+                                "Save replay",
+                                ButtonVariant::Secondary,
+                                None,
+                                true,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.send(RecorderCommand::SaveReplay);
+                                cx.notify();
+                            })),
                         )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.send(RecorderCommand::SaveReplay);
-                            cx.notify();
-                        })),
-                    ),
+                        .child(div().flex().gap_1().children(keys)),
                 ),
-            ),
+            )),
     )
 }
 
@@ -454,5 +598,51 @@ impl ClipperWindow {
         if self.send(RecorderCommand::StartRecording { source, options }) {
             self.recording.begin_start();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_resolution_is_disabled_with_reason() {
+        let options = resolution_options(120);
+        let k4 = options.iter().find(|o| o.label == "4K").unwrap();
+        assert!(!k4.enabled);
+        assert_eq!(
+            k4.reason.as_ref().map(|r| r.as_ref()),
+            Some("Not supported at 120 fps")
+        );
+        assert!(options.iter().find(|o| o.label == "900p").unwrap().enabled);
+    }
+
+    #[test]
+    fn unsupported_fps_is_disabled_at_4k() {
+        let options = fps_options(3840, 2160);
+        let fps120 = options.iter().find(|o| o.label == "120 FPS").unwrap();
+        assert!(!fps120.enabled);
+        assert_eq!(
+            fps120.reason.as_ref().map(|r| r.as_ref()),
+            Some("Not supported at 4K")
+        );
+        assert!(options.iter().all(|o| o.label != "144 FPS"));
+    }
+
+    #[test]
+    fn quality_details_show_effective_bitrate() {
+        let details: Vec<_> = quality_options(16)
+            .into_iter()
+            .map(|o| o.detail.unwrap().to_string())
+            .collect();
+        assert_eq!(details, ["16 Mbps CBR", "16 Mbps VBR", "24 Mbps VBR"]);
+    }
+
+    #[test]
+    fn storage_estimate_is_labelled() {
+        let (value, detail, half) = storage_summary(&AppConfig::default());
+        assert!(value.starts_with("~") && value.ends_with(" MB/min"));
+        assert!(detail.starts_with("Estimate"));
+        assert!(half.starts_with("30 s ≈ "));
     }
 }
