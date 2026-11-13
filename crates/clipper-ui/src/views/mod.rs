@@ -46,6 +46,7 @@ const HOTKEY_CONTEXT: &str = "HotkeyRecorder";
 pub fn bind_keys(cx: &mut App) {
     let window = Some(WINDOW_CONTEXT);
     let palette = Some(PALETTE_CONTEXT);
+    let dropdown = Some("Dropdown");
     cx.bind_keys([
         KeyBinding::new("ctrl-1", OpenDashboard, window),
         KeyBinding::new("ctrl-2", OpenClips, window),
@@ -61,6 +62,11 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("up", SelectPrevious, palette),
         KeyBinding::new("enter", Confirm, palette),
         KeyBinding::new("escape", Dismiss, palette),
+        KeyBinding::new("up", SelectPrevious, dropdown),
+        KeyBinding::new("down", SelectNext, dropdown),
+        KeyBinding::new("enter", Confirm, dropdown),
+        KeyBinding::new("space", Confirm, dropdown),
+        KeyBinding::new("escape", Dismiss, dropdown),
     ]);
     // gpui runs key bindings before `on_key_down`. While the hotkey recorder has
     // focus, its (deeper) NoAction bindings cancel the window bindings so every
@@ -81,6 +87,24 @@ pub fn bind_keys(cx: &mut App) {
         ]
         .map(|keys| KeyBinding::new(keys, NoAction, recorder)),
     );
+}
+
+/// The Dashboard capture dropdowns; at most one is open at a time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureMenu {
+    Resolution,
+    FrameRate,
+    Quality,
+}
+
+impl CaptureMenu {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Resolution => "Resolution",
+            Self::FrameRate => "Frame rate",
+            Self::Quality => "Quality",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -184,6 +208,9 @@ pub struct ClipperWindow {
     audio_levels: (f32, f32),
     audio_testing: bool,
     audio_test_path: Option<String>,
+    /// The open capture dropdown and its highlighted row.
+    capture_menu: Option<(CaptureMenu, usize)>,
+    capture_focus: [FocusHandle; 3],
 }
 
 impl ClipperWindow {
@@ -297,6 +324,9 @@ impl ClipperWindow {
             audio_levels: (0.0, 0.0),
             audio_testing: false,
             audio_test_path: None,
+            capture_menu: None,
+            // After the four sidebar items in tab order.
+            capture_focus: [4, 5, 6].map(|index| cx.focus_handle().tab_index(index).tab_stop(true)),
         };
         this.send(RecorderCommand::RefreshSources);
         this.refresh_audio_devices(cx);
@@ -350,6 +380,8 @@ impl ClipperWindow {
     }
 
     fn navigate(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
+        // An open capture menu belongs to the page being left.
+        self.capture_menu = None;
         let palette_was_open = self.palette.take().is_some();
         if palette_was_open {
             window.focus(&self.focus);
@@ -568,9 +600,9 @@ impl ClipperWindow {
             .child(badge(self.recording.status_label(), self.status_tone()))
     }
 
-    fn page_content(&self, cx: &mut Context<Self>) -> Div {
+    fn page_content(&self, window: &Window, cx: &mut Context<Self>) -> Div {
         match self.active_page {
-            Page::Dashboard => dashboard::content(self, cx),
+            Page::Dashboard => dashboard::content(self, window, cx),
             Page::Clips => clips::content(),
             Page::Editor => editor::content(),
             Page::Settings => settings::content(self, cx),
@@ -731,13 +763,17 @@ impl Render for ClipperWindow {
             }))
             .on_action(cx.listener(Self::toggle_palette))
             // Tab must not move focus out of an open palette, or its keys stop reaching it.
-            .on_action(cx.listener(|this, _: &FocusNext, window, _| {
+            // An open capture menu only takes keys while its trigger is focused,
+            // so moving focus closes it.
+            .on_action(cx.listener(|this, _: &FocusNext, window, cx| {
                 if this.palette.is_none() {
+                    this.capture_close(cx);
                     window.focus_next()
                 }
             }))
-            .on_action(cx.listener(|this, _: &FocusPrevious, window, _| {
+            .on_action(cx.listener(|this, _: &FocusPrevious, window, cx| {
                 if this.palette.is_none() {
+                    this.capture_close(cx);
                     window.focus_prev()
                 }
             }))
@@ -763,7 +799,7 @@ impl Render for ClipperWindow {
                                 .mx_auto()
                                 .px_8()
                                 .py_6()
-                                .child(self.page_content(cx)),
+                                .child(self.page_content(window, cx)),
                         ),
                     ),
             )
