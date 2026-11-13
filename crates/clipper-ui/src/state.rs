@@ -75,6 +75,10 @@ impl RecordingState {
             // Non-fatal errors (e.g. a failed source refresh) never change the
             // run phase: only RecordingStarted/Finished/Failed/Stopped do.
             RecorderEvent::Error { message } => self.error = Some(message),
+            // Replay outcomes surface as toasts, not recording state.
+            RecorderEvent::ReplaySaving
+            | RecorderEvent::ReplaySaved { .. }
+            | RecorderEvent::ReplaySaveFailed { .. } => {}
             RecorderEvent::Stopped => {
                 self.reset_run();
                 self.error = Some("The recorder stopped. Restart Clipper to record again.".into());
