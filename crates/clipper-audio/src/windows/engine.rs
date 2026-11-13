@@ -36,7 +36,7 @@ pub struct AudioCapture {
 }
 
 /// Current QPC time in 100 ns units.
-pub(super) fn qpc_now_ticks() -> i64 {
+pub fn qpc_now_ticks() -> i64 {
     let mut freq = 0i64;
     let mut counter = 0i64;
     // SAFETY: both pointers reference valid, live i64 locals.
@@ -53,6 +53,17 @@ pub(super) fn qpc_now_ticks() -> i64 {
 impl AudioCapture {
     /// Plans routing for `selection`, opens rings and starts every track.
     pub fn start(selection: &AudioSelection, config: AudioConfig) -> Result<Self, AudioError> {
+        Self::start_with_device(selection, config, None, None)
+    }
+
+    /// Starts capture of an explicit render endpoint, waking the consumer only
+    /// when packets/events arrive. The callback must never block or allocate.
+    pub fn start_with_device(
+        selection: &AudioSelection,
+        config: AudioConfig,
+        output_device: Option<&str>,
+        wake: Option<std::sync::mpsc::SyncSender<()>>,
+    ) -> Result<Self, AudioError> {
         let plan = routing::plan(selection, process::capabilities());
         if plan.tracks.is_empty() {
             return Err(AudioError::NothingToCapture);
@@ -69,7 +80,9 @@ impl AudioCapture {
 
         for (index, planned) in plan.tracks.iter().enumerate() {
             let (channels, source): (u16, Box<dyn StreamSource>) = match &planned.stream {
-                StreamPlan::EndpointLoopback => (2, endpoint::loopback_source()),
+                StreamPlan::EndpointLoopback => {
+                    (2, endpoint::selected_loopback_source(output_device))
+                }
                 StreamPlan::Microphone(choice) => (
                     endpoint::microphone_channels(choice),
                     endpoint::microphone_source(choice.clone()),
@@ -80,13 +93,14 @@ impl AudioCapture {
             let (producer, consumer) = crate::ring::audio_ring(channels, config.ring_ms);
             let cell = Arc::new(LevelCell::default());
             stats.push(Arc::clone(consumer.stats()));
-            match StreamThread::spawn(
+            match StreamThread::spawn_with_wake(
                 index,
                 channels,
                 source,
                 producer,
                 Arc::clone(&cell),
                 events_tx.clone(),
+                wake.clone(),
             ) {
                 Ok(thread) => threads.push(thread),
                 Err(error) => {
@@ -177,9 +191,27 @@ impl AudioCapture {
         }
     }
 
-    /// Stops all threads and returns counters. Unread packets are discarded.
-    pub fn stop(mut self) -> CaptureSummary {
+    /// Stops producers, then drains their remaining packets before finalization.
+    pub fn stop_and_drain(&mut self, f: impl FnMut(AudioFrameRef<'_>)) -> CaptureSummary {
         self.stop_threads();
+        self.read_frames(f);
+        self.summary()
+    }
+
+    /// Latched even if the bounded event channel drops the failure notification.
+    pub fn had_source_failure(&self) -> bool {
+        self.levels.iter().any(|levels| levels.source_failed())
+    }
+
+    /// Persistent counters do not depend on delivery of lossy/throttled events.
+    pub fn dropped_frames(&self) -> u64 {
+        self.stats
+            .iter()
+            .map(|stats| stats.dropped_frames.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    fn summary(&self) -> CaptureSummary {
         CaptureSummary {
             frames: self
                 .stats
@@ -194,6 +226,12 @@ impl AudioCapture {
         }
     }
 
+    /// Stops all threads and returns counters. Unread packets are discarded.
+    pub fn stop(mut self) -> CaptureSummary {
+        self.stop_threads();
+        self.summary()
+    }
+
     /// QPC time (100 ns) taken just before the tracks started: timeline origin.
     pub fn started_at(&self) -> i64 {
         self.started_at
@@ -203,5 +241,39 @@ impl AudioCapture {
 impl Drop for AudioCapture {
     fn drop(&mut self) {
         self.stop_threads();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unavailable_endpoint_failure_stays_latched_without_consuming_notifications() {
+        let selection = AudioSelection {
+            desktop: true,
+            ..Default::default()
+        };
+        let capture = AudioCapture::start_with_device(
+            &selection,
+            AudioConfig {
+                event_capacity: 1,
+                ..Default::default()
+            },
+            Some("clipper-nonexistent-test-endpoint"),
+            None,
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !capture.had_source_failure() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "source failure was not latched"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        while capture.events().try_recv().is_ok() {}
+        assert!(capture.had_source_failure());
+        capture.stop();
     }
 }

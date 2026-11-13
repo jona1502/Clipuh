@@ -7,6 +7,36 @@ use clipper_core::recording::{
     CaptureSource, RecorderEvent, RecordingStats, SourceKind, StopReason,
 };
 
+/// Orders background saves by UI intent, including when a newer save fails.
+#[derive(Debug, Default)]
+pub struct SettingsSaveOrder {
+    requested: std::sync::atomic::AtomicU64,
+    writer: std::sync::Mutex<()>,
+}
+
+impl SettingsSaveOrder {
+    pub fn request(&self) -> u64 {
+        self.requested
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1
+    }
+
+    pub fn save(
+        &self,
+        revision: u64,
+        write: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        let _guard = self
+            .writer
+            .lock()
+            .map_err(|_| "Settings save lock poisoned".to_owned())?;
+        if revision != self.requested.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
+        write()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Phase {
     #[default]
@@ -39,6 +69,9 @@ pub struct RecordingState {
 impl RecordingState {
     pub fn apply(&mut self, event: RecorderEvent) {
         match event {
+            RecorderEvent::AudioLevels { .. }
+            | RecorderEvent::AudioTestStarted
+            | RecorderEvent::AudioTestFinished { .. } => {}
             RecorderEvent::SourcesListed(sources) => {
                 self.sources = sources;
                 if let Some((kind, id)) = self.selected
@@ -286,5 +319,41 @@ mod tests {
         assert_eq!(format_elapsed(Duration::from_secs(3600)), "60:00");
         assert_eq!(resolution_label(2560, 1440), "1440p");
         assert_eq!(resolution_label(100, 50), "100x50");
+    }
+    #[test]
+    fn newer_failed_save_still_prevents_an_older_snapshot_from_writing() {
+        let order = SettingsSaveOrder::default();
+        let old = order.request();
+        let new = order.request();
+        assert!(order.save(new, || Err("disk unavailable".into())).is_err());
+        let mut wrote_old = false;
+        order
+            .save(old, || {
+                wrote_old = true;
+                Ok(())
+            })
+            .unwrap();
+        assert!(!wrote_old);
+    }
+
+    #[test]
+    fn only_latest_requested_settings_are_written() {
+        let order = SettingsSaveOrder::default();
+        let old = order.request();
+        let new = order.request();
+        let mut saved = Vec::new();
+        order
+            .save(old, || {
+                saved.push("old");
+                Ok(())
+            })
+            .unwrap();
+        order
+            .save(new, || {
+                saved.push("new");
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(saved, vec!["new"]);
     }
 }

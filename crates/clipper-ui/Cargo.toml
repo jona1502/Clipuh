@@ -7,5 +7,6 @@ publish.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 clipper-core.workspace = true
+clipper-audio.workspace = true
 clipper-storage.workspace = true
 gpui.workspace = true

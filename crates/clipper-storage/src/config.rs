@@ -1,4 +1,4 @@
-use clipper_core::recording::{QualityProfile, RecordingOptions};
+use clipper_core::recording::{QualityProfile, RecordingAudioOptions, RecordingOptions};
 use directories::{ProjectDirs, UserDirs};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
@@ -85,6 +85,36 @@ impl AppConfig {
                 "must be between 16 and 512 MiB",
             ));
         }
+        for (field, gain) in [
+            (
+                "audio.microphone_gain_percent",
+                self.audio.microphone_gain_percent,
+            ),
+            (
+                "audio.desktop_gain_percent",
+                self.audio.desktop_gain_percent,
+            ),
+        ] {
+            if gain > 200 {
+                issues.push(ValidationIssue::new(
+                    field,
+                    "gain must be between 0 and 200 percent",
+                ));
+            }
+        }
+        for (field, device) in [
+            ("audio.input_device", &self.audio.input_device),
+            ("audio.output_device", &self.audio.output_device),
+        ] {
+            if device.as_ref().is_some_and(|id| {
+                id.trim().is_empty() || id.len() > 1024 || id.chars().any(char::is_control)
+            }) {
+                issues.push(ValidationIssue::new(
+                    field,
+                    "device id must be nonempty and at most 1024 bytes without control characters",
+                ));
+            }
+        }
         let hotkey = self.replay.hotkey.trim();
         if hotkey.is_empty()
             || hotkey.len() > MAX_HOTKEY_LENGTH
@@ -134,6 +164,15 @@ impl AppConfig {
             None => default_recording_directory()?,
         };
         Ok(RecordingOptions {
+            audio: RecordingAudioOptions {
+                desktop: self.audio.desktop,
+                microphone: self.audio.microphone,
+                input_device: self.audio.input_device.clone(),
+                output_device: self.audio.output_device.clone(),
+                microphone_gain_percent: self.audio.microphone_gain_percent,
+                desktop_gain_percent: self.audio.desktop_gain_percent,
+                separate_tracks: self.audio.separate_tracks,
+            },
             width: self.video.width,
             height: self.video.height,
             fps: self.video.fps,
@@ -247,11 +286,20 @@ pub enum ReplayMode {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AudioSettings {
+    pub input_device: Option<String>,
+    pub output_device: Option<String>,
+    pub microphone_gain_percent: u16,
+    pub desktop_gain_percent: u16,
+    /// Future process-selection preference; the recorder currently uses full desktop playback.
     pub game: bool,
     /// The system output mix, excluding dedicated game and Discord streams.
     /// This avoids recording process audio twice when dedicated tracks are enabled.
     /// This crate stores the preference only; it does not capture or route audio.
+    /// The exclusion policy above is for future recorder process routing.
+    /// Current recording captures the full selected playback endpoint once,
+    /// including game/Discord; those two future preferences do not filter it.
     pub desktop: bool,
+    /// Future process-selection preference; not an independent recording source yet.
     pub discord: bool,
     pub microphone: bool,
     pub separate_tracks: bool,
@@ -260,6 +308,10 @@ pub struct AudioSettings {
 impl Default for AudioSettings {
     fn default() -> Self {
         Self {
+            input_device: None,
+            output_device: None,
+            microphone_gain_percent: 100,
+            desktop_gain_percent: 100,
             game: true,
             desktop: true,
             discord: true,
@@ -791,5 +843,44 @@ mod tests {
             AppConfig::load_from(&path),
             Err(ConfigError::Validation(_))
         ));
+    }
+    #[test]
+    fn audio_devices_gains_and_enabled_sources_reach_the_recorder_after_reload() {
+        let temp = TestDir::new();
+        let path = temp.path("audio.toml");
+        let mut config = AppConfig::default();
+        config.audio.input_device = Some("capture-endpoint-id".into());
+        config.audio.output_device = Some("render-endpoint-id".into());
+        config.audio.microphone_gain_percent = 50;
+        config.audio.desktop_gain_percent = 150;
+        config.audio.desktop = false;
+        config.save_to(&path).unwrap();
+        let restored = AppConfig::load_from(&path)
+            .unwrap()
+            .recording_options()
+            .unwrap();
+        assert_eq!(
+            restored.audio.input_device.as_deref(),
+            Some("capture-endpoint-id")
+        );
+        assert_eq!(
+            restored.audio.output_device.as_deref(),
+            Some("render-endpoint-id")
+        );
+        assert_eq!(restored.audio.microphone_gain_percent, 50);
+        assert_eq!(restored.audio.desktop_gain_percent, 150);
+        assert!(!restored.audio.desktop);
+        assert!(restored.audio.microphone);
+    }
+
+    #[test]
+    fn malformed_audio_devices_and_unbounded_gains_are_rejected() {
+        let mut config = AppConfig::default();
+        config.audio.input_device = Some("".into());
+        config.audio.output_device = Some("bad\nid".into());
+        config.audio.microphone_gain_percent = 201;
+        config.audio.desktop_gain_percent = u16::MAX;
+        let error = config.validate().unwrap_err();
+        assert_eq!(error.issues().len(), 4);
     }
 }

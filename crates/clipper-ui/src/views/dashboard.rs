@@ -416,6 +416,11 @@ fn recent_clips() -> Div {
 
 impl ClipperWindow {
     fn start_recording(&mut self) {
+        if self.audio_testing {
+            self.recording
+                .fail("Stop the audio test before recording.".into());
+            return;
+        }
         let Some(source) = self.recording.selected_source().cloned() else {
             return;
         };
@@ -435,12 +440,18 @@ impl ClipperWindow {
     }
 
     /// Saves the config off the UI thread; failures show up in the error banner.
-    fn persist_config(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn persist_config(&mut self, cx: &mut Context<Self>) {
         cx.notify();
         let config = self.config.clone();
+        let persistence = self.config_persistence.clone();
+        let revision = persistence.request();
         cx.spawn(async move |this, cx| {
             let result = cx
-                .background_spawn(async move { config.save().map_err(|error| error.to_string()) })
+                .background_spawn(async move {
+                    persistence.save(revision, || {
+                        config.save().map_err(|error| error.to_string())
+                    })
+                })
                 .await;
             if let Err(message) = result {
                 this.update(cx, |this, cx| {

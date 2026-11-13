@@ -209,6 +209,13 @@ pub(crate) fn loopback_source() -> Box<dyn StreamSource> {
     ))
 }
 
+pub(crate) fn selected_loopback_source(device: Option<&str>) -> Box<dyn StreamSource> {
+    match device {
+        Some(id) => Box::new(EndpointSource::new(Target::Id(id.to_owned()), true)),
+        None => loopback_source(),
+    }
+}
+
 /// Microphone capture; `Default` follows default-device changes.
 pub(crate) fn microphone_source(choice: MicrophoneChoice) -> Box<dyn StreamSource> {
     let target = match choice {

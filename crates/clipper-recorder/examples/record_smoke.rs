@@ -44,12 +44,21 @@ fn main() {
     };
     println!("using {source:?}");
 
-    for round in 1..=2 {
+    let seconds = args
+        .get(3)
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(5);
+    let rounds = args
+        .get(4)
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(2);
+    for round in 1..=rounds {
         println!("--- round {round}");
         handle
             .send(RecorderCommand::StartRecording {
                 source: source.clone(),
                 options: RecordingOptions {
+                    audio: Default::default(),
                     width,
                     height,
                     fps,
@@ -62,7 +71,7 @@ fn main() {
         let mut stop_sent = false;
         let mut started_at = None;
         loop {
-            if started_at.is_some_and(|t: Instant| t.elapsed() > Duration::from_secs(5))
+            if started_at.is_some_and(|t: Instant| t.elapsed() > Duration::from_secs(seconds))
                 && !stop_sent
             {
                 handle.send(RecorderCommand::StopRecording).expect("send");

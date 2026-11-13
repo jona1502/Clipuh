@@ -476,9 +476,39 @@ fn build_sample(texture: &ID3D11Texture2D, id: usize) -> Result<IMFSample, WinEr
     }
 }
 
+/// Media Foundation AAC-LC, 48 kHz stereo, 192 kbps, raw AAC for MP4.
+fn add_audio_stream(writer: &IMFSinkWriter) -> Result<u32, WinError> {
+    // SAFETY: fresh media types; scalar attributes match the AAC encoder's
+    // supported output and PCM16 input formats. All interfaces outlive calls.
+    unsafe {
+        let output = MFCreateMediaType()?;
+        output.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
+        output.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_AAC)?;
+        output.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, 2)?;
+        output.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, 48_000)?;
+        output.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16)?;
+        output.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 24_000)?;
+        output.SetUINT32(&MF_MT_AAC_PAYLOAD_TYPE, 0)?;
+        output.SetUINT32(&MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0x29)?;
+        let stream = writer.AddStream(&output)?;
+        let input = MFCreateMediaType()?;
+        input.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
+        input.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_PCM)?;
+        input.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, 2)?;
+        input.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, 48_000)?;
+        input.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16)?;
+        input.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, 4)?;
+        input.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 192_000)?;
+        input.SetUINT32(&MF_MT_ALL_SAMPLES_INDEPENDENT, 1)?;
+        writer.SetInputMediaType(stream, &input, None::<&IMFAttributes>)?;
+        Ok(stream)
+    }
+}
+
 pub struct HardwareEncoder {
     writer: Option<IMFSinkWriter>,
     stream: u32,
+    audio_streams: Vec<u32>,
     d3d: D3DContext,
     input: (u32, u32),
     name: String,
@@ -494,6 +524,23 @@ impl HardwareEncoder {
         config: &EncoderConfig,
         path: &Path,
     ) -> Result<Self, EncoderError> {
+        Self::create_with_audio(mf, d3d, config, path, 0)
+    }
+
+    /// Adds one AAC stream per stereo PCM input before BeginWriting. Stream
+    /// zero in the audio API is the primary mix; later streams are isolated.
+    pub fn create_with_audio(
+        mf: &MediaFoundation,
+        d3d: &D3DContext,
+        config: &EncoderConfig,
+        path: &Path,
+        audio_tracks: usize,
+    ) -> Result<Self, EncoderError> {
+        if audio_tracks > 5 {
+            return Err(EncoderError::UnsupportedFormat(
+                "too many audio tracks".into(),
+            ));
+        }
         let encoders = hardware_h264_encoders(mf)?;
         let Some(listed_name) = encoders.into_iter().next() else {
             return Err(EncoderError::NoHardwareEncoder);
@@ -516,7 +563,7 @@ impl HardwareEncoder {
             return Err(EncoderError::UnsupportedFormat(detail));
         }
 
-        match Self::create_inner(d3d, config, path, &detail, listed_name) {
+        match Self::create_inner(d3d, config, path, &detail, listed_name, audio_tracks) {
             Ok(encoder) => Ok(encoder),
             Err(error) => {
                 let _ = std::fs::remove_file(path);
@@ -531,6 +578,7 @@ impl HardwareEncoder {
         path: &Path,
         detail: &str,
         listed_name: String,
+        audio_tracks: usize,
     ) -> Result<Self, EncoderError> {
         let tuning = H264Tuning::new(config.profile, config.bitrate_mbps, config.fps);
         let win = EncoderError::Windows;
@@ -650,12 +698,17 @@ impl HardwareEncoder {
         let input = (config.input_width, config.input_height);
         let pool = create_pool(d3d, input)?;
 
+        let mut audio_streams = Vec::with_capacity(audio_tracks);
+        for _ in 0..audio_tracks {
+            audio_streams.push(add_audio_stream(&writer).map_err(map_error)?);
+        }
         // SAFETY: fully configured writer.
         unsafe { writer.BeginWriting() }.map_err(map_error)?;
 
         Ok(Self {
             writer: Some(writer),
             stream,
+            audio_streams,
             d3d: d3d.clone(),
             input,
             name,
@@ -733,6 +786,74 @@ impl HardwareEncoder {
         drop(sample);
         result.map_err(map_error)?;
         Ok(SubmitOutcome::Submitted)
+    }
+
+    /// Signals a real gap in WGC delivery so the MP4 muxer does not wait for
+    /// nonexistent video frames while the audio streams continue in real time.
+    pub fn video_gap(&mut self, time: i64) -> Result<(), EncoderError> {
+        let writer = self
+            .writer
+            .as_ref()
+            .ok_or_else(|| EncoderError::Windows(E_POINTER.into()))?;
+        // SAFETY: valid writer/stream; ticks use the same monotonic timeline
+        // as video samples and are sent only after pending frames are drained.
+        unsafe { writer.SendStreamTick(self.stream, time) }.map_err(map_error)
+    }
+
+    /// Submit aligned stereo f32 at 48 kHz. PCM16 conversion is explicit:
+    /// the system AAC encoder accepts 16-bit PCM. MF owns the copied buffer.
+    /// This runs on the recorder thread, never inside WASAPI's packet callback.
+    pub fn submit_audio(
+        &mut self,
+        track: usize,
+        samples: &[f32],
+        time: i64,
+    ) -> Result<(), EncoderError> {
+        if time < 0
+            || samples.is_empty()
+            || !samples.len().is_multiple_of(2)
+            || samples.len() > 96_000
+        {
+            return Err(EncoderError::UnsupportedFormat(
+                "invalid audio packet".into(),
+            ));
+        }
+        let stream = *self
+            .audio_streams
+            .get(track)
+            .ok_or_else(|| EncoderError::UnsupportedFormat("unknown audio stream".into()))?;
+        let writer = self
+            .writer
+            .as_ref()
+            .ok_or_else(|| EncoderError::Windows(E_POINTER.into()))?;
+        let bytes = (samples.len() * 2) as u32;
+        // SAFETY: MF allocates a buffer of `bytes`; Lock returns a writable
+        // region of at least that size. Every successful Lock is unlocked
+        // before returning; MF retains its own references after WriteSample.
+        unsafe {
+            let buffer = MFCreateMemoryBuffer(bytes).map_err(map_error)?;
+            let mut data = std::ptr::null_mut();
+            buffer.Lock(&mut data, None, None).map_err(map_error)?;
+            for (index, sample) in samples.iter().enumerate() {
+                let clean = if sample.is_finite() {
+                    sample.clamp(-1.0, 1.0)
+                } else {
+                    0.0
+                };
+                let value = (clean * 32767.0).round() as i16;
+                std::ptr::copy_nonoverlapping(value.to_le_bytes().as_ptr(), data.add(index * 2), 2);
+            }
+            buffer.Unlock().map_err(map_error)?;
+            buffer.SetCurrentLength(bytes).map_err(map_error)?;
+            let sample = MFCreateSample().map_err(map_error)?;
+            sample.AddBuffer(&buffer).map_err(map_error)?;
+            sample.SetSampleTime(time).map_err(map_error)?;
+            sample
+                .SetSampleDuration((samples.len() / 2) as i64 * 10_000_000 / 48_000)
+                .map_err(map_error)?;
+            writer.WriteSample(stream, &sample).map_err(map_error)?;
+        }
+        Ok(())
     }
 
     /// Drains the encoder and finalizes the MP4. Only a successful return
@@ -965,5 +1086,123 @@ mod tests {
         assert!(submitted > 0 && submitted + dropped == 240);
         encoder.finish().expect("finish");
         let _ = std::fs::remove_file(&path);
+    }
+    #[test]
+    #[ignore = "requires a Windows GPU hardware encoder and the system AAC codec"]
+    fn muxes_real_aac_audio_with_video_and_decodes_non_silent_samples() {
+        let env = env().expect("Windows D3D/Media Foundation required");
+        let path = temp_mp4("audio-roundtrip");
+        let mut encoder =
+            HardwareEncoder::create_with_audio(&env.mf, &env.d3d, &config(640, 360), &path, 3)
+                .expect("create audiovisual encoder");
+        let (texture, view) = source_texture(&env.d3d, 640, 360);
+        for frame in 0..60_u32 {
+            fill(&env.d3d, &view, frame);
+            let pcm: Vec<f32> = (0..1600)
+                .flat_map(|n| {
+                    let value = ((frame * 1600 + n) as f32 * 440.0 * std::f32::consts::TAU
+                        / 48_000.0)
+                        .sin()
+                        * 0.25;
+                    [value, value]
+                })
+                .collect();
+            for track in 0..3 {
+                encoder
+                    .submit_audio(track, &pcm, i64::from(frame) * 10_000_000 / 30)
+                    .expect("audio sample");
+            }
+            encoder
+                .submit(
+                    &texture,
+                    (640, 360),
+                    i64::from(frame) * 10_000_000 / 30,
+                    333_333,
+                )
+                .expect("video sample");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        encoder.finish().expect("finalize audiovisual MP4");
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        // SAFETY: interfaces are live; locked buffers are decoded as aligned
+        // f32 only after negotiating Float. Every Lock is paired with Unlock.
+        unsafe {
+            let mut audio_count = 0;
+            for stream in 0..4 {
+                let reader =
+                    MFCreateSourceReaderFromURL(PCWSTR(wide.as_ptr()), None::<&IMFAttributes>)
+                        .expect("open MP4");
+                let native = reader
+                    .GetNativeMediaType(stream, 0)
+                    .expect("native media type");
+                if native.GetGUID(&MF_MT_MAJOR_TYPE).unwrap() != MFMediaType_Audio {
+                    continue;
+                }
+                audio_count += 1;
+                assert_eq!(native.GetGUID(&MF_MT_SUBTYPE).unwrap(), MFAudioFormat_AAC);
+                assert_eq!(
+                    native.GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND).unwrap(),
+                    48_000
+                );
+                assert_eq!(native.GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS).unwrap(), 2);
+                reader
+                    .SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS.0 as u32, false)
+                    .unwrap();
+                reader.SetStreamSelection(stream, true).unwrap();
+                let decoded = MFCreateMediaType().unwrap();
+                decoded
+                    .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)
+                    .unwrap();
+                decoded
+                    .SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_Float)
+                    .unwrap();
+                reader.SetCurrentMediaType(stream, None, &decoded).unwrap();
+                let (mut samples, mut peak, mut last_time) = (0_usize, 0.0_f32, 0_i64);
+                for _ in 0..200 {
+                    let (mut flags, mut time, mut sample) = (0, 0, None);
+                    reader
+                        .ReadSample(
+                            stream,
+                            0,
+                            None,
+                            Some(&mut flags),
+                            Some(&mut time),
+                            Some(&mut sample),
+                        )
+                        .unwrap();
+                    if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 {
+                        break;
+                    }
+                    if let Some(sample) = sample {
+                        assert!(time >= last_time);
+                        last_time = time;
+                        let buffer = sample.ConvertToContiguousBuffer().unwrap();
+                        let (mut data, mut len) = (std::ptr::null_mut(), 0);
+                        buffer.Lock(&mut data, None, Some(&mut len)).unwrap();
+                        for value in
+                            std::slice::from_raw_parts(data.cast::<f32>(), len as usize / 4)
+                        {
+                            peak = peak.max(value.abs());
+                            samples += 1;
+                        }
+                        buffer.Unlock().unwrap();
+                    }
+                }
+                assert!(
+                    samples > 180_000,
+                    "two seconds stereo AAC must decode: {samples}"
+                );
+                assert!(peak > 0.1, "AAC must contain actual signal: {peak}");
+                assert!(
+                    (18_000_000..=21_000_000).contains(&last_time),
+                    "PTS duration: {last_time}"
+                );
+                println!(
+                    "AAC stream {stream}: 48000 Hz stereo samples={samples} peak={peak:.3} final_pts={last_time}"
+                );
+            }
+            assert_eq!(audio_count, 3);
+        }
+        std::fs::remove_file(path).unwrap();
     }
 }

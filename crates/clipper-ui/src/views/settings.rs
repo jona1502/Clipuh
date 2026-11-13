@@ -1,9 +1,11 @@
+use super::ClipperWindow;
 use clipper_core::recording::QualityProfile;
 use clipper_storage::{
     AppConfig,
     config::{EncoderPreference, ReplayMode, Theme, VideoCodec},
     config_path,
 };
+use gpui::Context;
 use gpui::prelude::*;
 use gpui::{AnyElement, Div, SharedString, div, rgb};
 
@@ -45,10 +47,11 @@ fn toggle(on: bool) -> AnyElement {
     switch(on).into_any_element()
 }
 
-pub(super) fn content(config: &AppConfig) -> Div {
+pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
+    let config: &AppConfig = &window.config;
     let video = &config.video;
     let replay = &config.replay;
-    let audio = &config.audio;
+
     let app = &config.app;
     let perf = &config.performance;
 
@@ -115,16 +118,7 @@ pub(super) fn content(config: &AppConfig) -> Div {
                 ),
             ],
         ))
-        .child(group(
-            "Audio",
-            vec![
-                ("Game", None, toggle(audio.game)),
-                ("Desktop", None, toggle(audio.desktop)),
-                ("Discord", None, toggle(audio.discord)),
-                ("Microphone", None, toggle(audio.microphone)),
-                ("Separate tracks", None, toggle(audio.separate_tracks)),
-            ],
-        ));
+        .child(super::audio::content(window, cx));
 
     let recordings = match config.recording_options() {
         Ok(options) => path_text(options.output_directory.display().to_string()),

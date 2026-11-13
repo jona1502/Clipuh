@@ -10,6 +10,8 @@
 
 mod logic;
 #[cfg(windows)]
+mod recording_audio;
+#[cfg(windows)]
 mod windows_worker;
 
 use std::thread::JoinHandle;
@@ -157,6 +159,62 @@ mod tests {
         let handle = recorder.handle();
         let _ = handle.send(RecorderCommand::StopRecording);
         let _ = handle.send(RecorderCommand::StopRecording);
+        drop(recorder);
+    }
+    #[test]
+    #[ignore = "captures real microphone audio; requires an enabled Windows microphone"]
+    fn microphone_test_finalizes_a_pcm_wave_and_leaves_worker_usable() {
+        let recorder = Recorder::spawn(8, 64).unwrap();
+        let handle = recorder.handle();
+        let output_directory = std::env::temp_dir().join("clipper-audio-diagnostic-tests");
+        handle
+            .send(RecorderCommand::StartAudioTest {
+                options: clipper_core::recording::RecordingAudioOptions {
+                    desktop: false,
+                    microphone: true,
+                    separate_tracks: false,
+                    ..Default::default()
+                },
+                output_directory,
+            })
+            .unwrap();
+        assert_eq!(next(&handle), RecorderEvent::AudioTestStarted);
+        let mut peak = 0.0_f32;
+        let start = std::time::Instant::now();
+        let mut stopped = false;
+        let path = loop {
+            match next(&handle) {
+                RecorderEvent::AudioLevels { microphone, .. } => peak = peak.max(microphone),
+                RecorderEvent::AudioTestFinished { path, error } => {
+                    assert!(error.is_none(), "{error:?}");
+                    break path.unwrap();
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+            if !stopped && start.elapsed() >= Duration::from_secs(30) {
+                handle.send(RecorderCommand::StopAudioTest).unwrap();
+                stopped = true;
+            }
+        };
+        let wave = std::fs::read(&path).unwrap();
+        assert_eq!(&wave[..4], b"RIFF");
+        assert_eq!(&wave[8..12], b"WAVE");
+        assert_eq!(u32::from_le_bytes(wave[24..28].try_into().unwrap()), 48_000);
+        let data_bytes = u32::from_le_bytes(wave[40..44].try_into().unwrap());
+        assert_eq!(wave.len(), data_bytes as usize + 44);
+        assert!(data_bytes > 48_000 * 4 * 29);
+        println!(
+            "real microphone WAV seconds={:.3} peak={peak:.5}",
+            f64::from(data_bytes) / 192_000.0
+        );
+        std::fs::remove_file(path).unwrap();
+        handle.send(RecorderCommand::StopRecording).unwrap();
+        // A final zero-level event can precede the idle command response.
+        loop {
+            if matches!(next(&handle), RecorderEvent::Error { .. }) {
+                break;
+            }
+        }
         drop(recorder);
     }
 }

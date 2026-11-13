@@ -1,3 +1,4 @@
+mod audio;
 mod clips;
 mod dashboard;
 mod editor;
@@ -145,6 +146,13 @@ pub struct ClipperWindow {
     focus: FocusHandle,
     nav_focus: Vec<FocusHandle>,
     palette: Option<CommandPalette>,
+    config_persistence: std::sync::Arc<crate::state::SettingsSaveOrder>,
+    audio_devices: Vec<clipper_audio::AudioDevice>,
+    audio_menu: Option<clipper_audio::DeviceFlow>,
+    audio_loading: bool,
+    audio_levels: (f32, f32),
+    audio_testing: bool,
+    audio_test_path: Option<String>,
 }
 
 impl ClipperWindow {
@@ -158,6 +166,29 @@ impl ClipperWindow {
         let task = cx.spawn(async move |this, cx| {
             while let Ok(event) = events.recv().await {
                 let updated = this.update(cx, |this, cx| {
+                    match &event {
+                        RecorderEvent::AudioLevels {
+                            desktop,
+                            microphone,
+                        } => this.audio_levels = (*desktop, *microphone),
+                        RecorderEvent::AudioTestStarted => this.audio_testing = true,
+                        RecorderEvent::AudioTestFinished { path, error } => {
+                            this.audio_testing = false;
+                            this.audio_levels = (0.0, 0.0);
+                            this.audio_test_path =
+                                path.as_ref().map(|path| path.display().to_string());
+                            if let Some(error) = error {
+                                this.recording.fail(error.clone());
+                            }
+                        }
+                        RecorderEvent::RecordingFinished { .. }
+                        | RecorderEvent::RecordingFailed { .. } => this.audio_levels = (0.0, 0.0),
+                        RecorderEvent::Stopped => {
+                            this.audio_levels = (0.0, 0.0);
+                            this.audio_testing = false;
+                        }
+                        _ => {}
+                    }
                     this.recording.apply(event);
                     cx.notify();
                 });
@@ -167,10 +198,12 @@ impl ClipperWindow {
             }
             // Channel closed without a final event: the worker is gone.
             let _ = this.update(cx, |this, cx| {
+                this.audio_testing = false;
+                this.audio_levels = (0.0, 0.0);
                 if this.recording.phase != Phase::Idle {
                     this.recording.apply(RecorderEvent::Stopped);
-                    cx.notify();
                 }
+                cx.notify();
             });
         });
         let focus = cx.focus_handle();
@@ -188,8 +221,16 @@ impl ClipperWindow {
             focus,
             nav_focus,
             palette: None,
+            config_persistence: Default::default(),
+            audio_devices: Vec::new(),
+            audio_menu: None,
+            audio_loading: false,
+            audio_levels: (0.0, 0.0),
+            audio_testing: false,
+            audio_test_path: None,
         };
         this.send(RecorderCommand::RefreshSources);
+        this.refresh_audio_devices(cx);
         this
     }
 
@@ -436,7 +477,7 @@ impl ClipperWindow {
             Page::Dashboard => dashboard::content(self, cx),
             Page::Clips => clips::content(),
             Page::Editor => editor::content(),
-            Page::Settings => settings::content(&self.config),
+            Page::Settings => settings::content(self, cx),
         }
     }
 
