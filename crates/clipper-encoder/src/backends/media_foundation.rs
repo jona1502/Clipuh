@@ -687,6 +687,7 @@ impl HardwareEncoder {
             return Ok(SubmitOutcome::Dropped);
         };
         let Some(target) = self.pool.textures.get(slot.id) else {
+            self.pool.shared.lock().push(slot);
             return Ok(SubmitOutcome::Dropped);
         };
 
@@ -706,23 +707,29 @@ impl HardwareEncoder {
                 .CopySubresourceRegion(target, 0, 0, 0, 0, texture, 0, Some(&region));
         }
 
-        let sample = slot.sample;
         let stream = self.stream;
         let callback = &self.pool.callback;
-        // SAFETY: valid sample/writer. SetAllocator must precede every write
-        // so the pool gets the sample back after MF releases it. Our own
-        // reference is dropped right after WriteSample, so Media Foundation's
-        // release is the last one. If the write fails, that drop returns the
-        // sample through the callback as well.
-        let result = unsafe {
+        // SAFETY: valid sample. Until SetAllocator succeeds the callback is
+        // not armed, so on failure the slot must go back to the pool by hand
+        // or it would be lost (and the pool would starve permanently).
+        let armed = unsafe {
             (|| -> Result<(), WinError> {
-                sample.SetSampleTime(sample_time)?;
-                sample.SetSampleDuration(duration)?;
-                let tracked: IMFTrackedSample = sample.cast()?;
-                tracked.SetAllocator(callback, None::<&windows_core::IUnknown>)?;
-                writer.WriteSample(stream, &sample)
+                slot.sample.SetSampleTime(sample_time)?;
+                slot.sample.SetSampleDuration(duration)?;
+                let tracked: IMFTrackedSample = slot.sample.cast()?;
+                tracked.SetAllocator(callback, None::<&windows_core::IUnknown>)
             })()
         };
+        if let Err(error) = armed {
+            self.pool.shared.lock().push(slot);
+            return Err(map_error(error));
+        }
+        let sample = slot.sample;
+        // SAFETY: valid sample/writer. Our own reference is dropped right
+        // after WriteSample, so Media Foundation's release is the last one and
+        // returns the sample through the armed callback, also when the write
+        // fails.
+        let result = unsafe { writer.WriteSample(stream, &sample) };
         drop(sample);
         result.map_err(map_error)?;
         Ok(SubmitOutcome::Submitted)

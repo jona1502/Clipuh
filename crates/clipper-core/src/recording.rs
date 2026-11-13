@@ -106,6 +106,9 @@ pub enum StopReason {
     User,
     SourceClosed,
     Shutdown,
+    /// Capture or encoder failed mid-recording; frames up to the failure
+    /// were finalized successfully.
+    Error,
 }
 
 #[derive(Clone, Debug, PartialEq)]

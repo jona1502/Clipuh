@@ -33,7 +33,19 @@ impl Recorder {
         let thread = std::thread::Builder::new()
             .name("clipper-recorder".into())
             .spawn(move || {
-                run(&endpoint);
+                // A panic must still tell the UI the worker is gone, otherwise
+                // it would wait forever in "Starting" or "Recording".
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run(&endpoint);
+                }));
+                if result.is_err() {
+                    emit(
+                        &endpoint,
+                        RecorderEvent::RecordingFailed {
+                            message: "the recorder stopped unexpectedly".into(),
+                        },
+                    );
+                }
                 emit(&endpoint, RecorderEvent::Stopped);
             })?;
         Ok(Self {

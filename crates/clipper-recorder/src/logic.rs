@@ -34,6 +34,24 @@ pub fn partial_path(final_path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// Encoded size for a source of `source` pixels and a configured `target`
+/// size: preserves the source aspect ratio (no stretching), never upscales,
+/// and keeps both dimensions even as H.264/NV12 requires.
+pub fn fit_output_size(source: (u32, u32), target: (u32, u32)) -> (u32, u32) {
+    let (sw, sh) = (u64::from(source.0.max(2)), u64::from(source.1.max(2)));
+    let (tw, th) = (u64::from(target.0.max(2)), u64::from(target.1.max(2)));
+    // scale = min(tw/sw, th/sh, 1) in exact integer arithmetic.
+    let (w, h) = if sw <= tw && sh <= th {
+        (sw, sh)
+    } else if tw * sh <= th * sw {
+        (tw, sh * tw / sw)
+    } else {
+        (sw * th / sh, th)
+    };
+    let even = |value: u64| (value.max(2) as u32) & !1;
+    (even(w), even(h))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StopOutcome {
     Success,
@@ -144,6 +162,21 @@ fn describe(error: CoreError) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn output_keeps_aspect_and_never_upscales() {
+        use super::fit_output_size;
+        // Same aspect: exact target.
+        assert_eq!(fit_output_size((2560, 1440), (1920, 1080)), (1920, 1080));
+        // Ultrawide monitor into a 16:9 preset: width-limited, no stretch.
+        assert_eq!(fit_output_size((3440, 1440), (1920, 1080)), (1920, 802));
+        // Tall window: height-limited.
+        assert_eq!(fit_output_size((1000, 2000), (1920, 1080)), (540, 1080));
+        // Small window: kept at source size, rounded to even.
+        assert_eq!(fit_output_size((801, 601), (1920, 1080)), (800, 600));
+        // Degenerate input never yields odd or zero sizes.
+        assert_eq!(fit_output_size((0, 0), (1920, 1080)), (2, 2));
+    }
+
     use super::*;
 
     #[test]

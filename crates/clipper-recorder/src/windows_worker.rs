@@ -22,7 +22,8 @@ use windows::Win32::System::SystemInformation::GetLocalTime;
 
 use crate::emit;
 use crate::logic::{
-    Counters, Lifecycle, StopOutcome, classify_stop, partial_path, unique_file_name,
+    Counters, Lifecycle, StopOutcome, classify_stop, fit_output_size, partial_path,
+    unique_file_name,
 };
 
 const MAX_WAIT: Duration = Duration::from_millis(250);
@@ -88,10 +89,12 @@ impl Recording {
 struct Worker<'a> {
     endpoint: &'a RecorderEndpoint,
     lifecycle: Lifecycle,
-    _com: Option<ComApartment>,
     init_error: Option<String>,
-    media_foundation: Option<MediaFoundation>,
+    // Field order is drop order: the recording and Media Foundation must be
+    // released before the COM apartment is left.
     recording: Option<Recording>,
+    media_foundation: Option<MediaFoundation>,
+    _com: Option<ComApartment>,
 }
 
 pub fn run(endpoint: &RecorderEndpoint) {
@@ -110,10 +113,10 @@ pub fn run(endpoint: &RecorderEndpoint) {
     let mut worker = Worker {
         endpoint,
         lifecycle: Lifecycle::new(),
-        _com: com,
         init_error,
-        media_foundation: None,
         recording: None,
+        media_foundation: None,
+        _com: com,
     };
 
     let mut running = true;
@@ -241,7 +244,7 @@ impl Worker<'_> {
             Err(RecvTimeoutError::Disconnected) => std::thread::sleep(Duration::from_millis(10)),
         }
         if let Err(message) = recording.pump() {
-            self.stop_recording(StopReason::SourceClosed, Some(message));
+            self.stop_recording(StopReason::Error, Some(message));
             return;
         }
         if recording.source_closed.load(Ordering::Acquire) {
@@ -291,12 +294,21 @@ impl Worker<'_> {
         drop(_d3d);
 
         let outcome = match classify_stop(counters.encoded, finish) {
-            StopOutcome::Success => fs::rename(&partial, &final_path).map_err(|error| {
-                format!(
-                    "could not save the recording to {}: {error}",
-                    final_path.display()
-                )
-            }),
+            StopOutcome::Success => match fs::rename(&partial, &final_path) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    // The partial file is complete and playable: keep it.
+                    self.lifecycle.stopped();
+                    self.send(RecorderEvent::RecordingFailed {
+                        message: format!(
+                            "the recording is complete but could not be renamed to {} ({error}); it was kept as {}",
+                            final_path.display(),
+                            partial.display()
+                        ),
+                    });
+                    return;
+                }
+            },
             StopOutcome::Failure(message) => Err(message),
         };
         self.lifecycle.stopped();
@@ -343,11 +355,13 @@ fn build_recording(
     .map_err(|error| error.to_string())?;
 
     let (width, height) = session.size();
+    let (output_width, output_height) =
+        fit_output_size((width, height), (options.width, options.height));
     let config = EncoderConfig {
         input_width: round_up_even(width),
         input_height: round_up_even(height),
-        output_width: options.width,
-        output_height: options.height,
+        output_width,
+        output_height,
         fps: options.fps,
         bitrate_mbps: options.bitrate_mbps,
         profile: options.profile,
