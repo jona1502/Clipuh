@@ -3,10 +3,13 @@ mod dashboard;
 mod editor;
 mod settings;
 
+use clipper_core::recording::{RecorderCommand, RecorderEvent, RecorderHandle};
+use clipper_storage::AppConfig;
 use gpui::prelude::*;
-use gpui::{Context, Div, FontWeight, Render, Window, div, px, rgb};
+use gpui::{Context, Div, FontWeight, Render, Task, Window, div, px, rgb};
 
 use crate::components::navigation_item;
+use crate::state::{Phase, RecordingState};
 use crate::theme;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -50,9 +53,62 @@ impl Page {
 }
 
 /// Main desktop application shell.
-#[derive(Default)]
 pub struct ClipperWindow {
     active_page: Page,
+    handle: RecorderHandle,
+    config: AppConfig,
+    recording: RecordingState,
+    /// Awaits recorder events; the UI re-renders only when one arrives.
+    _events: Task<()>,
+}
+
+impl ClipperWindow {
+    pub fn new(
+        handle: RecorderHandle,
+        config: AppConfig,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let events = handle.events();
+        let task = cx.spawn(async move |this, cx| {
+            while let Ok(event) = events.recv().await {
+                let updated = this.update(cx, |this, cx| {
+                    this.recording.apply(event);
+                    cx.notify();
+                });
+                if updated.is_err() {
+                    return;
+                }
+            }
+            // Channel closed without a final event: the worker is gone.
+            let _ = this.update(cx, |this, cx| {
+                if this.recording.phase != Phase::Idle {
+                    this.recording.apply(RecorderEvent::Stopped);
+                    cx.notify();
+                }
+            });
+        });
+        let mut window = Self {
+            active_page: Page::default(),
+            handle,
+            config,
+            recording: RecordingState::default(),
+            _events: task,
+        };
+        window.send(RecorderCommand::RefreshSources);
+        window
+    }
+
+    /// Queues a command; a full or closed queue surfaces as an error banner.
+    fn send(&mut self, command: RecorderCommand) -> bool {
+        match self.handle.send(command) {
+            Ok(()) => true,
+            Err(error) => {
+                self.recording.fail(error.to_string());
+                false
+            }
+        }
+    }
 }
 
 impl Render for ClipperWindow {
@@ -63,7 +119,7 @@ impl Render for ClipperWindow {
             .bg(rgb(theme::BACKGROUND))
             .text_color(rgb(theme::TEXT))
             .child(self.sidebar(cx))
-            .child(self.main_panel())
+            .child(self.main_panel(cx))
     }
 }
 
@@ -161,16 +217,18 @@ impl ClipperWindow {
                             .font_weight(FontWeight::SEMIBOLD)
                             .child("LOCAL WORKSPACE"),
                     )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(theme::MUTED))
-                            .child("Capture and clip storage are not connected yet."),
-                    ),
+                    .child(div().text_xs().text_color(rgb(theme::MUTED)).child(
+                        match self.recording.phase {
+                            Phase::Idle => "Ready to record. Clip storage is not connected yet.",
+                            Phase::Starting => "Starting a recording...",
+                            Phase::Recording => "Recording in progress.",
+                            Phase::Stopping => "Saving the recording...",
+                        },
+                    )),
             )
     }
 
-    fn main_panel(&self) -> Div {
+    fn main_panel(&self, cx: &mut Context<Self>) -> Div {
         div()
             .flex_1()
             .h_full()
@@ -195,7 +253,7 @@ impl ClipperWindow {
                             .flex_col()
                             .gap_7()
                             .child(self.page_heading())
-                            .child(self.page_content()),
+                            .child(self.page_content(cx)),
                     ),
             )
     }
@@ -236,12 +294,21 @@ impl ClipperWindow {
                     .border_1()
                     .border_color(rgb(theme::BORDER))
                     .bg(rgb(theme::SURFACE))
-                    .child(div().size(px(7.)).rounded_full().bg(rgb(0x78869a)))
+                    .child(
+                        div()
+                            .size(px(7.))
+                            .rounded_full()
+                            .bg(rgb(match self.recording.phase {
+                                Phase::Idle => 0x78869a,
+                                Phase::Starting => 0xe0b04a,
+                                Phase::Recording | Phase::Stopping => 0xe5484d,
+                            })),
+                    )
                     .child(
                         div()
                             .text_xs()
                             .text_color(rgb(theme::MUTED))
-                            .child("Capture not connected"),
+                            .child(self.recording.status_label()),
                     ),
             )
     }
@@ -290,12 +357,12 @@ impl ClipperWindow {
             )
     }
 
-    fn page_content(&self) -> Div {
+    fn page_content(&self, cx: &mut Context<Self>) -> Div {
         match self.active_page {
-            Page::Dashboard => dashboard::content(),
+            Page::Dashboard => dashboard::content(self, cx),
             Page::Clips => clips::content(),
             Page::Editor => editor::content(),
-            Page::Settings => settings::content(),
+            Page::Settings => settings::content(&self.config),
         }
     }
 }

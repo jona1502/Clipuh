@@ -1,5 +1,8 @@
 use gpui::prelude::*;
-use gpui::{App, ClickEvent, Div, FontWeight, IntoElement, Window, div, px, rgb};
+use gpui::{
+    App, ClickEvent, Div, ElementId, FontWeight, IntoElement, SharedString, Stateful, Window, div,
+    px, rgb,
+};
 
 use crate::theme;
 
@@ -87,7 +90,11 @@ pub fn empty_state(title: &'static str, description: &'static str, glyph: &'stat
         )
 }
 
-pub fn settings_row(title: &'static str, description: &'static str, value: &'static str) -> Div {
+pub fn settings_row(
+    title: &'static str,
+    description: &'static str,
+    value: impl Into<SharedString>,
+) -> Div {
     div()
         .w_full()
         .rounded_xl()
@@ -126,6 +133,128 @@ pub fn settings_row(title: &'static str, description: &'static str, value: &'sta
                 .bg(rgb(theme::SURFACE_RAISED))
                 .text_xs()
                 .text_color(rgb(theme::MUTED))
-                .child(value),
+                .child(value.into()),
         )
+}
+
+/// Selectable option chip. Disabled pills are muted and ignore clicks.
+pub fn pill(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    selected: bool,
+    enabled: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
+    let base = div()
+        .id(id)
+        .px_3()
+        .py_1()
+        .rounded_full()
+        .border_1()
+        .text_xs()
+        .font_weight(FontWeight::MEDIUM)
+        .border_color(rgb(if selected && enabled {
+            theme::ACCENT
+        } else {
+            theme::BORDER
+        }))
+        .bg(rgb(if selected {
+            theme::SURFACE_RAISED
+        } else {
+            theme::SURFACE
+        }))
+        .text_color(rgb(if !enabled {
+            theme::MUTED
+        } else if selected {
+            theme::TEXT
+        } else {
+            theme::MUTED
+        }))
+        .child(label.into());
+    if enabled {
+        base.cursor_pointer().on_click(on_click)
+    } else {
+        base.opacity(0.55)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ButtonKind {
+    Primary,
+    Danger,
+    Subtle,
+}
+
+/// Push button. Disabled buttons are muted and ignore clicks.
+pub fn button(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    kind: ButtonKind,
+    enabled: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
+    let (bg, fg) = match kind {
+        ButtonKind::Primary => (theme::ACCENT, 0xffffff),
+        ButtonKind::Danger => (0xd64545, 0xffffff),
+        ButtonKind::Subtle => (theme::SURFACE_RAISED, theme::TEXT),
+    };
+    let base = div()
+        .id(id)
+        .px_5()
+        .py_2()
+        .rounded_lg()
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_sm()
+        .font_weight(FontWeight::SEMIBOLD)
+        .bg(rgb(bg))
+        .text_color(rgb(fg))
+        .child(label.into());
+    if enabled {
+        base.cursor_pointer().on_click(on_click)
+    } else {
+        base.opacity(0.4)
+    }
+}
+
+/// Clickable list row used by the source picker.
+pub fn list_row(
+    id: impl Into<ElementId>,
+    primary: impl Into<SharedString>,
+    secondary: impl Into<SharedString>,
+    selected: bool,
+    enabled: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
+    let base = div()
+        .id(id)
+        .w_full()
+        .px_3()
+        .py_2()
+        .rounded_lg()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .text_sm()
+        .bg(rgb(if selected {
+            theme::SURFACE_RAISED
+        } else {
+            theme::SURFACE
+        }))
+        .border_1()
+        .border_color(rgb(if selected {
+            theme::ACCENT
+        } else {
+            theme::SURFACE
+        }))
+        .text_color(rgb(if selected { theme::TEXT } else { theme::MUTED }))
+        .child(div().flex_1().truncate().child(primary.into()))
+        .child(div().text_xs().child(secondary.into()));
+    if enabled {
+        base.cursor_pointer().on_click(on_click)
+    } else {
+        base.opacity(0.55)
+    }
 }

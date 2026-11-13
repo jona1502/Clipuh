@@ -1,5 +1,8 @@
-//! Phase 1 boundary for the future capture subsystem. No runtime backend is implemented.
-#![forbid(unsafe_code)]
+//! Screen capture backends. Windows uses Windows Graphics Capture.
+//!
+//! `unsafe` is denied crate-wide and allowed only inside the Windows FFI
+//! module, where each call documents its invariants.
+#![deny(unsafe_code)]
 
 #[cfg(target_os = "windows")]
 pub mod windows;
