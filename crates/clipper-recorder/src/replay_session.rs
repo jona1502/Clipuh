@@ -1,11 +1,10 @@
 //! Instant replay session: WGC capture -> pacing -> packet encoder -> hybrid
 //! replay buffer, all driven from the recorder worker thread.
 //!
-//! The worker never performs file I/O in steady state. The only exceptions
-//! are `ReplayBuffer::new`, which creates the SSD session directory once when
-//! the first packet defines the layout, and the tiny `exists()` checks used
-//! to pick a clip name when a save is requested. Spilling to the SSD runs on
-//! the buffer's own spill thread and clip files are written by the exporter
+//! The worker never performs file I/O in steady state. The only exception is
+//! `ReplayBuffer::new`, which creates the SSD session directory once when the
+//! first packet defines the layout. Spilling to the SSD runs on the buffer's
+//! own spill thread; clip folders, names and files are handled by the exporter
 //! thread.
 
 use std::sync::Arc;
@@ -13,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, sync_channel};
 use std::time::{Duration, Instant};
 
-use clipper_capture::windows::CaptureSession;
+use clipper_capture::windows::{CaptureSession, CapturedFrame};
 use clipper_core::pipeline::{FramePacer, RateMeter};
 use clipper_core::recording::{CaptureSource, ReplayOptions, ReplayStatus};
 use clipper_encoder::backends::media_foundation::{EncoderConfig, MediaFoundation, SubmitOutcome};
@@ -29,7 +28,8 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 
 use crate::logic::{
-    Counters, fit_output_size, replay_failure_text, replay_status, valid_replay_duration,
+    Counters, SlotTimeline, fit_output_size, replay_failure_text, replay_status, replay_warning,
+    valid_replay_duration,
 };
 use crate::recording_audio::RecordingAudio;
 use crate::windows_worker::{encoder_message, round_up_even, signal_handler};
@@ -43,7 +43,9 @@ const MAX_FRAMES_PER_PUMP: usize = 4;
 const MAX_REPEATS_PER_PUMP: usize = 16;
 /// Silence (in half frame intervals) before a gap is filled with repeated
 /// frames, so a merely late real frame is not overtaken by a repeat.
-const REPEAT_LAG_HALF_FRAMES: i64 = 3;
+const REPEAT_LAG_HALF_FRAMES: i64 = 2;
+/// Longest wait for the first captured frame before the session gives up.
+const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
 /// Audio is mixed this far behind real time (same as manual recording).
 const AUDIO_LAG_TICKS: i64 = 800_000;
 /// Audio/video clock gap that cannot be recovered.
@@ -58,9 +60,29 @@ struct LastFrame {
     content: (u32, u32),
 }
 
+/// A real frame waiting for the repeats that fill the slots before it.
+struct PendingFrame {
+    frame: CapturedFrame,
+    slot: i64,
+}
+
+/// Internal health counters of a session (logged when it stops).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReplayDiagnostics {
+    /// Frames the pacer skipped (source faster than the target rate).
+    pub pacer_skipped: u64,
+    /// Frames discarded because their slot was already filled.
+    pub late_discarded: u64,
+    /// Audio frames lost to ring overflow or the mixing window.
+    pub audio_glitch_frames: u64,
+    /// Packets the buffer rejected (timestamps not increasing).
+    pub invalid_packets: u64,
+}
+
 pub struct ReplaySession {
-    // Field order is drop order: stop capture first, then the encoder, audio
-    // and the buffer, and the device last.
+    // Field order is drop order: release the held frame and stop capture
+    // first, then the encoder, audio and the buffer, and the device last.
+    pending: Option<PendingFrame>,
     capture: CaptureSession,
     encoder: PacketEncoder,
     audio: Option<RecordingAudio>,
@@ -73,10 +95,11 @@ pub struct ReplaySession {
     meter: RateMeter,
     counters: Counters,
     started: Instant,
-    /// End of the newest submitted frame on the session timeline.
-    video_end: i64,
-    /// Start time of the newest submitted frame.
-    last_time: Option<i64>,
+    /// Constant frame rate grid of the video.
+    timeline: SlotTimeline,
+    /// Session time of the first submitted frame.
+    video_start: Option<i64>,
+    diagnostics: ReplayDiagnostics,
     packets: Vec<EncodedPacket>,
     pub wake: Receiver<()>,
     source_closed: Arc<AtomicBool>,
@@ -121,14 +144,19 @@ impl ReplaySession {
 
         // Initialize expensive GPU/codec resources before audio starts,
         // otherwise hardware encoder discovery can overflow the audio rings.
-        let audio = RecordingAudio::start(&recording.audio, wake_tx)
+        let mut audio = RecordingAudio::start(&recording.audio, wake_tx)
             .map_err(|message| replay_failure_text(&message))?;
+        if let Some(audio) = &mut audio {
+            audio.set_tolerant(true);
+        }
         let origin = audio.as_ref().map_or_else(
             clipper_audio::windows::qpc_now_ticks,
             RecordingAudio::origin,
         );
 
+        let interval = clipper_core::pipeline::FramePacer::new(recording.fps).interval();
         Ok(Self {
+            pending: None,
             capture,
             encoder,
             audio,
@@ -149,8 +177,9 @@ impl ReplaySession {
             meter: RateMeter::new(),
             counters: Counters::default(),
             started: Instant::now(),
-            video_end: 0,
-            last_time: None,
+            timeline: SlotTimeline::new(interval),
+            video_start: None,
+            diagnostics: ReplayDiagnostics::default(),
             packets: Vec::with_capacity(64),
             wake,
             source_closed,
@@ -189,12 +218,29 @@ impl ReplaySession {
             .counters
             .snapshot(self.started.elapsed(), self.meter.rate());
         let buffer = self.buffer.as_ref().map(ReplayBuffer::stats);
-        replay_status(
+        let mut status = replay_status(
             buffer.as_ref(),
             self.config.duration,
             exports_in_flight,
             stats,
-        )
+        );
+        status.warning = replay_warning(
+            status.warning.as_deref(),
+            self.video_start.is_none(),
+            self.diagnostics().audio_glitch_frames,
+            self.diagnostics.invalid_packets,
+        );
+        status
+    }
+
+    pub fn diagnostics(&self) -> ReplayDiagnostics {
+        ReplayDiagnostics {
+            audio_glitch_frames: self
+                .audio
+                .as_ref()
+                .map_or(0, RecordingAudio::glitched_frames),
+            ..self.diagnostics
+        }
     }
 
     /// Cheap Arc-clone snapshot of the configured duration; no file I/O.
@@ -209,90 +255,178 @@ impl ReplaySession {
     /// One bounded service step: frames, repeated frames, audio, packets.
     pub fn pump(&mut self) -> Result<(), String> {
         let interval = self.pacer.interval();
-        for _ in 0..MAX_FRAMES_PER_PUMP {
-            let Some(frame) = self
-                .capture
-                .try_next_frame()
-                .map_err(|error| replay_failure_text(&error.to_string()))?
-            else {
+        if self.video_start.is_none()
+            && self.last_frame.is_none()
+            && self.pending.is_none()
+            && self.started.elapsed() > FIRST_FRAME_TIMEOUT
+        {
+            return Err("the capture source delivered no frames".into());
+        }
+        let mut repeats_left = MAX_REPEATS_PER_PUMP;
+        let mut pulled = 0;
+        loop {
+            if self.pending.is_none() {
+                if pulled >= MAX_FRAMES_PER_PUMP {
+                    break;
+                }
+                let Some(frame) = self
+                    .capture
+                    .try_next_frame()
+                    .map_err(|error| replay_failure_text(&error.to_string()))?
+                else {
+                    break;
+                };
+                pulled += 1;
+                self.counters.captured += 1;
+                let Some(sample_time) = self.pacer.accept(frame.timestamp()) else {
+                    self.diagnostics.pacer_skipped += 1;
+                    // Before the shared origin (initial WGC frame delivered
+                    // while audio was starting): keep it as the repeat source
+                    // so a static scene still produces video.
+                    if self.last_frame.is_none() {
+                        self.remember(frame.texture(), frame.content_size())?;
+                    }
+                    continue;
+                };
+                let slot = self.timeline.slot_of(sample_time);
+                if self.timeline.is_late(slot) {
+                    // Its slot is taken (a repeat or an earlier frame).
+                    self.diagnostics.late_discarded += 1;
+                    continue;
+                }
+                self.pending = Some(PendingFrame { frame, slot });
+            }
+            if !self.flush_pending(interval, &mut repeats_left)? {
                 break;
-            };
-            self.counters.captured += 1;
-            let accepted = self.pacer.accept(frame.timestamp());
-            let Some(sample_time) = accepted else {
-                // Before the shared origin (initial WGC frame delivered while
-                // audio was starting): keep it as the repeat source so a
-                // static scene still produces video.
-                if self.last_frame.is_none() {
-                    self.remember(frame.texture(), frame.content_size())?;
-                }
-                continue;
-            };
-            // A frame delivered late after a declared gap must not move the
-            // timeline backwards or collide with a repeated frame.
-            if sample_time < self.video_end - interval
-                || self
-                    .last_time
-                    .is_some_and(|last| sample_time < last + interval / 2)
-            {
-                continue;
             }
-            let outcome = self
-                .encoder
-                .submit(frame.texture(), frame.content_size(), sample_time, interval)
-                .map_err(|error| replay_failure_text(&encoder_message(&error)))?;
-            match outcome {
-                SubmitOutcome::Submitted => {
-                    self.counters.encoded += 1;
-                    self.meter.record();
-                    self.video_end = sample_time + interval;
-                    self.last_time = Some(sample_time);
-                    self.remember(frame.texture(), frame.content_size())?;
-                }
-                SubmitOutcome::Dropped => self.counters.dropped += 1,
-            }
-            // `frame` drops here, returning its slot to the WGC pool.
         }
 
-        self.fill_static_scene(interval)?;
+        self.fill_static_scene(interval, &mut repeats_left)?;
 
-        if let Some(audio) = &mut self.audio
-            && let Err(message) = audio.pump(&mut self.encoder, false, self.video_end)
-        {
-            return Err(replay_failure_text(&message));
+        if let Some(audio) = &mut self.audio {
+            let result = if self.video_start.is_none() {
+                // No video to align with yet: keep the capture rings empty.
+                audio.discard()
+            } else {
+                audio.pump(&mut self.encoder, false, self.timeline.end_ticks())
+            };
+            if let Err(message) = result {
+                return Err(replay_failure_text(&message));
+            }
         }
         self.drain_packets()
     }
 
+    /// Starts the video (and audio) timeline at `slot`.
+    fn begin_video(&mut self, slot: i64) {
+        if self.timeline.started() {
+            return;
+        }
+        self.timeline.begin(slot);
+        let start = self.timeline.time_of(slot);
+        self.video_start = Some(start);
+        if let Some(audio) = &mut self.audio {
+            audio.start_at(self.origin + start);
+        }
+    }
+
+    /// Submits the held real frame once the slots before it are filled with
+    /// repeats. `Ok(false)`: out of budget or the encoder is busy, the frame
+    /// stays pending for the next iteration.
+    fn flush_pending(&mut self, interval: i64, repeats_left: &mut usize) -> Result<bool, String> {
+        let Some(pending) = self.pending.take() else {
+            return Ok(true);
+        };
+        let slot = pending.slot;
+        if self.timeline.is_late(slot) {
+            self.diagnostics.late_discarded += 1;
+            return Ok(true);
+        }
+        if !self.timeline.started() {
+            // A remembered pre-origin frame lets the video start at 0.
+            self.begin_video(if self.last_frame.is_some() { 0 } else { slot });
+        }
+        while self.timeline.next() < slot {
+            if *repeats_left == 0 || !self.submit_repeat(interval)? {
+                self.pending = Some(pending);
+                return Ok(false);
+            }
+            *repeats_left -= 1;
+        }
+        let size = pending.frame.content_size();
+        let outcome = self
+            .encoder
+            .submit(
+                pending.frame.texture(),
+                size,
+                self.timeline.time_of(slot),
+                interval,
+            )
+            .map_err(|error| replay_failure_text(&encoder_message(&error)))?;
+        match outcome {
+            SubmitOutcome::Submitted => {
+                self.counters.encoded += 1;
+                self.meter.record();
+                self.timeline.advance();
+                self.remember(pending.frame.texture(), size)?;
+            }
+            // The slot stays empty; the static-scene fill repeats the last
+            // frame there.
+            SubmitOutcome::Dropped => self.counters.dropped += 1,
+        }
+        // `pending` drops here, returning its slot to the WGC pool.
+        Ok(true)
+    }
+
+    /// Fills the next slot with the last frame. `Ok(false)` when the encoder
+    /// is busy.
+    fn submit_repeat(&mut self, interval: i64) -> Result<bool, String> {
+        let Some(last) = &self.last_frame else {
+            // Nothing to repeat (cannot happen once video started).
+            self.timeline.advance();
+            return Ok(true);
+        };
+        let time = self.timeline.time_of(self.timeline.next());
+        let outcome = self
+            .encoder
+            .submit(&last.texture, last.content, time, interval)
+            .map_err(|error| replay_failure_text(&encoder_message(&error)))?;
+        match outcome {
+            SubmitOutcome::Submitted => {
+                self.counters.encoded += 1;
+                self.meter.record();
+                self.timeline.advance();
+                Ok(true)
+            }
+            SubmitOutcome::Dropped => Ok(false),
+        }
+    }
+
     /// Re-submits the last frame while WGC is silent, up to real time minus a
     /// small lag, so the timeline keeps moving at the configured frame rate.
-    fn fill_static_scene(&mut self, interval: i64) -> Result<(), String> {
+    fn fill_static_scene(&mut self, interval: i64, repeats_left: &mut usize) -> Result<(), String> {
         let now = clipper_audio::windows::qpc_now_ticks() - self.origin;
-        if self.audio.is_some() && now - AUDIO_LAG_TICKS - self.video_end > MAX_CLOCK_GAP_TICKS {
+        // Only meaningful once video exists: without a first frame the video
+        // end stays 0 and the clocks cannot be compared.
+        if self.video_start.is_some()
+            && self.audio.is_some()
+            && now - AUDIO_LAG_TICKS - self.timeline.end_ticks() > MAX_CLOCK_GAP_TICKS
+        {
             return Err("the audio and video clocks drifted apart".into());
         }
+        if self.pending.is_some() || self.last_frame.is_none() {
+            return Ok(());
+        }
         let due = now - REPEAT_LAG_HALF_FRAMES * interval / 2;
-        for _ in 0..MAX_REPEATS_PER_PUMP {
-            if self.video_end + interval > due {
+        while *repeats_left > 0 {
+            if self.timeline.end_ticks() + interval > due {
                 break;
             }
-            let Some(last) = &self.last_frame else {
+            self.begin_video(0);
+            if !self.submit_repeat(interval)? {
                 break;
-            };
-            let outcome = self
-                .encoder
-                .submit(&last.texture, last.content, self.video_end, interval)
-                .map_err(|error| replay_failure_text(&encoder_message(&error)))?;
-            match outcome {
-                SubmitOutcome::Submitted => {
-                    self.counters.encoded += 1;
-                    self.meter.record();
-                    self.last_time = Some(self.video_end);
-                    self.video_end += interval;
-                }
-                // Encoder busy: try again on the next iteration.
-                SubmitOutcome::Dropped => break,
             }
+            *repeats_left -= 1;
         }
         Ok(())
     }
@@ -318,9 +452,12 @@ impl ReplaySession {
             return Ok(());
         };
         for packet in self.packets.drain(..) {
-            buffer
-                .push(packet)
-                .map_err(|error| replay_failure_text(&error.to_string()))?;
+            match buffer.push(packet) {
+                Ok(()) => {}
+                // Timestamps not increasing: lose this packet, keep recording.
+                Err(ReplayError::Invalid(_)) => self.diagnostics.invalid_packets += 1,
+                Err(error) => return Err(replay_failure_text(&error.to_string())),
+            }
         }
         Ok(())
     }

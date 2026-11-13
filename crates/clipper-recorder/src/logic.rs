@@ -178,6 +178,126 @@ pub fn replay_status(
     }
 }
 
+/// Constant frame rate grid of the replay video: slot `n` covers
+/// `[n * interval, (n + 1) * interval)` on the session timeline and holds
+/// exactly one frame, real or repeated.
+#[derive(Clone, Copy, Debug)]
+pub struct SlotTimeline {
+    interval: i64,
+    next: i64,
+    started: bool,
+}
+
+impl SlotTimeline {
+    pub fn new(interval: i64) -> Self {
+        Self {
+            interval: interval.max(1),
+            next: 0,
+            started: false,
+        }
+    }
+
+    /// Nearest slot of a frame timestamp.
+    pub fn slot_of(&self, sample_time: i64) -> i64 {
+        (sample_time + self.interval / 2).div_euclid(self.interval)
+    }
+
+    pub fn started(&self) -> bool {
+        self.started
+    }
+
+    /// First slot that is still empty.
+    pub fn next(&self) -> i64 {
+        self.next
+    }
+
+    pub fn time_of(&self, slot: i64) -> i64 {
+        slot * self.interval
+    }
+
+    /// End of the newest submitted slot (0 before the first one).
+    pub fn end_ticks(&self) -> i64 {
+        self.next * self.interval
+    }
+
+    /// A real frame whose slot is already taken (or passed) must be skipped.
+    pub fn is_late(&self, slot: i64) -> bool {
+        self.started && slot < self.next
+    }
+
+    /// Starts the grid at `slot`; no-op once started.
+    pub fn begin(&mut self, slot: i64) {
+        if !self.started {
+            self.started = true;
+            self.next = slot.max(0);
+        }
+    }
+
+    /// The slot `next` was filled.
+    pub fn advance(&mut self) {
+        self.next += 1;
+    }
+}
+
+/// Status warning text of a replay session (`None` when all is well).
+pub fn replay_warning(
+    disk: Option<&str>,
+    waiting_for_video: bool,
+    audio_glitch_frames: u64,
+    invalid_packets: u64,
+) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(disk) = disk {
+        parts.push(disk.to_owned());
+    }
+    if waiting_for_video {
+        parts.push("waiting for the first video frame".into());
+    }
+    if audio_glitch_frames > 0 {
+        parts.push(format!("audio glitch: {audio_glitch_frames} frames lost"));
+    }
+    if invalid_packets > 0 {
+        parts.push(format!("dropped {invalid_packets} invalid packets"));
+    }
+    (!parts.is_empty()).then(|| parts.join("; "))
+}
+
+/// Deletes `Clipper_Replay_*.mp4.partial` files in `directory` last modified
+/// more than `max_age` before `now`. Never touches any other file. Returns the
+/// number of removed files.
+pub fn sweep_stale_partials(
+    directory: &Path,
+    now: std::time::SystemTime,
+    max_age: Duration,
+) -> usize {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !(name.starts_with("Clipper_Replay_") && name.ends_with(".mp4.partial")) {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let stale = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age > max_age);
+        if stale && std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StopOutcome {
     Success,
@@ -421,6 +541,74 @@ mod tests {
             classify_stop(10, Err("disk".into())),
             StopOutcome::Failure("disk".into())
         );
+    }
+
+    #[test]
+    fn slots_round_to_the_nearest_frame_and_reject_late_frames() {
+        let mut timeline = SlotTimeline::new(166_666);
+        assert_eq!(timeline.slot_of(0), 0);
+        assert_eq!(timeline.slot_of(83_332), 0);
+        assert_eq!(timeline.slot_of(83_334), 1);
+        assert_eq!(timeline.slot_of(166_666 * 5 + 1000), 5);
+        assert!(!timeline.is_late(0), "nothing is late before the start");
+        timeline.begin(3);
+        timeline.begin(9);
+        assert_eq!(timeline.next(), 3);
+        assert_eq!(timeline.end_ticks(), 3 * 166_666);
+        assert!(timeline.is_late(2));
+        assert!(!timeline.is_late(3));
+        timeline.advance();
+        assert!(timeline.is_late(3));
+        assert_eq!(timeline.time_of(7), 7 * 166_666);
+    }
+
+    #[test]
+    fn warning_lists_every_problem() {
+        assert_eq!(replay_warning(None, false, 0, 0), None);
+        assert_eq!(
+            replay_warning(Some("disk"), true, 480, 2).as_deref(),
+            Some(
+                "disk; waiting for the first video frame; audio glitch: 480 frames lost; dropped 2 invalid packets"
+            )
+        );
+    }
+
+    #[test]
+    fn sweep_removes_only_old_replay_partials() {
+        let dir = std::env::temp_dir().join(format!("clipper-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in [
+            "Clipper_Replay_2026-01-01_10-00-00.mp4.partial",
+            "Clipper_Replay_2026-01-01_10-00-00.mp4",
+            "Clipper_2026-01-01_10-00-00.mp4.partial",
+            "other.partial",
+        ] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        let hour = Duration::from_secs(3600);
+        // Fresh files survive.
+        assert_eq!(
+            sweep_stale_partials(&dir, std::time::SystemTime::now(), hour),
+            0
+        );
+        // Two hours later the replay partial is stale, nothing else is.
+        let later = std::time::SystemTime::now() + 2 * hour;
+        assert_eq!(sweep_stale_partials(&dir, later, hour), 1);
+        let mut left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                "Clipper_2026-01-01_10-00-00.mp4.partial",
+                "Clipper_Replay_2026-01-01_10-00-00.mp4",
+                "other.partial"
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
