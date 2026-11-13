@@ -1,7 +1,42 @@
 //! FFprobe-like clip check with Media Foundation: lists every stream, fully
 //! DECODES each one (H.264 to NV12, AAC to float) and reports frame/sample
-//! counts, first/last timestamps, gaps, and audio peak level.
+//! counts, first/last timestamps, the decoded frame rate, min/max/median
+//! interval between successive timestamps, the number of intervals above
+//! 1.5x the median, and the audio peak level.
 //! Usage: cargo run -p clipper-encoder --example probe_clip -- <clip.mp4>
+/// Statistics over the timestamps of successive decoded samples (100 ns).
+#[derive(Debug, PartialEq)]
+struct IntervalStats {
+    min: i64,
+    max: i64,
+    median: i64,
+    /// Intervals longer than 1.5x the median.
+    long: usize,
+    /// Samples per second over `last - first + average duration`.
+    rate: f64,
+}
+
+fn interval_stats(times: &[i64], durations_sum: i64) -> Option<IntervalStats> {
+    if times.len() < 2 {
+        return None;
+    }
+    let mut intervals: Vec<i64> = times.windows(2).map(|w| w[1] - w[0]).collect();
+    let (min, max) = (*intervals.iter().min()?, *intervals.iter().max()?);
+    intervals.sort_unstable();
+    let median = intervals[intervals.len() / 2];
+    let long = intervals.iter().filter(|i| **i * 2 > median * 3).count();
+    let average = durations_sum / times.len() as i64;
+    let average = if average > 0 { average } else { median };
+    let span = (times[times.len() - 1] - times[0] + average) as f64 / 1e7;
+    Some(IntervalStats {
+        min,
+        max,
+        median,
+        long,
+        rate: times.len() as f64 / span,
+    })
+}
+
 #[cfg(windows)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use clipper_encoder::backends::media_foundation::MediaFoundation;
@@ -58,7 +93,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             reader.SetCurrentMediaType(index, None, &decoded)?;
             let (mut count, mut first, mut last, mut end) = (0u64, None, 0i64, 0i64);
-            let (mut max_gap, mut peak, mut errors) = (0i64, 0f32, 0u32);
+            let (mut peak, mut errors) = (0f32, 0u32);
+            let (mut times, mut durations_sum) = (Vec::<i64>::new(), 0i64);
             loop {
                 let mut flags = 0u32;
                 let mut time = 0i64;
@@ -82,9 +118,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     break;
                 }
                 if let Some(sample) = sample {
-                    if count > 0 {
-                        max_gap = max_gap.max(time - end);
-                    }
+                    times.push(time);
+                    durations_sum += sample.GetSampleDuration().unwrap_or(0);
                     first.get_or_insert(time);
                     last = time;
                     end = time + sample.GetSampleDuration().unwrap_or(0);
@@ -108,12 +143,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let first = first.unwrap_or(0);
             print!(
-                " decoded={count} first={:.3}s last={:.3}s end={:.3}s max_gap={:.1}ms",
+                " decoded={count} first={:.3}s last={:.3}s end={:.3}s",
                 first as f64 / 1e7,
                 last as f64 / 1e7,
                 end as f64 / 1e7,
-                max_gap as f64 / 1e4
             );
+            if let Some(stats) = interval_stats(&times, durations_sum) {
+                print!(
+                    " fps={:.3} interval_ms(min/median/max)={:.2}/{:.2}/{:.2} long_intervals(>1.5x median)={}",
+                    stats.rate,
+                    stats.min as f64 / 1e4,
+                    stats.median as f64 / 1e4,
+                    stats.max as f64 / 1e4,
+                    stats.long
+                );
+            }
             if !video {
                 print!(" peak={peak:.4}");
             }
@@ -129,3 +173,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(not(windows))]
 fn main() {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn steady_60_fps_has_no_long_intervals() {
+        let times: Vec<i64> = (0..60).map(|i| i * 166_667).collect();
+        let stats = interval_stats(&times, 60 * 166_667).unwrap();
+        assert!((stats.rate - 60.0).abs() < 0.01, "{}", stats.rate);
+        assert_eq!((stats.min, stats.max, stats.long), (166_667, 166_667, 0));
+    }
+
+    #[test]
+    fn holes_are_counted_and_lower_the_rate() {
+        // 30 frames, then a 100 ms hole, then 30 more.
+        let mut times: Vec<i64> = (0..30).map(|i| i * 166_667).collect();
+        times.extend((0..30).map(|i| 30 * 166_667 + 1_000_000 + i * 166_667));
+        let stats = interval_stats(&times, 0).unwrap();
+        assert_eq!(stats.long, 1);
+        assert_eq!(stats.max, 166_667 + 1_000_000);
+        assert!(stats.rate < 57.0, "{}", stats.rate);
+        assert!(interval_stats(&times[..1], 0).is_none());
+    }
+}
