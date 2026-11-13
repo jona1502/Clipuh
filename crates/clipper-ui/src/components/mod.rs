@@ -1,131 +1,364 @@
+//! Shared building blocks. Views compose these instead of styling raw divs, so surfaces,
+//! spacing and states stay consistent across pages.
+
 use gpui::prelude::*;
-use gpui::{App, ClickEvent, Div, FontWeight, IntoElement, Window, div, px, rgb};
+use gpui::{Div, ElementId, FontWeight, IntoElement, SharedString, Stateful, div, px, rgb, rgba};
 
 use crate::theme;
 
-pub fn navigation_item(
-    id: &'static str,
-    glyph: &'static str,
-    label: &'static str,
-    active: bool,
-    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
+/// Semantic color for badges and status dots.
+#[expect(
+    dead_code,
+    reason = "status tones are wired when capture state reaches the UI"
+)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tone {
+    Neutral,
+    Accent,
+    Success,
+    Warning,
+    Danger,
+}
+
+impl Tone {
+    fn color(self) -> u32 {
+        match self {
+            Self::Neutral => theme::NEUTRAL,
+            Self::Accent => theme::ACCENT,
+            Self::Success => theme::SUCCESS,
+            Self::Warning => theme::WARNING,
+            Self::Danger => theme::DANGER,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ButtonVariant {
+    Primary,
+    Secondary,
+    Ghost,
+}
+
+/// The base surface: one subtle border, one fill, one radius.
+pub fn panel() -> Div {
+    div()
+        .rounded_xl()
+        .border_1()
+        .border_color(rgb(theme::BORDER))
+        .bg(rgb(theme::SURFACE))
+}
+
+/// Small uppercase-free section label with optional trailing note.
+pub fn section_header(title: impl Into<SharedString>, trailing: Option<SharedString>) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .px_1()
+        .child(
+            div()
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(theme::TEXT_SECONDARY))
+                .child(title.into()),
+        )
+        .children(trailing.map(|note| {
+            div()
+                .text_xs()
+                .text_color(rgb(theme::TEXT_TERTIARY))
+                .child(note)
+        }))
+}
+
+/// A keycap. Pass one key per call ("Ctrl", "K").
+pub fn kbd(key: impl Into<SharedString>) -> Div {
+    div()
+        .min_w(px(18.))
+        .h(px(18.))
+        .px_1()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_sm()
+        .border_1()
+        .border_color(rgb(theme::BORDER_STRONG))
+        .bg(rgb(theme::SURFACE_RAISED))
+        .text_size(px(10.))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(rgb(theme::TEXT_SECONDARY))
+        .child(key.into())
+}
+
+/// Key combination such as `&["Ctrl", "K"]`.
+pub fn shortcut(keys: &[&'static str]) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(3.))
+        .children(keys.iter().map(|key| kbd(*key)))
+}
+
+pub fn status_dot(tone: Tone) -> Div {
+    div().size(px(6.)).rounded_full().bg(rgb(tone.color()))
+}
+
+/// Minimal pill: colored dot plus muted label.
+pub fn badge(label: impl Into<SharedString>, tone: Tone) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .gap_1p5()
+        .h(px(22.))
+        .px_2()
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(theme::BORDER))
+        .bg(rgb(theme::SURFACE_RAISED))
+        .text_xs()
+        .text_color(rgb(theme::TEXT_SECONDARY))
+        .child(status_dot(tone))
+        .child(label.into())
+}
+
+/// Compact button. Disabled buttons keep their layout but drop hover and pointer.
+/// Callers attach `on_click` to the returned element.
+pub fn button(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    variant: ButtonVariant,
+    keys: Option<&[&'static str]>,
+    enabled: bool,
+) -> Stateful<Div> {
+    let (bg, hover, text, border) = match variant {
+        ButtonVariant::Primary => (
+            theme::ACCENT,
+            theme::ACCENT_HOVER,
+            theme::TEXT_ON_ACCENT,
+            theme::ACCENT,
+        ),
+        ButtonVariant::Secondary => (
+            theme::SURFACE_RAISED,
+            theme::SURFACE_HOVER,
+            theme::TEXT,
+            theme::BORDER_STRONG,
+        ),
+        ButtonVariant::Ghost => (
+            theme::SURFACE,
+            theme::SURFACE_HOVER,
+            theme::TEXT_SECONDARY,
+            theme::SURFACE,
+        ),
+    };
+
     div()
         .id(id)
         .flex()
         .items_center()
-        .gap_3()
-        .w_full()
+        .gap_2()
+        .h(px(30.))
         .px_3()
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(border))
+        .bg(rgb(bg))
+        .text_xs()
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(rgb(text))
+        .child(label.into())
+        .children(keys.map(shortcut))
+        .map(|this| {
+            if enabled {
+                this.cursor_pointer().hover(|style| style.bg(rgb(hover)))
+            } else {
+                this.opacity(0.45)
+            }
+        })
+}
+
+/// One label/value line inside a panel. Rows after the first draw a top divider.
+pub fn property_row(
+    label: impl Into<SharedString>,
+    description: Option<SharedString>,
+    value: impl IntoElement,
+    first: bool,
+) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_6()
+        .px_4()
         .py_3()
-        .rounded_lg()
-        .cursor_pointer()
-        .bg(rgb(if active {
-            theme::SURFACE_RAISED
-        } else {
-            theme::SIDEBAR
-        }))
-        .text_color(rgb(if active { theme::TEXT } else { theme::MUTED }))
-        .on_click(on_click)
+        .when(!first, |this| {
+            this.border_t_1().border_color(rgb(theme::BORDER))
+        })
         .child(
             div()
-                .w(px(22.))
-                .text_color(rgb(if active { theme::ACCENT } else { theme::MUTED }))
-                .child(glyph),
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .min_w_0()
+                .child(div().text_sm().child(label.into()))
+                .children(description.map(|text| {
+                    div()
+                        .text_xs()
+                        .text_color(rgb(theme::TEXT_TERTIARY))
+                        .child(text)
+                })),
         )
+        .child(value)
+}
+
+/// Right-aligned secondary value for `property_row`.
+pub fn value_text(text: impl Into<SharedString>) -> Div {
+    div()
+        .flex_none()
+        .text_sm()
+        .text_color(rgb(theme::TEXT_SECONDARY))
+        .child(text.into())
+}
+
+/// Read-only switch visual. Settings are not editable from the UI yet.
+pub fn switch(on: bool) -> Div {
+    div()
+        .flex_none()
+        .w(px(28.))
+        .h(px(16.))
+        .p(px(2.))
+        .flex()
+        .rounded_full()
+        .bg(rgb(if on {
+            theme::ACCENT
+        } else {
+            theme::BORDER_STRONG
+        }))
+        .when(on, |this| this.justify_end())
         .child(
             div()
-                .text_sm()
-                .font_weight(if active {
-                    FontWeight::SEMIBOLD
-                } else {
-                    FontWeight::MEDIUM
-                })
-                .child(label),
+                .size(px(12.))
+                .rounded_full()
+                .bg(rgb(theme::TEXT_ON_ACCENT)),
         )
 }
 
-pub fn empty_state(title: &'static str, description: &'static str, glyph: &'static str) -> Div {
+/// Label, large value and one line of context.
+pub fn stat_tile(
+    label: impl Into<SharedString>,
+    value: impl Into<SharedString>,
+    detail: impl Into<SharedString>,
+) -> Div {
+    panel()
+        .flex_1()
+        .min_w_0()
+        .p_4()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(theme::TEXT_TERTIARY))
+                .child(label.into()),
+        )
+        .child(
+            div()
+                .text_lg()
+                .font_weight(FontWeight::SEMIBOLD)
+                .truncate()
+                .child(value.into()),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(theme::TEXT_SECONDARY))
+                .truncate()
+                .child(detail.into()),
+        )
+}
+
+pub fn empty_state(
+    glyph: &'static str,
+    title: impl Into<SharedString>,
+    description: impl Into<SharedString>,
+) -> Div {
     div()
         .w_full()
-        .rounded_2xl()
-        .border_1()
-        .border_color(rgb(theme::BORDER))
-        .bg(rgb(theme::SURFACE))
         .px_8()
         .py_10()
         .flex()
         .flex_col()
         .items_center()
-        .justify_center()
-        .gap_3()
+        .gap_2()
         .child(
             div()
-                .size(px(52.))
+                .size(px(36.))
+                .mb_1()
                 .flex()
                 .items_center()
                 .justify_center()
-                .rounded_2xl()
+                .rounded_lg()
+                .border_1()
+                .border_color(rgb(theme::BORDER_STRONG))
                 .bg(rgb(theme::SURFACE_RAISED))
-                .text_color(rgb(theme::ACCENT))
-                .text_xl()
+                .text_color(rgb(theme::TEXT_SECONDARY))
                 .child(glyph),
         )
         .child(
             div()
-                .text_base()
-                .font_weight(FontWeight::SEMIBOLD)
-                .child(title),
+                .text_sm()
+                .font_weight(FontWeight::MEDIUM)
+                .child(title.into()),
         )
         .child(
             div()
-                .max_w(px(440.))
-                .text_sm()
-                .text_color(rgb(theme::MUTED))
+                .max_w(px(380.))
+                .text_xs()
                 .text_center()
-                .child(description),
+                .text_color(rgb(theme::TEXT_TERTIARY))
+                .child(description.into()),
         )
 }
 
-pub fn settings_row(title: &'static str, description: &'static str, value: &'static str) -> Div {
+/// Selectable list row shared by the sidebar and the command palette.
+/// `selected` is the keyboard/active selection; hover is a lighter preview of it.
+pub fn list_item(
+    id: impl Into<ElementId>,
+    glyph: &'static str,
+    label: impl Into<SharedString>,
+    keys: Option<&[&'static str]>,
+    selected: bool,
+) -> Stateful<Div> {
     div()
-        .w_full()
-        .rounded_xl()
-        .border_1()
-        .border_color(rgb(theme::BORDER))
-        .bg(rgb(theme::SURFACE))
-        .px_5()
-        .py_4()
+        .id(id)
         .flex()
         .items_center()
-        .justify_between()
-        .gap_6()
+        .gap_2p5()
+        .h(px(32.))
+        .px_2()
+        .rounded_md()
+        .cursor_pointer()
+        .text_sm()
+        .map(|this| {
+            if selected {
+                this.bg(rgba(theme::ACCENT_SUBTLE))
+                    .text_color(rgb(theme::TEXT))
+            } else {
+                this.text_color(rgb(theme::TEXT_SECONDARY))
+                    .hover(|style| style.bg(rgb(theme::SURFACE_HOVER)))
+            }
+        })
         .child(
             div()
+                .w(px(16.))
                 .flex()
-                .flex_col()
-                .gap_1()
-                .child(
-                    div()
-                        .text_sm()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(title),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(theme::MUTED))
-                        .child(description),
-                ),
+                .justify_center()
+                .text_color(rgb(if selected {
+                    theme::ACCENT
+                } else {
+                    theme::TEXT_TERTIARY
+                }))
+                .child(glyph),
         )
-        .child(
-            div()
-                .px_3()
-                .py_2()
-                .rounded_full()
-                .bg(rgb(theme::SURFACE_RAISED))
-                .text_xs()
-                .text_color(rgb(theme::MUTED))
-                .child(value),
-        )
+        .child(div().flex_1().truncate().child(label.into()))
+        .children(keys.map(shortcut))
 }

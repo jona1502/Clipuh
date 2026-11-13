@@ -1,26 +1,172 @@
+use clipper_storage::{
+    AppConfig,
+    config::{EncoderPreference, ReplayMode, Theme, VideoCodec},
+    config_path,
+};
 use gpui::prelude::*;
-use gpui::{Div, div};
+use gpui::{AnyElement, Div, SharedString, div, rgb};
 
-use crate::components::settings_row;
+use crate::components::{kbd, panel, property_row, section_header, switch, value_text};
+use crate::theme;
 
-pub(super) fn content() -> Div {
+type Row = (&'static str, Option<&'static str>, AnyElement);
+
+/// One group: header plus a single panel of rows; the first row has no divider.
+fn group(title: &'static str, rows: Vec<Row>) -> Div {
+    let mut body = panel();
+    for (i, (label, description, value)) in rows.into_iter().enumerate() {
+        let description = description.map(SharedString::from);
+        body = body.child(property_row(label, description, value, i == 0));
+    }
     div()
         .flex()
         .flex_col()
-        .gap_4()
-        .child(settings_row(
-            "Capture",
-            "Capture controls will appear when the capture service is connected.",
-            "Not connected",
+        .gap_2()
+        .child(section_header(title, None))
+        .child(body)
+}
+
+fn text(value: impl Into<SharedString>) -> AnyElement {
+    value_text(value).into_any_element()
+}
+
+fn toggle(on: bool) -> AnyElement {
+    switch(on).into_any_element()
+}
+
+pub(super) fn content(config: &AppConfig) -> Div {
+    let video = &config.video;
+    let replay = &config.replay;
+    let audio = &config.audio;
+    let app = &config.app;
+    let perf = &config.performance;
+
+    let codec = match video.codec {
+        VideoCodec::H264 => "H.264",
+    };
+    let encoder = match video.encoder {
+        EncoderPreference::Auto => "Auto",
+    };
+    let mode = match replay.mode {
+        ReplayMode::Hybrid => "Hybrid",
+    };
+    let theme_name = match app.theme {
+        Theme::Dark => "Dark",
+        Theme::Light => "Light",
+        Theme::System => "System",
+    };
+
+    let mut root = div()
+        .flex()
+        .flex_col()
+        .gap_6()
+        .child(group(
+            "Video",
+            vec![
+                (
+                    "Resolution",
+                    None,
+                    text(format!("{}×{}", video.width, video.height)),
+                ),
+                ("Frame rate", None, text(format!("{} fps", video.fps))),
+                ("Codec", None, text(codec)),
+                ("Encoder", None, text(encoder)),
+                (
+                    "Bitrate",
+                    None,
+                    text(format!("{} Mbps", video.bitrate_mbps)),
+                ),
+            ],
         ))
-        .child(settings_row(
+        .child(group(
+            "Replay",
+            vec![
+                ("Mode", None, text(mode)),
+                (
+                    "Duration",
+                    None,
+                    text(format!("{} s", replay.duration_seconds)),
+                ),
+                (
+                    "Memory budget",
+                    Some("Older footage spills to disk."),
+                    text(format!("{} MB", replay.memory_limit_megabytes)),
+                ),
+                (
+                    "Save hotkey",
+                    None,
+                    kbd(replay.hotkey.clone()).into_any_element(),
+                ),
+            ],
+        ))
+        .child(group(
+            "Audio",
+            vec![
+                ("Game", None, toggle(audio.game)),
+                ("Desktop", None, toggle(audio.desktop)),
+                ("Discord", None, toggle(audio.discord)),
+                ("Microphone", None, toggle(audio.microphone)),
+                ("Separate tracks", None, toggle(audio.separate_tracks)),
+            ],
+        ));
+
+    // Path is shown only when the config directory can be resolved.
+    if let Ok(path) = config_path() {
+        root = root.child(group(
             "Storage",
-            "Clip storage preferences will appear when the clip library is connected.",
-            "Not connected",
-        ))
-        .child(settings_row(
-            "About",
-            "Clipper desktop workspace",
-            "Version 0.1.0",
-        ))
+            vec![(
+                "Settings file",
+                None,
+                div()
+                    .max_w(gpui::px(420.))
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .child(value_text(path.display().to_string()))
+                    .into_any_element(),
+            )],
+        ));
+    } else {
+        root = root.child(group(
+            "Storage",
+            vec![("Settings file", None, text("Unavailable"))],
+        ));
+    }
+
+    root.child(group(
+        "App",
+        vec![
+            ("Theme", None, text(theme_name)),
+            (
+                "Automatic game detection",
+                None,
+                toggle(app.automatic_detection),
+            ),
+            ("Manual game selection", None, toggle(app.manual_detection)),
+            ("Start on login", None, toggle(app.start_on_login)),
+            ("Tray icon", None, toggle(app.tray_icon)),
+            ("Minimize to tray", None, toggle(app.minimize_to_tray)),
+        ],
+    ))
+    .child(group(
+        "Performance",
+        vec![
+            (
+                "Command queue capacity",
+                Some("UI to worker commands."),
+                text(perf.command_queue_capacity.to_string()),
+            ),
+            (
+                "Event queue capacity",
+                Some("Worker to UI events."),
+                text(perf.event_queue_capacity.to_string()),
+            ),
+        ],
+    ))
+    .child(
+        div()
+            .text_xs()
+            .text_color(rgb(theme::TEXT_TERTIARY))
+            .child("Settings are read from settings.toml. Editing in the app is coming later."),
+    )
 }

@@ -730,6 +730,7 @@ dependencies = [
 name = "clipper-ui"
 version = "0.1.0"
 dependencies = [
+ "clipper-storage",
  "gpui",
 ]
 

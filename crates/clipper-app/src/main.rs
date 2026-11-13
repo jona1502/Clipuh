@@ -32,13 +32,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         App, Application, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, px, size,
     };
 
-    let _config = AppConfig::load()?;
+    let config = AppConfig::load()?;
     let window_opened = Rc::new(Cell::new(false));
     let window_opened_in_callback = Rc::clone(&window_opened);
 
     Application::new().run(move |cx: &mut App| {
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.bind_keys([KeyBinding::new("ctrl-q", Quit, None)]);
+        clipper_ui::bind_keys(cx);
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
                 cx.quit();
@@ -57,7 +58,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }),
                 ..Default::default()
             },
-            |_, cx| cx.new(|_| ClipperWindow::default()),
+            |window, cx| cx.new(|cx| ClipperWindow::new(config, window, cx)),
         );
 
         match result {

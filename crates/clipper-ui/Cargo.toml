@@ -6,5 +6,6 @@ rust-version.workspace = true
 publish.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+clipper-storage.workspace = true
 gpui.workspace = true
 

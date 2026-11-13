@@ -5,4 +5,4 @@ mod components;
 mod theme;
 mod views;
 
-pub use views::ClipperWindow;
+pub use views::{ClipperWindow, bind_keys};
