@@ -6,6 +6,7 @@ use std::time::Duration;
 use clipper_core::recording::{
     CaptureSource, RecorderEvent, RecordingStats, ReplayStatus, ReplayTier, SourceKind, StopReason,
 };
+use clipper_storage::{AppConfig, config::VideoCodec, storage_projection::StorageProjection};
 
 /// Most saved replay clips kept in the session list.
 pub const MAX_SAVED_CLIPS: usize = 200;
@@ -15,6 +16,173 @@ pub const MAX_SAVED_CLIPS: usize = 200;
 pub struct SettingsSaveOrder {
     requested: std::sync::atomic::AtomicU64,
     writer: std::sync::Mutex<()>,
+}
+
+/// Only these settings affect the cached storage projection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StorageProjectionKey {
+    width: u32,
+    height: u32,
+    fps: u32,
+    codec: VideoCodec,
+    quality: clipper_storage::config::QualityPreset,
+    bitrate_mbps: u32,
+    desktop_audio: bool,
+    microphone_audio: bool,
+    separate_tracks: bool,
+    replay_duration_seconds: u32,
+    replay_memory_limit_megabytes: u32,
+}
+
+impl From<&AppConfig> for StorageProjectionKey {
+    fn from(config: &AppConfig) -> Self {
+        Self {
+            width: config.video.width,
+            height: config.video.height,
+            fps: config.video.fps,
+            codec: config.video.codec,
+            quality: config.recording.quality,
+            bitrate_mbps: config.video.bitrate_mbps,
+            desktop_audio: config.audio.desktop,
+            microphone_audio: config.audio.microphone,
+            separate_tracks: config.audio.separate_tracks,
+            replay_duration_seconds: config.replay.duration_seconds,
+            replay_memory_limit_megabytes: config.replay.memory_limit_megabytes,
+        }
+    }
+}
+
+/// Cached estimate; config changes that do not affect its key leave it intact.
+#[derive(Debug, Default)]
+pub(crate) struct StorageProjectionCache {
+    key: Option<StorageProjectionKey>,
+    result: Option<Result<StorageProjection, String>>,
+}
+
+impl StorageProjectionCache {
+    /// Recomputes only when an input to the projection changes.
+    pub(crate) fn refresh(&mut self, config: &AppConfig) -> bool {
+        let key = StorageProjectionKey::from(config);
+        self.refresh_with_key(key, || {
+            config
+                .storage_projection()
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    fn refresh_with_key(
+        &mut self,
+        key: StorageProjectionKey,
+        calculate: impl FnOnce() -> Result<StorageProjection, String>,
+    ) -> bool {
+        if self.key == Some(key) {
+            return false;
+        }
+        self.key = Some(key);
+        self.result = Some(calculate());
+        true
+    }
+
+    pub(crate) fn projection(&self) -> Option<StorageProjection> {
+        self.result.as_ref()?.as_ref().ok().copied()
+    }
+
+    pub(crate) fn snapshot(&self) -> Option<StorageProjectionSnapshot> {
+        Some(StorageProjectionSnapshot {
+            key: self.key?,
+            projection: self.projection()?,
+        })
+    }
+
+    pub(crate) fn key(&self) -> Option<StorageProjectionKey> {
+        self.key
+    }
+
+    pub(crate) fn error(&self) -> Option<&str> {
+        self.result.as_ref()?.as_ref().err().map(String::as_str)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StorageProjectionSnapshot {
+    key: StorageProjectionKey,
+    projection: StorageProjection,
+}
+
+impl StorageProjectionSnapshot {
+    pub(crate) fn projection(self) -> StorageProjection {
+        self.projection
+    }
+
+    pub(crate) fn matches_key(self, key: Option<StorageProjectionKey>) -> bool {
+        key == Some(self.key)
+    }
+}
+
+/// Accepted recording settings remain visible as the active estimate until the run ends.
+#[derive(Debug, Default)]
+pub(crate) struct StorageProjectionRun {
+    pending: Option<StorageProjectionSnapshot>,
+    active: Option<StorageProjectionSnapshot>,
+}
+
+impl StorageProjectionRun {
+    pub(crate) fn start_accepted(&mut self, snapshot: Option<StorageProjectionSnapshot>) {
+        self.pending = snapshot;
+        self.active = None;
+    }
+
+    pub(crate) fn recording_started(&mut self) {
+        self.active = self.pending.take();
+    }
+
+    pub(crate) fn apply_event(&mut self, event: &RecorderEvent) {
+        match event {
+            RecorderEvent::RecordingStarted { .. } => self.recording_started(),
+            RecorderEvent::RecordingFinished { .. }
+            | RecorderEvent::RecordingFailed { .. }
+            | RecorderEvent::Stopped => self.clear(),
+            _ => {}
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.pending = None;
+        self.active = None;
+    }
+
+    pub(crate) fn pending(&self) -> Option<StorageProjectionSnapshot> {
+        self.pending
+    }
+
+    pub(crate) fn active(&self) -> Option<StorageProjectionSnapshot> {
+        self.active
+    }
+
+    pub(crate) fn displayed(&self) -> Option<StorageProjectionSnapshot> {
+        self.active.or(self.pending)
+    }
+}
+
+/// Formats a decimal byte count for human-readable storage estimates.
+pub(crate) fn format_decimal_size(bytes: u64) -> String {
+    const MB: f64 = 1_000_000.0;
+    const GB: f64 = 1_000_000_000.0;
+    if bytes >= 1_000_000_000 {
+        format!("~{:.2} GB", bytes as f64 / GB)
+    } else {
+        format!("~{:.2} MB", bytes as f64 / MB)
+    }
+}
+
+/// Formats an exact byte count as a binary mebibyte budget.
+pub(crate) fn format_mib(bytes: u64) -> String {
+    const MIB: u64 = 1_048_576;
+    if bytes.is_multiple_of(MIB) {
+        format!("{} MiB", bytes / MIB)
+    } else {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    }
 }
 
 impl SettingsSaveOrder {
@@ -362,6 +530,7 @@ pub fn format_elapsed(elapsed: Duration) -> String {
 pub fn resolution_label(width: u32, height: u32) -> String {
     match (width, height) {
         (1280, 720) => "720p".into(),
+        (1600, 900) => "900p".into(),
         (1920, 1080) => "1080p".into(),
         (2560, 1440) => "1440p".into(),
         (3840, 2160) => "4K".into(),
@@ -491,7 +660,142 @@ mod tests {
         assert_eq!(format_elapsed(Duration::from_secs(65)), "01:05");
         assert_eq!(format_elapsed(Duration::from_secs(3600)), "60:00");
         assert_eq!(resolution_label(2560, 1440), "1440p");
+        assert_eq!(resolution_label(1600, 900), "900p");
         assert_eq!(resolution_label(100, 50), "100x50");
+    }
+
+    #[test]
+    fn storage_projection_cache_ignores_unrelated_config_and_recomputes_for_inputs() {
+        let mut config = AppConfig::default();
+        let mut cache = StorageProjectionCache::default();
+        let projection = config.storage_projection().unwrap();
+        let mut calculations = 0;
+        let key = StorageProjectionKey::from(&config);
+        assert!(cache.refresh_with_key(key, || {
+            calculations += 1;
+            Ok(projection)
+        }));
+
+        config.audio.microphone_gain_percent = 50;
+        config.notifications.enabled = false;
+        assert_eq!(StorageProjectionKey::from(&config), key);
+        assert!(
+            !cache.refresh_with_key(StorageProjectionKey::from(&config), || {
+                calculations += 1;
+                Ok(projection)
+            })
+        );
+        assert_eq!(calculations, 1);
+
+        config.video.bitrate_mbps = 24;
+        assert!(
+            cache.refresh_with_key(StorageProjectionKey::from(&config), || {
+                calculations += 1;
+                Ok(projection)
+            })
+        );
+        assert_eq!(calculations, 2);
+    }
+
+    #[test]
+    fn storage_projection_cache_recalculates_real_estimates_and_preserves_active_snapshot() {
+        let mut config = AppConfig::default();
+        let mut cache = StorageProjectionCache::default();
+        let mut run = StorageProjectionRun::default();
+
+        assert!(cache.refresh(&config));
+        let original = cache.projection().unwrap();
+        assert_eq!(original.sizes[1], 124_320_000);
+        let active_snapshot = cache.snapshot().unwrap();
+        run.start_accepted(Some(active_snapshot));
+        run.apply_event(&RecorderEvent::RecordingStarted {
+            path: "active.mp4".into(),
+            encoder: "H.264".into(),
+        });
+
+        config.recording.quality = clipper_storage::config::QualityPreset::Quality;
+        assert!(cache.refresh(&config));
+        let quality = cache.projection().unwrap();
+        assert_eq!(quality.sizes[1], 184_320_000);
+        assert_eq!(
+            run.active().map(StorageProjectionSnapshot::projection),
+            Some(original)
+        );
+        assert_ne!(
+            run.active().map(StorageProjectionSnapshot::projection),
+            Some(quality)
+        );
+
+        config.audio.separate_tracks = false;
+        assert!(cache.refresh(&config));
+        let mixed = cache.projection().unwrap();
+        assert_eq!(mixed.sizes[1], 181_440_000);
+        assert_eq!(
+            run.active().map(StorageProjectionSnapshot::projection),
+            Some(original)
+        );
+
+        run.apply_event(&RecorderEvent::RecordingFinished {
+            path: "active.mp4".into(),
+            stats: RecordingStats::default(),
+            reason: StopReason::User,
+        });
+        assert_eq!(run.displayed(), None);
+    }
+
+    #[test]
+    fn recording_projection_moves_from_pending_to_active_and_clears() {
+        let projection = AppConfig::default().storage_projection().unwrap();
+        let mut cache = StorageProjectionCache::default();
+        assert!(cache.refresh(&AppConfig::default()));
+        let snapshot = cache.snapshot().unwrap();
+        let mut run = StorageProjectionRun::default();
+
+        run.start_accepted(Some(snapshot));
+        assert_eq!(
+            run.pending().map(StorageProjectionSnapshot::projection),
+            Some(projection)
+        );
+        assert_eq!(run.active(), None);
+        assert_eq!(
+            run.displayed().map(StorageProjectionSnapshot::projection),
+            Some(projection)
+        );
+
+        run.recording_started();
+        assert_eq!(run.pending(), None);
+        assert_eq!(
+            run.active().map(StorageProjectionSnapshot::projection),
+            Some(projection)
+        );
+
+        run.apply_event(&RecorderEvent::RecordingFailed {
+            message: "failed to start".into(),
+        });
+        assert_eq!(run.displayed(), None);
+    }
+
+    #[test]
+    fn active_snapshot_detects_resolution_and_fps_changes_even_when_size_is_unchanged() {
+        let mut config = AppConfig::default();
+        let mut cache = StorageProjectionCache::default();
+        assert!(cache.refresh(&config));
+        let snapshot = cache.snapshot().unwrap();
+        let active_projection = snapshot.projection();
+
+        config.video.fps = 120;
+        assert!(cache.refresh(&config));
+        assert_eq!(cache.projection().unwrap(), active_projection);
+        assert!(!snapshot.matches_key(cache.key()));
+    }
+
+    #[test]
+    fn storage_sizes_use_decimal_units_and_preserve_precision() {
+        assert_eq!(format_decimal_size(1_100_000), "~1.10 MB");
+        assert_eq!(format_decimal_size(12_345_678), "~12.35 MB");
+        assert_eq!(format_decimal_size(1_250_000_000), "~1.25 GB");
+        assert_eq!(format_decimal_size(12_345_678_901), "~12.35 GB");
+        assert_eq!(format_mib(67_108_864), "64 MiB");
     }
     #[test]
     fn newer_failed_save_still_prevents_an_older_snapshot_from_writing() {

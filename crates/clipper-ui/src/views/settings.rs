@@ -584,8 +584,8 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
                 ("Codec", None, text(codec)),
                 ("Encoder", None, text(encoder)),
                 (
-                    "Bitrate",
-                    None,
+                    "Base bitrate",
+                    Some("The quality preset adjusts the encoded target used by estimates."),
                     text(format!("{} Mbps", video.bitrate_mbps)),
                 ),
             ],

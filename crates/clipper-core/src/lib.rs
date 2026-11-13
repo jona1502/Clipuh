@@ -4,6 +4,7 @@
 pub mod hotkey;
 pub mod pipeline;
 pub mod recording;
+pub mod storage_estimate;
 
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};

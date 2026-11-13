@@ -125,6 +125,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "needs audio hardware; CI runners have no render device"]
     fn hardware_list_render_devices_has_default() {
         let devices = list_devices(DeviceFlow::Render).expect("list render");
         for d in &devices {
@@ -136,6 +137,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs audio hardware"]
     fn hardware_list_capture_devices_succeeds() {
         let devices = list_devices(DeviceFlow::Capture).expect("list capture");
         println!("capture devices: {}", devices.len());

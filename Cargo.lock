@@ -768,6 +768,7 @@ name = "clipper-storage"
 version = "0.1.0"
 dependencies = [
  "clipper-core",
+ "clipper-encoder",
  "directories",
  "serde",
  "toml 0.8.23",

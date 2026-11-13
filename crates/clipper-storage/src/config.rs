@@ -1,7 +1,7 @@
 use clipper_core::hotkey::{DEFAULT_SAVE_REPLAY, Hotkey};
 use clipper_core::recording::{
     QualityProfile, REPLAY_DURATIONS_SECONDS, RecordingAudioOptions, RecordingOptions,
-    ReplayOptions,
+    ReplayOptions, h264_supports,
 };
 use directories::{BaseDirs, ProjectDirs, UserDirs};
 use serde::{Deserialize, Serialize};
@@ -14,11 +14,23 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-/// Output resolutions offered by the recorder: 720p, 1080p, 1440p, 4K.
-pub const VIDEO_RESOLUTIONS: [(u32, u32); 4] =
-    [(1280, 720), (1920, 1080), (2560, 1440), (3840, 2160)];
+/// Output resolutions offered by the recorder: 720p, 900p, 1080p, 1440p, 4K.
+pub const VIDEO_RESOLUTIONS: [(u32, u32); 5] = [
+    (1280, 720),
+    (1600, 900),
+    (1920, 1080),
+    (2560, 1440),
+    (3840, 2160),
+];
 /// Frame rates offered by the recorder.
 pub const VIDEO_FPS: [u32; 3] = [30, 60, 120];
+
+/// True when the size and frame rate are both offered and H.264 can encode the combination.
+pub fn video_mode_supported(width: u32, height: u32, fps: u32) -> bool {
+    VIDEO_RESOLUTIONS.contains(&(width, height))
+        && VIDEO_FPS.contains(&fps)
+        && h264_supports(width, height, fps)
+}
 const MAX_BITRATE_MBPS: u32 = 100;
 const MIN_REPLAY_MEMORY_MEGABYTES: u32 = 16;
 const MAX_REPLAY_MEMORY_MEGABYTES: u32 = 512;
@@ -60,13 +72,22 @@ impl AppConfig {
         if !VIDEO_RESOLUTIONS.contains(&(self.video.width, self.video.height)) {
             issues.push(ValidationIssue::new(
                 "video.width",
-                "resolution must be 1280x720, 1920x1080, 2560x1440 or 3840x2160",
+                "resolution must be 1280x720, 1600x900, 1920x1080, 2560x1440 or 3840x2160",
             ));
         }
         if !VIDEO_FPS.contains(&self.video.fps) {
             issues.push(ValidationIssue::new(
                 "video.fps",
                 "must be 30, 60 or 120 frames per second",
+            ));
+        }
+        if VIDEO_RESOLUTIONS.contains(&(self.video.width, self.video.height))
+            && VIDEO_FPS.contains(&self.video.fps)
+            && !h264_supports(self.video.width, self.video.height, self.video.fps)
+        {
+            issues.push(ValidationIssue::new(
+                "video.fps",
+                "4K recording is limited to 60 frames per second",
             ));
         }
         if self.video.bitrate_mbps == 0 || self.video.bitrate_mbps > MAX_BITRATE_MBPS {
@@ -184,7 +205,19 @@ impl AppConfig {
             Some(directory) => directory.clone(),
             None => default_recording_directory()?,
         };
-        Ok(RecordingOptions {
+        Ok(self.recording_options_in(output_directory))
+    }
+
+    /// Estimated recording size in decimal megabytes for `seconds`, using the
+    /// same bitrates and audio tracks as a recording. Cheap: it skips the
+    /// output-directory lookup, so it is safe to call while rendering.
+    pub fn estimated_megabytes(&self, seconds: f64) -> f64 {
+        self.recording_options_in(PathBuf::new())
+            .estimated_megabytes(seconds)
+    }
+
+    fn recording_options_in(&self, output_directory: PathBuf) -> RecordingOptions {
+        RecordingOptions {
             audio: RecordingAudioOptions {
                 desktop: self.audio.desktop,
                 microphone: self.audio.microphone,
@@ -200,7 +233,7 @@ impl AppConfig {
             bitrate_mbps: self.video.bitrate_mbps,
             profile: self.recording.quality.into(),
             output_directory,
-        })
+        }
     }
 
     /// Resolves the settings needed to start the instant replay buffer.
@@ -238,20 +271,37 @@ impl AppConfig {
             }
         };
 
-        let config: Self = toml::from_str(&contents).map_err(|source| ConfigError::Parse {
+        let mut config: Self = toml::from_str(&contents).map_err(|source| ConfigError::Parse {
             path: path.to_owned(),
             source: Box::new(source),
         })?;
-        let mut config = config;
-        // Older versions allowed any duration in 5..=300 s. Snap such values to
-        // the nearest preset instead of failing startup; the normalized value
-        // is persisted on the next settings change.
-        if (5..=300).contains(&config.replay.duration_seconds) {
-            config.replay.duration_seconds =
-                nearest_replay_duration(config.replay.duration_seconds);
-        }
+        config.migrate();
         config.validate().map_err(ConfigError::Validation)?;
         Ok(config)
+    }
+
+    /// Upgrades values older versions accepted but this one rejects, so a
+    /// saved file never stops startup. 4K at 120 fps (beyond H.264 Level 5.2)
+    /// drops to the highest supported frame rate. The file is rewritten only
+    /// when the user next changes a setting.
+    fn migrate(&mut self) {
+        let (width, height) = (self.video.width, self.video.height);
+        if VIDEO_RESOLUTIONS.contains(&(width, height))
+            && VIDEO_FPS.contains(&self.video.fps)
+            && !h264_supports(width, height, self.video.fps)
+            && let Some(&fps) = VIDEO_FPS
+                .iter()
+                .rev()
+                .find(|&&fps| h264_supports(width, height, fps))
+        {
+            self.video.fps = fps;
+        }
+        // Older versions allowed any replay duration in 5..=300 s. Snap such
+        // values to the nearest preset instead of failing startup; the
+        // normalized value is persisted on the next settings change.
+        if (5..=300).contains(&self.replay.duration_seconds) {
+            self.replay.duration_seconds = nearest_replay_duration(self.replay.duration_seconds);
+        }
     }
 
     fn save_to(&self, path: &Path) -> Result<(), ConfigError> {
@@ -827,9 +877,61 @@ mod tests {
                 config.video.width = width;
                 config.video.height = height;
                 config.video.fps = fps;
-                assert!(config.validate().is_ok(), "{width}x{height}@{fps}");
+                assert_eq!(
+                    config.validate().is_ok(),
+                    video_mode_supported(width, height, fps),
+                    "{width}x{height}@{fps}"
+                );
             }
         }
+
+        let mut config = AppConfig::default();
+        config.video.width = 1600;
+        config.video.height = 900;
+        assert!(config.validate().is_ok(), "1600x900");
+    }
+
+    fn with_mode(width: u32, height: u32, fps: u32) -> AppConfig {
+        let mut config = AppConfig::default();
+        config.video.width = width;
+        config.video.height = height;
+        config.video.fps = fps;
+        config
+    }
+
+    #[test]
+    fn validation_handles_900p_and_4k_frame_rate_limit() {
+        assert!(with_mode(1600, 900, 60).validate().is_ok());
+        assert!(with_mode(3840, 2160, 60).validate().is_ok());
+        assert!(with_mode(2560, 1440, 120).validate().is_ok());
+
+        let error = with_mode(3840, 2160, 120)
+            .validate()
+            .expect_err("4K@120 is unsupported");
+        assert!(
+            error
+                .issues()
+                .iter()
+                .any(|issue| issue.field() == "video.fps")
+        );
+    }
+
+    #[test]
+    fn video_mode_supported_truth_table() {
+        assert!(video_mode_supported(1600, 900, 120));
+        assert!(video_mode_supported(3840, 2160, 60));
+        assert!(!video_mode_supported(3840, 2160, 120));
+        assert!(!video_mode_supported(1921, 1080, 60));
+        assert!(!video_mode_supported(1920, 1080, 45));
+    }
+
+    #[test]
+    fn config_with_900p_round_trips() {
+        let temp = TestDir::new();
+        let path = temp.path("settings.toml");
+        let config = with_mode(1600, 900, 60);
+        config.save_to(&path).expect("save config");
+        assert_eq!(AppConfig::load_from(&path).expect("load config"), config);
     }
 
     #[test]
@@ -868,6 +970,130 @@ mod tests {
             (1920, 1080, 30)
         );
         assert_eq!(options.bitrate_mbps, 16);
+    }
+
+    #[test]
+    fn default_storage_projection_estimates_exact_video_audio_and_hybrid_bytes() {
+        let projection = AppConfig::default()
+            .storage_projection()
+            .expect("default config projects");
+
+        assert_eq!(projection.video_bps, 16_000_000);
+        assert_eq!(projection.audio_bps, 576_000);
+        assert_eq!(projection.audio_tracks, 3);
+        assert!(projection.variable_bitrate);
+        assert_eq!(
+            projection.sizes,
+            [62_160_000, 124_320_000, 248_640_000, 621_600_000]
+        );
+        assert_eq!(projection.replay_duration_seconds, 60);
+        assert_eq!(
+            projection.replay,
+            clipper_core::storage_estimate::HybridEstimate {
+                total_bytes: 124_320_000,
+                ram_budget_bytes: 67_108_864,
+                estimated_ram_bytes: 67_108_864,
+                estimated_ssd_bytes: 57_211_136,
+            }
+        );
+    }
+
+    #[test]
+    fn storage_projection_uses_encoder_profile_bitrate_and_rate_control() {
+        let mut config = AppConfig::default();
+        config.recording.quality = QualityPreset::Performance;
+        let performance = config.storage_projection().expect("performance projects");
+        assert_eq!(performance.video_bps, 16_000_000);
+        assert!(!performance.variable_bitrate);
+
+        config.video.bitrate_mbps = 20;
+        config.recording.quality = QualityPreset::Quality;
+        let quality = config.storage_projection().expect("quality projects");
+        assert_eq!(quality.video_bps, 30_000_000);
+        assert!(quality.variable_bitrate);
+        assert_eq!(quality.sizes[1], 229_320_000);
+    }
+
+    #[test]
+    fn storage_projection_audio_tracks_follow_current_sources_and_ignore_future_flags() {
+        for (desktop, microphone, separate_tracks, tracks, audio_bps, sixty_second_bytes) in [
+            (false, false, true, 0, 0, 120_000_000),
+            (true, true, false, 1, 192_000, 121_440_000),
+            (false, true, true, 2, 384_000, 122_880_000),
+            (true, true, true, 3, 576_000, 124_320_000),
+        ] {
+            let mut config = AppConfig::default();
+            config.audio.desktop = desktop;
+            config.audio.microphone = microphone;
+            config.audio.separate_tracks = separate_tracks;
+            // These are future process-capture preferences and do not create tracks.
+            config.audio.game = true;
+            config.audio.discord = true;
+
+            let projection = config.storage_projection().expect("audio config projects");
+            assert_eq!(projection.audio_tracks, tracks);
+            assert_eq!(projection.audio_bps, audio_bps);
+            assert_eq!(projection.sizes[1], sixty_second_bytes);
+        }
+    }
+
+    #[test]
+    fn storage_projection_keeps_target_bitrate_independent_of_fps_and_resolution() {
+        for (width, height) in VIDEO_RESOLUTIONS {
+            for fps in VIDEO_FPS {
+                if !video_mode_supported(width, height, fps) {
+                    continue;
+                }
+
+                let mut config = AppConfig::default();
+                config.video.width = width;
+                config.video.height = height;
+                config.video.fps = fps;
+                let projection = config.storage_projection().expect("video config projects");
+
+                assert_eq!(projection.video_bps, 16_000_000, "{width}x{height}@{fps}");
+                assert_eq!(projection.sizes[1], 124_320_000, "{width}x{height}@{fps}");
+            }
+        }
+    }
+
+    #[test]
+    fn storage_projection_rejects_invalid_config() {
+        let mut config = AppConfig::default();
+        config.video.fps = 0;
+
+        let error = config
+            .storage_projection()
+            .expect_err("invalid config cannot be projected");
+        assert!(error.to_string().contains("video.fps"));
+    }
+
+    #[test]
+    fn saved_4k_at_120_fps_loads_as_4k_at_60() {
+        let temp = TestDir::new();
+        let path = temp.path("settings.toml");
+        let mut config = AppConfig::default();
+        (config.video.width, config.video.height) = (3840, 2160);
+        let text = toml::to_string_pretty(&config)
+            .expect("serialize")
+            .replace("fps = 60", "fps = 120");
+        assert!(text.contains("fps = 120"));
+        fs::write(&path, text).expect("write legacy file");
+
+        let loaded = AppConfig::load_from(&path).expect("legacy 4K@120 still loads");
+        assert_eq!(loaded.video.fps, 60);
+        assert_eq!(loaded.video.width, 3840);
+    }
+
+    #[test]
+    fn estimate_matches_recording_options_without_directory_lookup() {
+        let config = AppConfig::default();
+        let options = config
+            .recording_options_in(PathBuf::new())
+            .estimated_megabytes(60.0);
+        assert_eq!(config.estimated_megabytes(60.0), options);
+        // 16 Mbps video + 3 AAC tracks (0.576 Mbps) for one minute.
+        assert!((config.estimated_megabytes(60.0) - 124.32).abs() < 1e-9);
     }
 
     #[test]

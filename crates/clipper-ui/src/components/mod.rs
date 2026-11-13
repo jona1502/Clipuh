@@ -1,6 +1,9 @@
 //! Shared building blocks. Views compose these instead of styling raw divs, so surfaces,
 //! spacing and states stay consistent across pages.
 
+mod dropdown;
+pub use dropdown::{DropdownOption, dropdown, step};
+
 use gpui::prelude::*;
 use gpui::{Div, ElementId, FontWeight, IntoElement, SharedString, Stateful, div, px, rgb, rgba};
 
