@@ -184,6 +184,16 @@ impl RamTier {
             self.handed_bytes += batch.iter().map(|gop| gop.charged_bytes).sum::<usize>();
         }
     }
+
+    /// Forgets every hand-off after a failed spill so the GOPs can be spilled
+    /// again (or evicted) later. Late successes of newer batches are ignored
+    /// by `pop_oldest_if`, so the disk tier stays strictly older than RAM.
+    pub fn reset_handed(&mut self) {
+        if let Some(front) = self.sealed.front() {
+            self.handed_upto = front.sequence;
+        }
+        self.handed_bytes = 0;
+    }
 }
 
 #[cfg(test)]

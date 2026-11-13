@@ -14,7 +14,7 @@ use std::collections::VecDeque;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::disk::{DiskConfig, Segment, SegmentStore};
 use crate::error::ReplayError;
@@ -29,6 +29,13 @@ const SPILL_QUEUE: usize = 4;
 const SPILL_MIN_GOPS: usize = 4;
 /// ...unless they already reach this many charged bytes.
 const SPILL_TARGET_BYTES: usize = 8 << 20;
+/// After a failed spill (disk full, quota reached while exports pin old
+/// segments, transient I/O) the buffer runs RAM only for this long, then
+/// tries the SSD tier again.
+#[cfg(not(test))]
+const DISK_RETRY: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const DISK_RETRY: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReplayConfig {
@@ -142,8 +149,8 @@ fn spill_loop(
     jobs: Receiver<Vec<Arc<Gop>>>,
     done: SyncSender<SpillDone>,
 ) {
-    // Ends when the buffer drops the job sender, or after the first failure
-    // (the buffer then runs RAM only).
+    // Ends when the buffer drops the job sender. Failures are reported and
+    // the thread keeps serving: the buffer decides when to retry.
     while let Ok(batch) = jobs.recv() {
         let metas = batch
             .iter()
@@ -154,8 +161,7 @@ fn spill_loop(
             .collect();
         let result = sink.write(&batch);
         drop(batch);
-        let failed = result.is_err();
-        if done.send(SpillDone { metas, result }).is_err() || failed {
+        if done.send(SpillDone { metas, result }).is_err() {
             break;
         }
     }
@@ -170,6 +176,7 @@ struct Worker {
 struct DiskEntry {
     segment: Arc<Segment>,
     index: usize,
+    sequence: u64,
     start_pts: Ticks,
 }
 
@@ -184,14 +191,19 @@ struct Core {
     /// Spilled GOPs, oldest first; all older than every RAM GOP.
     disk: VecDeque<DiskEntry>,
     worker: Option<Worker>,
+    /// Permanent failure (spill thread gone or never started).
     disk_failed: bool,
+    /// Transient failure: SSD tier paused until this instant.
+    retry_at: Option<Instant>,
     disk_error: Option<String>,
     dropped_gops: u64,
 }
 
 impl Core {
     fn disk_usable(&self) -> bool {
-        self.worker.is_some() && !self.disk_failed
+        self.worker.is_some()
+            && !self.disk_failed
+            && self.retry_at.is_none_or(|at| Instant::now() >= at)
     }
 
     fn fail_disk(&mut self, message: String) {
@@ -221,18 +233,38 @@ impl Core {
     fn apply(&mut self, done: SpillDone) {
         match done.result {
             Ok(segment) => {
+                if self.retry_at.is_some_and(|at| Instant::now() >= at) {
+                    self.retry_at = None;
+                    self.disk_error = None;
+                }
                 for (index, meta) in done.metas.into_iter().enumerate() {
                     // Missing = evicted while the write was running.
                     if self.ram.pop_oldest_if(meta.sequence).is_some() {
+                        // The disk tier must stay gap free: older disk GOPs
+                        // that are no longer contiguous are useless for a clip.
+                        if self
+                            .disk
+                            .back()
+                            .is_some_and(|last| last.sequence + 1 != meta.sequence)
+                        {
+                            self.disk.clear();
+                        }
                         self.disk.push_back(DiskEntry {
                             segment: Arc::clone(&segment),
                             index,
+                            sequence: meta.sequence,
                             start_pts: meta.start_pts,
                         });
                     }
                 }
             }
-            Err(error) => self.fail_disk(error.to_string()),
+            Err(error) => {
+                // GOPs stay in RAM; forget every hand-off so they can be
+                // spilled again after the pause or evicted by the cap.
+                self.ram.reset_handed();
+                self.retry_at = Some(Instant::now() + DISK_RETRY);
+                self.disk_error = Some(error.to_string());
+            }
         }
     }
 
@@ -293,7 +325,10 @@ impl Core {
             if self.ram.pop_oldest().is_none() {
                 break;
             }
-            self.dropped_gops += 1;
+            // Everything on disk is older than the evicted GOP; keeping it
+            // would leave a gap in the timeline.
+            self.dropped_gops += 1 + self.disk.len() as u64;
+            self.disk.clear();
         }
     }
 
@@ -390,7 +425,7 @@ impl Core {
                 previous = Some(&entry.segment);
             }
         }
-        let tier = if self.disk_failed {
+        let tier = if self.disk_failed || self.retry_at.is_some() {
             BufferTier::RamOnlyDegraded
         } else if self.worker.is_some() && !self.disk.is_empty() {
             BufferTier::Hybrid
@@ -478,6 +513,7 @@ impl ReplayBuffer {
                 disk: VecDeque::new(),
                 worker,
                 disk_failed,
+                retry_at: None,
                 disk_error,
                 dropped_gops: 0,
             }),
@@ -604,13 +640,10 @@ mod tests {
     fn assert_contiguous(snapshot: &ReplaySnapshot) {
         let mut previous = None;
         for gop in &snapshot.gops {
-            let GopRef::Ram(gop) = gop else {
-                panic!("unexpected disk gop")
-            };
             if let Some(p) = previous {
-                assert_eq!(gop.sequence, p + 1);
+                assert_eq!(gop.sequence(), p + 1);
             }
-            previous = Some(gop.sequence);
+            previous = Some(gop.sequence());
         }
     }
 
@@ -770,7 +803,8 @@ mod tests {
         });
         let stats = buf.stats();
         assert_eq!(stats.tier, BufferTier::RamOnlyDegraded);
-        assert!(stats.ram_bytes <= 8 * MIB);
+        // Retries briefly allow the 2x spill cap before failing again.
+        assert!(stats.ram_bytes <= 8 * MIB * 2);
         assert!(stats.dropped_gops > 0);
         assert!(buf.snapshot(Duration::from_secs(10)).is_ok());
     }
@@ -844,5 +878,145 @@ mod tests {
         assert!(stats.ram_bytes <= limit);
         assert!(stats.dropped_gops > 100);
         assert!(buf.snapshot(Duration::from_secs(300)).is_ok());
+    }
+
+    fn temp_root(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "clipper-hybrid-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        root
+    }
+
+    fn disk_layout() -> StreamLayout {
+        let mut layout = layout();
+        layout.tracks[0].codec = crate::packet::CodecConfig::H264 {
+            width: 1920,
+            height: 1080,
+            sps: vec![0x67, 0x64, 0x00, 0x28, 0xac],
+            pps: vec![0x68, 0xee, 0x3c, 0x80],
+        };
+        layout
+    }
+
+    fn sessions(root: &std::path::Path) -> usize {
+        std::fs::read_dir(root).map_or(0, |entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().starts_with("session-"))
+                .count()
+        })
+    }
+
+    #[test]
+    fn real_disk_spills_exports_and_cleans_up() {
+        let root = temp_root("spill");
+        let config = ReplayConfig {
+            duration: Duration::from_secs(30),
+            memory_limit_bytes: 4 * MIB,
+            disk: Some(DiskConfig {
+                root: root.clone(),
+                max_bytes: 1 << 30,
+            }),
+        };
+        let mut buf = ReplayBuffer::new(config, disk_layout()).unwrap();
+        let mut generator = Gen::with_sizes(100_000, 8_000, 400);
+        // Paced like real capture (scaled): give the spill thread time.
+        for _ in 0..20 {
+            generator.seconds(&mut buf, 2);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let stats = wait_for(&buf, |s| s.tier == BufferTier::Hybrid && s.disk_gops >= 4);
+        assert_eq!(stats.dropped_gops, 0, "{stats:?}");
+        assert!(stats.disk_bytes > 0);
+        assert!(stats.ram_bytes <= 8 * MIB);
+        generator.seconds(&mut buf, 2);
+
+        let snapshot = buf.snapshot(Duration::from_secs(30)).unwrap();
+        assert!(
+            snapshot
+                .gops
+                .iter()
+                .any(|gop| matches!(gop, GopRef::Disk { .. }))
+        );
+        assert_contiguous(&snapshot);
+        // Recording continues while the export runs: segments pinned by the
+        // snapshot must survive eviction.
+        for _ in 0..20 {
+            generator.seconds(&mut buf, 2);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let clip = root.join("clip.mp4");
+        let saved = crate::export::export_clip(&crate::export::ExportJob {
+            snapshot,
+            final_path: clip.clone(),
+        })
+        .unwrap();
+        assert!(saved.duration >= Duration::from_secs(30));
+        assert!(saved.duration <= Duration::from_secs(33));
+        assert_eq!(saved.audio_tracks, 1);
+        assert!(std::fs::metadata(&clip).unwrap().len() == saved.bytes);
+
+        drop(buf);
+        assert_eq!(sessions(&root), 0, "session dir must be removed");
+        assert!(clip.exists(), "cleanup must never delete saved clips");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    struct FlakySink {
+        fails_left: usize,
+        store: SegmentStore,
+    }
+
+    impl SpillSink for FlakySink {
+        fn write(&mut self, gops: &[Arc<Gop>]) -> Result<Arc<Segment>, ReplayError> {
+            if self.fails_left > 0 {
+                self.fails_left -= 1;
+                return Err(ReplayError::DiskFull {
+                    path: "cache".into(),
+                });
+            }
+            self.store.write_segment(gops)
+        }
+    }
+
+    #[test]
+    fn transient_disk_failure_recovers_to_hybrid() {
+        let root = temp_root("flaky");
+        let store = SegmentStore::open(&DiskConfig {
+            root: root.clone(),
+            max_bytes: 1 << 30,
+        })
+        .unwrap();
+        let mut buf = ReplayBuffer::with_sink(
+            config(30, 4 * MIB),
+            disk_layout(),
+            Box::new(FlakySink {
+                fails_left: 1,
+                store,
+            }),
+        )
+        .unwrap();
+        let mut generator = Gen::with_sizes(100_000, 8_000, 400);
+        generator.seconds(&mut buf, 10);
+        wait_for(&buf, |s| s.tier == BufferTier::RamOnlyDegraded);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            generator.seconds(&mut buf, 1);
+            let stats = buf.stats();
+            if stats.tier == BufferTier::Hybrid {
+                assert!(stats.disk_error.is_none());
+                break;
+            }
+            assert!(Instant::now() < deadline, "SSD tier never recovered");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(buf);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
