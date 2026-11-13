@@ -57,9 +57,15 @@ impl FramePacer {
         if relative + tolerance < self.next_due {
             return None;
         }
-        // Advance the deadline; after a stall restart from this frame instead
-        // of bursting to catch up.
-        self.next_due = (self.next_due + self.interval).max(relative + self.interval - tolerance);
+        // Advance the deadline on the fixed grid. Re-anchor only after a real
+        // stall (frame later than the following slot) instead of bursting to
+        // catch up. Re-anchoring on every late-in-window frame pushed the grid
+        // forward and lost frames from non-60 Hz sources (75 Hz gave 56 fps).
+        self.next_due = if relative < self.next_due + self.interval {
+            self.next_due + self.interval
+        } else {
+            relative + self.interval - tolerance
+        };
         Some(relative)
     }
 }
@@ -155,6 +161,35 @@ mod tests {
         assert_eq!(pacer.accept(1000 * MS), Some(1000 * MS));
         assert_eq!(pacer.accept(1001 * MS), None);
         assert!(pacer.accept(1000 * MS + pacer.interval()).is_some());
+    }
+
+    /// Frames accepted over `seconds` from a source at `hz` with a
+    /// deterministic +-`jitter` ticks wobble.
+    fn accepted(hz: i64, jitter: i64, seconds: i64) -> usize {
+        let mut pacer = FramePacer::new(60);
+        let period = 10_000_000 / hz;
+        (0..hz * seconds)
+            .filter(|&i| {
+                let wobble = if i % 2 == 0 { jitter } else { -jitter };
+                pacer.accept(1_000_000 + i * period + wobble).is_some()
+            })
+            .count()
+    }
+
+    #[test]
+    fn pacer_keeps_60fps_from_non_multiple_refresh_rates() {
+        // 120 s: 7200 frames expected; regression for 75 Hz giving 56.25 fps.
+        for hz in [75, 90, 100, 120, 144, 165] {
+            for jitter in [0, 20_000] {
+                let frames = accepted(hz, jitter, 120);
+                assert!(
+                    (7190..=7201).contains(&frames),
+                    "{hz} Hz jitter {jitter}: {frames} frames"
+                );
+            }
+        }
+        // Slower sources keep every frame.
+        assert_eq!(accepted(50, 0, 10), 500);
     }
 
     #[test]

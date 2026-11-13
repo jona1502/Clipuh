@@ -122,7 +122,10 @@ pub fn plan_clip(
             if packet.duration <= 0 {
                 return Err(invalid("packet with non-positive duration"));
             }
-            if packet.pts < 0 || packet.dts < 0 {
+            // A B-frame encoder's derived dts lead-in may be slightly negative
+            // at the session start; the muxer rebases each track to its first
+            // sample, so only negative presentation times are invalid.
+            if packet.pts < 0 {
                 return Err(invalid("packet with negative timestamp"));
             }
             let track = usize::from(packet.track);
@@ -464,6 +467,30 @@ mod tests {
         assert_eq!(plan.duration, ms(700));
         let min_pts = plan.video.samples.iter().map(|p| p.pts).min().unwrap();
         assert_eq!(min_pts - plan.start_pts, 0);
+    }
+
+    #[test]
+    fn negative_dts_lead_in_at_session_start_is_exportable() {
+        // Encoder-derived B-frame dts at the very first frames: dts < 0 <= pts.
+        let gops: Vec<Arc<Gop>> = b_frame_gops()
+            .iter()
+            .map(|g| {
+                let mut g = (**g).clone();
+                for packet in &mut g.packets {
+                    packet.dts -= ms(200);
+                }
+                Arc::new(g)
+            })
+            .collect();
+        assert!(gops[0].packets[0].dts < 0);
+        let plan = plan_clip(&layout(0), &gops, ms(5000), ms(2900)).unwrap();
+        assert_eq!(plan.start_pts, ms(200));
+        assert!(plan.video.media_time > 0);
+        let mut out = Vec::new();
+        let bytes =
+            crate::mp4::write_mp4(&mut out, std::path::Path::new("x.mp4"), &layout(0), &plan)
+                .unwrap();
+        assert_eq!(bytes as usize, out.len());
     }
 
     #[test]
