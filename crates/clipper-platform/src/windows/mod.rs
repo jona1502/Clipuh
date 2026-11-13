@@ -1,6 +1,9 @@
 //! Windows platform primitives: COM apartment and the shared D3D11 device.
 #![allow(unsafe_code)]
 
+pub mod hotkey;
+pub mod notify;
+
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::{
