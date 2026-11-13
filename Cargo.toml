@@ -18,8 +18,10 @@ clipper-encoder = { path = "crates/clipper-encoder" }
 clipper-recorder = { path = "crates/clipper-recorder" }
 clipper-audio = { path = "crates/clipper-audio" }
 clipper-replay = { path = "crates/clipper-replay" }
+clipper-media = { path = "crates/clipper-media" }
 # Same versions GPUI already pulls in, so no duplicate compilation.
 async-channel = "2.5"
+image = { version = "0.25", default-features = false }
 raw-window-handle = "0.6"
 rtrb = "0.4.1"
 windows = "0.61.3"
