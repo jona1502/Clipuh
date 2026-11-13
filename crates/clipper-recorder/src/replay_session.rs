@@ -41,9 +41,9 @@ pub const WAKE_WAIT: Duration = Duration::from_millis(30);
 const MAX_FRAMES_PER_PUMP: usize = 4;
 /// Repeated frames submitted per service iteration.
 const MAX_REPEATS_PER_PUMP: usize = 16;
-/// Frames of silence before a static scene is filled with repeated frames,
-/// so a merely late real frame is never overtaken by a repeat.
-const REPEAT_LAG_FRAMES: i64 = 3;
+/// Silence (in half frame intervals) before a gap is filled with repeated
+/// frames, so a merely late real frame is not overtaken by a repeat.
+const REPEAT_LAG_HALF_FRAMES: i64 = 3;
 /// Audio is mixed this far behind real time (same as manual recording).
 const AUDIO_LAG_TICKS: i64 = 800_000;
 /// Audio/video clock gap that cannot be recovered.
@@ -256,10 +256,10 @@ impl ReplaySession {
 
         self.fill_static_scene(interval)?;
 
-        if let Some(audio) = &mut self.audio {
-            if let Err(message) = audio.pump(&mut self.encoder, false, self.video_end) {
-                return Err(replay_failure_text(&message));
-            }
+        if let Some(audio) = &mut self.audio
+            && let Err(message) = audio.pump(&mut self.encoder, false, self.video_end)
+        {
+            return Err(replay_failure_text(&message));
         }
         self.drain_packets()
     }
@@ -271,7 +271,7 @@ impl ReplaySession {
         if self.audio.is_some() && now - AUDIO_LAG_TICKS - self.video_end > MAX_CLOCK_GAP_TICKS {
             return Err("the audio and video clocks drifted apart".into());
         }
-        let due = now - REPEAT_LAG_FRAMES * interval;
+        let due = now - REPEAT_LAG_HALF_FRAMES * interval / 2;
         for _ in 0..MAX_REPEATS_PER_PUMP {
             if self.video_end + interval > due {
                 break;
