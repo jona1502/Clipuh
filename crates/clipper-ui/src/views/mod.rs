@@ -4,15 +4,18 @@ mod dashboard;
 mod editor;
 mod settings;
 
+use clipper_core::hotkey::Hotkey;
 use clipper_core::recording::{RecorderCommand, RecorderEvent, RecorderHandle};
+use clipper_platform::windows::hotkey::HotkeyHandle;
 use clipper_storage::AppConfig;
 use gpui::prelude::*;
 use gpui::{
-    App, Context, Div, FocusHandle, FontWeight, KeyBinding, KeyDownEvent, Render, Task, Window,
-    actions, div, px, rgb, rgba,
+    App, Context, Div, FocusHandle, FontWeight, KeyBinding, KeyDownEvent, NoAction, Render, Task,
+    Window, actions, div, px, rgb, rgba,
 };
 
 use crate::components::{Tone, badge, kbd, list_item, shortcut, status_dot};
+use crate::notifications::{Notifier, Toast};
 use crate::state::{Phase, RecordingState};
 use crate::theme;
 
@@ -37,6 +40,7 @@ actions!(
 
 const WINDOW_CONTEXT: &str = "ClipperWindow";
 const PALETTE_CONTEXT: &str = "CommandPalette";
+const HOTKEY_CONTEXT: &str = "HotkeyRecorder";
 
 /// Registers the window's keyboard shortcuts. Call once at startup.
 pub fn bind_keys(cx: &mut App) {
@@ -58,6 +62,25 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("enter", Confirm, palette),
         KeyBinding::new("escape", Dismiss, palette),
     ]);
+    // gpui runs key bindings before `on_key_down`. While the hotkey recorder has
+    // focus, its (deeper) NoAction bindings cancel the window bindings so every
+    // combo reaches the recorder instead of navigating or moving focus.
+    let recorder = Some(HOTKEY_CONTEXT);
+    cx.bind_keys(
+        [
+            "ctrl-1",
+            "ctrl-2",
+            "ctrl-3",
+            "ctrl-4",
+            "ctrl-tab",
+            "ctrl-shift-tab",
+            "ctrl-k",
+            "tab",
+            "shift-tab",
+            "enter",
+        ]
+        .map(|keys| KeyBinding::new(keys, NoAction, recorder)),
+    );
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -138,10 +161,18 @@ impl CommandPalette {
 /// Main desktop application shell.
 pub struct ClipperWindow {
     handle: RecorderHandle,
+    hotkeys: HotkeyHandle,
+    notifier: Notifier,
+    /// The shortcut Clipper wants registered (the configured one).
+    hotkey: Hotkey,
+    /// Why `hotkey` could not be registered, if it could not.
+    hotkey_error: Option<String>,
+    hotkey_recorder: Option<settings::HotkeyRecorder>,
     config: AppConfig,
     recording: RecordingState,
     /// Awaits recorder events; the UI re-renders only when one arrives.
     _events: Task<()>,
+    _hotkey_failures: Task<()>,
     active_page: Page,
     focus: FocusHandle,
     nav_focus: Vec<FocusHandle>,
@@ -158,6 +189,8 @@ pub struct ClipperWindow {
 impl ClipperWindow {
     pub fn new(
         handle: RecorderHandle,
+        hotkeys: HotkeyHandle,
+        hotkey_failures: async_channel::Receiver<String>,
         config: AppConfig,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -165,6 +198,17 @@ impl ClipperWindow {
         let events = handle.events();
         let task = cx.spawn(async move |this, cx| {
             while let Ok(event) = events.recv().await {
+                let toast = match &event {
+                    RecorderEvent::ReplaySaving => Some(Toast::Saving),
+                    RecorderEvent::ReplaySaved { path, duration } => Some(Toast::Saved {
+                        path: path.clone(),
+                        duration: *duration,
+                    }),
+                    RecorderEvent::ReplaySaveFailed { message } => Some(Toast::Failed {
+                        message: message.clone(),
+                    }),
+                    _ => None,
+                };
                 let updated = this.update(cx, |this, cx| {
                     match &event {
                         RecorderEvent::AudioLevels {
@@ -190,6 +234,9 @@ impl ClipperWindow {
                         _ => {}
                     }
                     this.recording.apply(event);
+                    if let Some(toast) = toast {
+                        this.notifier.show(toast, &this.config.notifications, cx);
+                    }
                     cx.notify();
                 });
                 if updated.is_err() {
@@ -206,6 +253,22 @@ impl ClipperWindow {
                 cx.notify();
             });
         });
+        let failures = cx.spawn(async move |this, cx| {
+            while let Ok(message) = hotkey_failures.recv().await {
+                let shown = this.update(cx, |this, cx| {
+                    let toast = Toast::Failed { message };
+                    this.notifier.show(toast, &this.config.notifications, cx);
+                });
+                if shown.is_err() {
+                    return;
+                }
+            }
+        });
+        let hotkey = config
+            .replay
+            .hotkey
+            .parse()
+            .unwrap_or_else(|_| Hotkey::default_save_replay());
         let focus = cx.focus_handle();
         window.focus(&focus);
         let nav_focus = (0..Page::ALL.len())
@@ -214,9 +277,15 @@ impl ClipperWindow {
 
         let mut this = Self {
             handle,
+            hotkeys,
+            notifier: Notifier::new(),
+            hotkey,
+            hotkey_error: None,
+            hotkey_recorder: None,
             config,
             recording: RecordingState::default(),
             _events: task,
+            _hotkey_failures: failures,
             active_page: Page::Dashboard,
             focus,
             nav_focus,
@@ -231,7 +300,34 @@ impl ClipperWindow {
         };
         this.send(RecorderCommand::RefreshSources);
         this.refresh_audio_devices(cx);
+        this.register_hotkey(cx);
         this
+    }
+
+    /// Saves the config off the UI thread; failures show up in the error banner.
+    pub(super) fn persist_config(&mut self, cx: &mut Context<Self>) {
+        cx.notify();
+        let config = self.config.clone();
+        let persistence = self.config_persistence.clone();
+        let revision = persistence.request();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    persistence.save(revision, || {
+                        config.save().map_err(|error| error.to_string())
+                    })
+                })
+                .await;
+            if let Err(message) = result {
+                this.update(cx, |this, cx| {
+                    this.recording
+                        .fail(format!("Could not save settings: {message}"));
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
     }
 
     /// Queues a command; a full or closed queue surfaces as an error banner.

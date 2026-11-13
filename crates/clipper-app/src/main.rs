@@ -25,6 +25,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     use std::cell::Cell;
     use std::rc::Rc;
 
+    use clipper_core::recording::RecorderCommand;
+    use clipper_platform::windows::hotkey::GlobalHotkey;
     use clipper_recorder::Recorder;
     use clipper_storage::AppConfig;
     use clipper_ui::ClipperWindow;
@@ -43,6 +45,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         config.performance.event_queue_capacity as usize,
     )?;
     let handle = recorder.handle();
+
+    // The hotkey thread queues SaveReplay itself, so saving never waits on the
+    // UI thread. Only a failure to queue is forwarded for a toast.
+    let (hotkey_failures_tx, hotkey_failures) = async_channel::bounded::<String>(4);
+    let hotkey_recorder = handle.clone();
+    let hotkey = GlobalHotkey::spawn(move || {
+        if let Err(error) = hotkey_recorder.send(RecorderCommand::SaveReplay) {
+            let _ = hotkey_failures_tx.try_send(format!("Could not save the replay: {error}."));
+        }
+    })?;
+    let hotkeys = hotkey.handle();
     let window_opened = Rc::new(Cell::new(false));
     let window_opened_in_callback = Rc::clone(&window_opened);
 
@@ -50,8 +63,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.bind_keys([KeyBinding::new("ctrl-q", Quit, None)]);
         clipper_ui::bind_keys(cx);
-        cx.on_window_closed(|cx| {
-            if cx.windows().is_empty() {
+        // Quit with the main window: a visible toast is also a window and must
+        // not keep the process (and the global hotkey) alive on its own.
+        let main_window = Rc::new(Cell::new(None));
+        let main_window_in_callback = Rc::clone(&main_window);
+        cx.on_window_closed(move |cx| {
+            let main_open = main_window_in_callback
+                .get()
+                .is_some_and(|main| cx.windows().contains(&main));
+            if !main_open {
                 cx.quit();
             }
         })
@@ -69,12 +89,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 ..Default::default()
             },
             |window, cx| {
-                cx.new(|cx| ClipperWindow::new(handle.clone(), config.clone(), window, cx))
+                cx.new(|cx| {
+                    ClipperWindow::new(
+                        handle.clone(),
+                        hotkeys.clone(),
+                        hotkey_failures.clone(),
+                        config.clone(),
+                        window,
+                        cx,
+                    )
+                })
             },
         );
 
         match result {
-            Ok(_) => {
+            Ok(handle) => {
+                main_window.set(Some(handle.into()));
                 window_opened_in_callback.set(true);
                 cx.activate(true);
             }
@@ -85,7 +115,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Joins the recorder worker (finalizing any active recording).
+    // Release the global hotkey first so no save is queued during shutdown,
+    // then join the recorder worker (finalizing any active recording).
+    drop(hotkey);
     drop(recorder);
 
     if !window_opened.get() {

@@ -1,6 +1,7 @@
 //! Platform-independent application lifecycle: state, commands and backend events.
 #![forbid(unsafe_code)]
 
+pub mod hotkey;
 pub mod pipeline;
 pub mod recording;
 

@@ -27,7 +27,7 @@ iteration so audio and commands cannot be starved by continuous WGC delivery.
 
 ## Devices, lifecycle and memory
 
-Settings → Audio selects capture and render endpoints independently, including
+Settings â†’ Audio selects capture and render endpoints independently, including
 Windows default. Stable endpoint IDs, enable flags, gains and isolated-track
 preferences persist in per-user TOML. Missing explicit devices fail startup;
 there is no silent fallback to a different microphone. Device refresh happens
@@ -86,12 +86,14 @@ Open gates: listening tests for clarity/dropouts, explicit A/V marker sync tests
 long-duration drift, physical device removal/switching under load, release CPU/
 RAM benchmarking, and visual interaction tests for the GPUI controls.
 
-Instant Replay has no implemented buffer/hotkey/save pipeline in this repository.
+The global clipping hotkey is registered and dispatches SaveReplay. No replay
+buffer or successful replay-save pipeline is implemented; SaveReplay reports
+"Replay buffer is not running." until that engine is available.
 Manual-recording audio does not prove Replay audio. The command/event and
 bounded audio interfaces prepare integration, but Test E remains unavailable.
-Keep the PR draft until the remaining hardware acceptance gates are reviewed.
+Review the remaining hardware acceptance gates before merging.
 
-A short debug-build resource sample of the **entire recorder** at 1280�720,
+A short debug-build resource sample of the **entire recorder** at 1280×720,
 30 fps, desktop+microphone with three AAC streams measured 0.953125 CPU seconds
 in 5.014 seconds (19.0% of one logical core, about 0.79% normalized across the
 24 logical processors), 147.9 MiB private bytes and 108.7 MiB working set.

@@ -6,7 +6,10 @@ rust-version.workspace = true
 publish.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+async-channel.workspace = true
 clipper-core.workspace = true
 clipper-audio.workspace = true
+clipper-platform.workspace = true
 clipper-storage.workspace = true
 gpui.workspace = true
+raw-window-handle.workspace = true

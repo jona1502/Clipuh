@@ -29,7 +29,7 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
         .child(recording(window, cx))
         .child(sources(window, cx))
         .child(capture_settings(window, cx))
-        .child(overview(window))
+        .child(overview(window, cx))
         .child(performance(window))
         .child(recent_clips())
 }
@@ -326,7 +326,7 @@ fn capture_settings(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> 
     )
 }
 
-fn overview(window: &ClipperWindow) -> Div {
+fn overview(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
     let config = &window.config;
     let video = &config.video;
     let mode = match config.replay.mode {
@@ -353,11 +353,28 @@ fn overview(window: &ClipperWindow) -> Div {
                 format!("~{mb_per_minute} MB/min"),
                 "Estimate from bitrate",
             ))
-            .child(stat_tile(
-                "Replay buffer",
-                format!("{} s", config.replay.duration_seconds),
-                format!("{mode} · not available yet"),
-            )),
+            .child(
+                stat_tile(
+                    "Replay buffer",
+                    format!("{} s", config.replay.duration_seconds),
+                    format!("{mode} · Save: {}", config.replay.hotkey),
+                )
+                .child(
+                    div().pt_2().child(
+                        button(
+                            "save-replay",
+                            "Save replay",
+                            ButtonVariant::Secondary,
+                            None,
+                            true,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.send(RecorderCommand::SaveReplay);
+                            cx.notify();
+                        })),
+                    ),
+                ),
+            ),
     )
 }
 
@@ -437,31 +454,5 @@ impl ClipperWindow {
         if self.send(RecorderCommand::StartRecording { source, options }) {
             self.recording.begin_start();
         }
-    }
-
-    /// Saves the config off the UI thread; failures show up in the error banner.
-    pub(super) fn persist_config(&mut self, cx: &mut Context<Self>) {
-        cx.notify();
-        let config = self.config.clone();
-        let persistence = self.config_persistence.clone();
-        let revision = persistence.request();
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_spawn(async move {
-                    persistence.save(revision, || {
-                        config.save().map_err(|error| error.to_string())
-                    })
-                })
-                .await;
-            if let Err(message) = result {
-                this.update(cx, |this, cx| {
-                    this.recording
-                        .fail(format!("Could not save settings: {message}"));
-                    cx.notify();
-                })
-                .ok();
-            }
-        })
-        .detach();
     }
 }

@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use clipper_capture::windows::{CaptureSession, CaptureSignal, list_sources};
 use clipper_core::pipeline::{FramePacer, RateMeter, recording_file_name};
 use clipper_core::recording::{
-    CaptureSource, RecorderCommand, RecorderEndpoint, RecorderEvent, RecordingOptions,
-    RecordingStats, StopReason,
+    CaptureSource, REPLAY_NOT_RUNNING, RecorderCommand, RecorderEndpoint, RecorderEvent,
+    RecordingOptions, RecordingStats, StopReason,
 };
 use clipper_encoder::backends::media_foundation::{
     EncoderConfig, EncoderError, HardwareEncoder, MediaFoundation, SubmitOutcome,
@@ -243,6 +243,17 @@ impl Worker<'_> {
                 Ok(()) => self.stop_recording_started(StopReason::User, None),
                 Err(message) => self.error(message),
             },
+            // A real replay engine will emit ReplaySaving then ReplaySaved/ReplaySaveFailed here.
+            RecorderCommand::SaveReplay => {
+                // Repeated hotkeys must not stall capture/audio when the UI
+                // notification queue is full. This rejection is best effort.
+                let _ = self
+                    .endpoint
+                    .events
+                    .try_send(RecorderEvent::ReplaySaveFailed {
+                        message: REPLAY_NOT_RUNNING.into(),
+                    });
+            }
         }
         true
     }

@@ -12,4 +12,6 @@ clipper-recorder.workspace = true
 
 
 [target.'cfg(windows)'.dependencies]
+async-channel.workspace = true
+clipper-platform.workspace = true
 gpui.workspace = true

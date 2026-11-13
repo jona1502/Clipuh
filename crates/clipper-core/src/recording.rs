@@ -117,6 +117,9 @@ pub enum RecorderCommand {
         options: RecordingOptions,
     },
     StopRecording,
+    /// Save the last seconds of the replay buffer as a clip. Never blocks the
+    /// sender; the outcome arrives as a `Replay*` event.
+    SaveReplay,
     Shutdown,
 }
 
@@ -177,9 +180,23 @@ pub enum RecorderEvent {
     Error {
         message: String,
     },
+    /// A replay save was accepted and the clip is being written.
+    ReplaySaving,
+    /// The replay clip was written and is playable.
+    ReplaySaved {
+        path: PathBuf,
+        duration: Duration,
+    },
+    /// The replay could not be saved, e.g. [`REPLAY_NOT_RUNNING`].
+    ReplaySaveFailed {
+        message: String,
+    },
     /// The worker thread has released all resources and exited.
     Stopped,
 }
+
+/// Reported for `SaveReplay` while no replay buffer is capturing.
+pub const REPLAY_NOT_RUNNING: &str = "Replay buffer is not running.";
 
 /// Why a command could not be queued.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
