@@ -72,17 +72,42 @@ Teardown order: capture, encoder, audio, buffer, D3D device.
 
 Per service iteration (wake wait at most 30 ms, never more than ~250 ms of
 work): at most 4 captured frames -> `FramePacer` (audio origin, same as manual
-recordings) -> `PacketEncoder::submit`; then, when WGC was silent (static
-scene), the last frame is re-submitted at the next pacer time up to real time
-minus 1.5 frame intervals (max 16 per iteration, GPU `CopySubresourceRegion`
-only, no readback); then `RecordingAudio::pump` through the `AudioSink` trait
-(shared with manual recording); then `poll` -> `ReplayBuffer::push`. Track
-labels: `Mix`, then `Desktop`/`Microphone` with separate tracks.
+recordings) -> constant frame rate grid -> `PacketEncoder::submit`; then, when
+WGC was silent (static scene), the last frame is re-submitted up to real time
+minus one frame interval; then `RecordingAudio::pump` through the `AudioSink`
+trait (shared with manual recording); then `poll` -> `ReplayBuffer::push`.
+Track labels: `Mix`, then `Desktop`/`Microphone` with separate tracks.
+
+Constant frame rate: the video timeline is a grid of slots of one frame
+interval (`SlotTimeline`). A real frame goes to slot `round(sample_time / I)`
+and is submitted at `slot * I`; a frame whose slot is already taken is
+discarded (counted); every empty slot before it is filled with a repeat of the
+previous frame (GPU `CopySubresourceRegion` copy only, no readback; at most 16
+repeats per iteration, the real frame stays pending and the rest carries
+over). Output is therefore exactly the configured fps (59.9-60.1 measured by
+`probe_clip`), also for 17-59 fps content.
+
+First frame: until the first video frame exists, audio is read and discarded
+(rings never back up), the status warning is "waiting for the first video
+frame", the audio/video clock drift check is off, and after 30 s without a
+frame the session stops with `ReplayStopped{"the capture source delivered no
+frames"}`. The audio timeline then starts at the first video sample.
+
+Audio resilience (replay only; manual recording stays strict): dropped capture
+frames and frames that miss the mixing window are counted, the mixer renders
+silence for the gap and the status warning reads "audio glitch: N frames
+lost". Loss or failure of a source (device removed) still stops the replay. A
+`ReplayBuffer::push` `Invalid` error (dts not increasing) drops that packet,
+counts it and warns. Pacer skips, late discards, audio glitches and invalid
+packets are logged to stderr when the session stops.
 
 File I/O on the worker thread: `ReplayBuffer::new` creates the SSD session
-directory once, and a save does `create_dir_all` plus `exists()` checks to
-choose the clip name. Spilling runs on the spill thread, export on the export
-thread.
+directory once. Clip folder creation and the on-disk name check run on the
+export thread (`Exporter::try_submit_with` prepare hook); the worker only
+reserves the name in memory (`ClipNames`). Once per replay start the export
+thread removes `Clipper_Replay_*.mp4.partial` files older than 1 h in the clip
+folder (no other file). Spilling runs on the spill thread, export on the
+export thread.
 
 ### Event flows
 
@@ -91,8 +116,13 @@ thread.
   (lowercase fragment). Already running: `ReplayStarted` again. While a manual
   recording or audio test runs: `ReplayStopped{"stop the current recording first"}`.
 * `StopReplay` (running or not): `ReplayStopped{None}`.
-* Runtime failure (capture closed, encoder, audio, buffer): the session is torn
-  down, `ReplayStopped{Some(reason)}`.
+* Runtime failure (capture closed, encoder, lost audio source, buffer): the
+  footage is kept first. If the buffer holds a complete keyframe-aligned span,
+  an automatic save of the configured duration is queued exactly like a normal
+  save (`ReplaySaving`, later `ReplaySaved`/`ReplaySaveFailed`), then the session is torn
+  down and `ReplayStopped{Some(reason)}` is sent. Nothing is saved when the
+  buffer is not ready yet. A user `StopReplay` or app shutdown never
+  auto-saves.
 * `SetReplayDuration`: ignored when idle; live `ReplayBuffer::set_duration`.
 * `SaveReplay`: idle -> `ReplaySaveFailed{REPLAY_NOT_RUNNING}`; buffer not
   ready -> "The replay buffer is still filling; try again in a moment.";
@@ -104,12 +134,14 @@ thread.
 * `StartRecording` / `StartAudioTest` while replay runs: `RecordingFailed` /
   `AudioTestFinished{error}` with "Stop instant replay first.".
 
-Shutdown: the export thread sends completion events with `send_blocking`
-(it may wait for the UI). Before the worker joins the exporter it sets
-`shutting_down`, after which completions use `try_send`, so the join cannot hang
-on a full queue. `Recorder::drop` also drains events while joining, and the
-`RecorderHandle` keeps a receiver alive, so `send_blocking` never fails with a
-closed channel while the queue is full without a drain.
+Shutdown: the export thread delivers completion events with `try_send` plus a
+10 ms sleep loop, so it never blocks without bound on a UI queue nobody drains.
+On shutdown the worker first lets already accepted saves finish
+(`Exporter::finish_queued`, at most 10 s; the UI keeps draining events
+meanwhile), then sets `shutting_down` (pending completion events are given up
+if the queue is still full) and drops the exporter, which fails whatever is
+still queued with `Shutdown`. `Recorder::drop` also drains events while
+joining.
 
 Hardware check: `cargo run --release -p clipper-recorder --example
 replay_smoke -- run=45 duration=30` then `probe_clip` on every clip.

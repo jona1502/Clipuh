@@ -19,13 +19,14 @@ use clipper_encoder::backends::media_foundation::{
 };
 use clipper_platform::windows::{ComApartment, D3DContext};
 use clipper_replay::error::ReplayError;
-use clipper_replay::export::{ExportJob, Exporter, SavedClip};
+use clipper_replay::export::{ExportJob, ExportPrepare, Exporter, SavedClip};
 use windows::Win32::System::SystemInformation::GetLocalTime;
 
 use crate::emit;
 use crate::logic::{
     ClipNames, Counters, Lifecycle, StopOutcome, classify_stop, fit_output_size, partial_path,
-    replay_failure_text, replay_file_name, unique_file_name, validate_replay_options,
+    replay_failure_text, replay_file_name, sweep_stale_partials, unique_file_name,
+    validate_replay_options,
 };
 use crate::recording_audio::{AudioTest, RecordingAudio};
 use crate::replay_session::{ReplaySession, WAKE_WAIT};
@@ -34,6 +35,10 @@ const MAX_WAIT: Duration = Duration::from_millis(250);
 const STATS_WINDOW: Duration = Duration::from_secs(1);
 /// Clips that may wait behind the running export.
 const EXPORT_QUEUE: usize = 3;
+/// At shutdown, accepted saves get this long to finish before they fail.
+const SHUTDOWN_EXPORT_WAIT: Duration = Duration::from_secs(10);
+/// Stale `Clipper_Replay_*.mp4.partial` files older than this are removed.
+const STALE_PARTIAL_AGE: Duration = Duration::from_secs(3600);
 
 struct Recording {
     // Field order matters for implicit drops: capture first, then encoder,
@@ -210,8 +215,12 @@ pub fn run(endpoint: &RecorderEndpoint) {
     worker.stop_recording(StopReason::Shutdown, None);
     worker.stop_replay(None, false);
     worker.stop_audio_test(None);
-    // The exporter drop waits for the running export; its completion events
-    // must not block on a full UI queue from here on.
+    // Accepted saves get a bounded time to finish (the UI normally keeps
+    // draining events meanwhile). Afterwards completion events must not block
+    // on a full UI queue and the exporter fails whatever is still queued.
+    if let Some(exporter) = &worker.exporter {
+        exporter.finish_queued(SHUTDOWN_EXPORT_WAIT);
+    }
     worker.shutting_down.store(true, Ordering::Release);
     drop(worker.exporter.take());
 }
@@ -321,6 +330,7 @@ impl Worker<'_> {
             Ok(replay) => {
                 let encoder = replay.encoder_name().to_owned();
                 self.replay_output = options.recording.output_directory.clone();
+                self.sweep_stale_partials();
                 self.replay = Some(replay);
                 self.send(RecorderEvent::ReplayStarted { encoder });
             }
@@ -347,10 +357,31 @@ impl Worker<'_> {
         ReplaySession::start(mf, source, options)
     }
 
+    /// Removes stale `Clipper_Replay_*.mp4.partial` files of crashed runs in
+    /// the clip folder, once per replay start, on the export thread.
+    fn sweep_stale_partials(&mut self) {
+        let exporter = match &self.exporter {
+            Some(exporter) => exporter,
+            None => match Exporter::spawn(EXPORT_QUEUE) {
+                Ok(exporter) => self.exporter.insert(exporter),
+                Err(_) => return,
+            },
+        };
+        let directory = self.replay_output.clone();
+        let _ = exporter.try_run(Box::new(move || {
+            sweep_stale_partials(&directory, std::time::SystemTime::now(), STALE_PARTIAL_AGE);
+        }));
+    }
+
     /// Stops the replay buffer (also when idle, so the UI stays consistent)
     /// and reports it. Running exports are not touched.
     fn stop_replay(&mut self, error: Option<String>, report: bool) {
-        let had_session = self.replay.take().is_some();
+        let session = self.replay.take();
+        if let Some(session) = &session {
+            eprintln!("replay stopped: {:?}", session.diagnostics());
+        }
+        let had_session = session.is_some();
+        drop(session);
         if report || (had_session && error.is_some()) {
             self.send(RecorderEvent::ReplayStopped { error });
         }
@@ -365,11 +396,11 @@ impl Worker<'_> {
             Err(RecvTimeoutError::Disconnected) => std::thread::sleep(Duration::from_millis(10)),
         }
         if let Err(message) = replay.pump() {
-            self.stop_replay(Some(message), true);
+            self.fail_replay(message);
             return;
         }
         if replay.source_closed() {
-            self.stop_replay(Some("the capture source was closed".into()), true);
+            self.fail_replay("the capture source was closed".into());
             return;
         }
         if replay.status_due() {
@@ -382,6 +413,13 @@ impl Worker<'_> {
         }
     }
 
+    /// Fatal runtime error: first try to keep the footage by saving the
+    /// configured duration as an automatic save, then tear the session down.
+    fn fail_replay(&mut self, message: String) {
+        self.queue_save(true);
+        self.stop_replay(Some(message), true);
+    }
+
     fn save_failed(&self, message: impl Into<String>) {
         self.notify(RecorderEvent::ReplaySaveFailed {
             message: message.into(),
@@ -390,12 +428,19 @@ impl Worker<'_> {
 
     /// Snapshots the buffer (Arc clones, no file I/O) and queues the export.
     fn save_replay(&mut self) {
+        self.queue_save(false);
+    }
+
+    /// `automatic`: save triggered by a fatal replay error; failures are
+    /// silent when there is nothing to save yet.
+    fn queue_save(&mut self, automatic: bool) {
         let Some(replay) = self.replay.as_mut() else {
             self.save_failed(REPLAY_NOT_RUNNING);
             return;
         };
         let snapshot = match replay.snapshot() {
             Ok(snapshot) => snapshot,
+            Err(_) if automatic => return,
             Err(ReplayError::NotReady) => {
                 self.save_failed("The replay buffer is still filling; try again in a moment.");
                 return;
@@ -406,13 +451,6 @@ impl Worker<'_> {
             }
         };
         let directory = self.replay_output.clone();
-        if let Err(error) = fs::create_dir_all(&directory) {
-            self.save_failed(format!(
-                "Could not create the clip folder {}: {error}",
-                directory.display()
-            ));
-            return;
-        }
         if self.exporter.is_none() {
             match Exporter::spawn(EXPORT_QUEUE) {
                 Ok(exporter) => self.exporter = Some(exporter),
@@ -425,14 +463,28 @@ impl Worker<'_> {
         let Some(exporter) = self.exporter.as_ref() else {
             return;
         };
-        let name = self.clip_names.reserve(&replay_clip_base(), |candidate| {
-            let path = directory.join(candidate);
-            path.exists() || partial_path(&path).exists()
-        });
+        // In-memory reservation only: folder creation and the on-disk name
+        // check run on the export thread (`prepare`).
+        let name = self.clip_names.reserve(&replay_clip_base(), |_| false);
         let job = ExportJob {
             snapshot,
             final_path: directory.join(&name),
         };
+        let prepare: ExportPrepare = Box::new(move |job| {
+            fs::create_dir_all(&directory)
+                .map_err(|error| ReplayError::io("creating the clip folder", &directory, error))?;
+            let base = job
+                .final_path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let unique = unique_file_name(&base, |candidate| {
+                let path = directory.join(candidate);
+                path.exists() || partial_path(&path).exists()
+            });
+            job.final_path = directory.join(unique);
+            Ok(())
+        });
         let events = self.endpoint.events.clone();
         let names = self.clip_names.clone();
         let shutting_down = Arc::clone(&self.shutting_down);
@@ -450,14 +502,9 @@ impl Worker<'_> {
                 },
             };
             names.release(&reserved);
-            if shutting_down.load(Ordering::Acquire) {
-                let _ = events.try_send(event);
-            } else {
-                // Fails only when every receiver is gone; never hangs.
-                let _ = events.send_blocking(event);
-            }
+            send_without_hanging(&events, event, &shutting_down);
         });
-        match exporter.try_submit(job, done) {
+        match exporter.try_submit_with(job, Some(prepare), done) {
             Ok(()) => self.notify(RecorderEvent::ReplaySaving),
             Err(error) => {
                 self.clip_names.release(&name);
@@ -778,6 +825,28 @@ pub(crate) fn signal_handler(
 
 pub(crate) fn round_up_even(value: u32) -> u32 {
     value.max(2).saturating_add(1) & !1
+}
+
+/// Delivers a completion event from the export thread. Waits for room in the
+/// UI queue in short steps and gives up as soon as the worker is shutting
+/// down, so joining the exporter can never hang on a queue nobody drains.
+fn send_without_hanging(
+    events: &async_channel::Sender<RecorderEvent>,
+    mut event: RecorderEvent,
+    shutting_down: &AtomicBool,
+) {
+    loop {
+        match events.try_send(event) {
+            Ok(()) | Err(async_channel::TrySendError::Closed(_)) => return,
+            Err(async_channel::TrySendError::Full(back)) => {
+                if shutting_down.load(Ordering::Acquire) {
+                    return;
+                }
+                event = back;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
 }
 
 const STOP_REPLAY_FIRST: &str = "Stop instant replay first.";

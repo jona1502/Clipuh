@@ -284,10 +284,12 @@ impl Exporter {
         let Some(sender) = &self.sender else {
             return Err(ReplayError::Shutdown);
         };
-        sender.try_send(Queued::Task(task)).map_err(|err| match err {
-            TrySendError::Full(_) => ReplayError::Busy,
-            TrySendError::Disconnected(_) => ReplayError::Shutdown,
-        })
+        sender
+            .try_send(Queued::Task(task))
+            .map_err(|err| match err {
+                TrySendError::Full(_) => ReplayError::Busy,
+                TrySendError::Disconnected(_) => ReplayError::Shutdown,
+            })
     }
 
     /// Waits until every accepted export finished, at most `deadline`.
@@ -578,7 +580,9 @@ mod tests {
         assert_eq!(saved.path, expected);
         let (tx, rx) = channel();
         exporter
-            .try_run(Box::new(move || tx.send(std::thread::current().id()).unwrap()))
+            .try_run(Box::new(move || {
+                tx.send(std::thread::current().id()).unwrap()
+            }))
             .unwrap();
         assert_ne!(rx.recv_timeout(Duration::from_secs(20)).unwrap(), caller);
         drop(exporter);
