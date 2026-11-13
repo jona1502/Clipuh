@@ -1794,10 +1794,7 @@ mod tests {
         // Only the packet right at the switch can be unrepresentable; every
         // later packet keeps dts strictly increasing and never above pts.
         let settled = 8;
-        assert!(
-            dts[settled..].windows(2).all(|w| w[1] > w[0]),
-            "{dts:?}"
-        );
+        assert!(dts[settled..].windows(2).all(|w| w[1] > w[0]), "{dts:?}");
         assert!(
             stream[settled..]
                 .iter()
@@ -1834,7 +1831,10 @@ mod tests {
         assert_eq!(aac_expected_time(first, 0), first);
         // 100 frames of 1024 samples at 48 kHz, exactly.
         assert_eq!(expected, first + 21_333_333);
-        assert_eq!(aac_presentation_time(Some(expected + 5), expected), (expected + 5, false));
+        assert_eq!(
+            aac_presentation_time(Some(expected + 5), expected),
+            (expected + 5, false)
+        );
         assert_eq!(
             aac_presentation_time(Some(expected + AAC_FRAME_TICKS), expected),
             (expected + AAC_FRAME_TICKS, false)
