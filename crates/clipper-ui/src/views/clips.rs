@@ -1,50 +1,37 @@
 use gpui::prelude::*;
 use gpui::{Div, div, px, rgb};
 
+use super::ClipperWindow;
 use crate::components::{ButtonVariant, button, empty_state, panel};
+use crate::notifications::run_explorer;
+use crate::state::{SavedClip, format_elapsed};
 use crate::theme;
 
-const COLUMNS: [&str; 5] = ["Name", "Game", "Duration", "Size", "Saved"];
-
-pub(super) fn content() -> Div {
-    let search = panel()
-        .flex_1()
-        .h(px(32.))
-        .px_3()
-        .flex()
-        .items_center()
-        .gap_2()
-        .text_sm()
-        .text_color(rgb(theme::TEXT_TERTIARY))
-        .child("⌕")
-        .child("Search clips");
+pub(super) fn content(window: &ClipperWindow) -> Div {
+    let clips = &window.recording.saved_clips;
+    let count = match clips.len() {
+        1 => "1 clip this session".to_owned(),
+        n => format!("{n} clips this session"),
+    };
 
     let toolbar = div()
         .flex()
         .items_center()
         .gap_2()
-        .child(search)
+        .child(
+            div()
+                .flex_1()
+                .text_sm()
+                .text_color(rgb(theme::TEXT_TERTIARY))
+                .child(count),
+        )
         .child(button(
             "sort",
             "Newest",
             ButtonVariant::Secondary,
             None,
             false,
-        ))
-        .child(button(
-            "filter",
-            "All games",
-            ButtonVariant::Ghost,
-            None,
-            false,
-        ))
-        .child(
-            div()
-                .px_2()
-                .text_xs()
-                .text_color(rgb(theme::TEXT_TERTIARY))
-                .child("0 clips"),
-        );
+        ));
 
     let header = div()
         .flex()
@@ -54,13 +41,72 @@ pub(super) fn content() -> Div {
         .border_color(rgb(theme::BORDER))
         .text_xs()
         .text_color(rgb(theme::TEXT_TERTIARY))
-        .children(COLUMNS.map(|name| div().flex_1().child(name)));
+        .child(div().flex_1().min_w_0().child("Name"))
+        .child(div().w(px(80.)).child("Duration"))
+        .child(div().w(px(200.)).child("Actions"));
 
-    div().flex().flex_col().gap_3().child(toolbar).child(
-        panel().child(header).child(empty_state(
+    let mut list = panel().child(header);
+    if clips.is_empty() {
+        list = list.child(empty_state(
             "▤",
             "No clips yet",
-            "Saved replays will appear here. Save one with your replay hotkey once capture is connected.",
-        )),
-    )
+            "Replays you save during this session appear here. Turn on instant replay on the Dashboard, then press your save hotkey.",
+        ));
+    } else {
+        list = list.children(
+            clips
+                .iter()
+                .enumerate()
+                .map(|(index, clip)| row(index, clip)),
+        );
+    }
+
+    div().flex().flex_col().gap_3().child(toolbar).child(list)
+}
+
+fn row(index: usize, clip: &SavedClip) -> Div {
+    let open = clip.path.clone();
+    let folder = clip.path.clone();
+    div()
+        .flex()
+        .items_center()
+        .px_4()
+        .py_2()
+        .when(index > 0, |this| {
+            this.border_t_1().border_color(rgb(theme::BORDER))
+        })
+        .text_sm()
+        .child(div().flex_1().min_w_0().truncate().child(clip.name()))
+        .child(
+            div()
+                .w(px(80.))
+                .text_color(rgb(theme::TEXT_SECONDARY))
+                .child(format_elapsed(clip.duration)),
+        )
+        .child(
+            div()
+                .w(px(200.))
+                .flex()
+                .gap_2()
+                .child(
+                    button(
+                        ("clip-open", index),
+                        "Open",
+                        ButtonVariant::Secondary,
+                        None,
+                        true,
+                    )
+                    .on_click(move |_, _, _| run_explorer(&open)),
+                )
+                .child(
+                    button(
+                        ("clip-folder", index),
+                        "Open Folder",
+                        ButtonVariant::Ghost,
+                        None,
+                        true,
+                    )
+                    .on_click(move |_, _, _| run_explorer(format!("/select,{}", folder.display()))),
+                ),
+        )
 }
