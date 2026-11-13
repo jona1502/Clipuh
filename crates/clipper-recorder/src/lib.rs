@@ -16,7 +16,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 #[cfg(not(windows))]
-use clipper_core::recording::RecorderCommand;
+use clipper_core::recording::{REPLAY_NOT_RUNNING, RecorderCommand};
 use clipper_core::recording::{RecorderEndpoint, RecorderEvent, RecorderHandle, recorder_channels};
 
 /// Owns the worker thread. Dropping it requests shutdown and joins.
@@ -102,6 +102,16 @@ fn run(endpoint: &RecorderEndpoint) {
         if command == RecorderCommand::Shutdown {
             break;
         }
+        if command == RecorderCommand::SaveReplay {
+            // A real replay engine will emit ReplaySaving then ReplaySaved/ReplaySaveFailed here.
+            emit(
+                endpoint,
+                RecorderEvent::ReplaySaveFailed {
+                    message: REPLAY_NOT_RUNNING.into(),
+                },
+            );
+            continue;
+        }
         emit(
             endpoint,
             RecorderEvent::Error {
@@ -115,7 +125,7 @@ fn run(endpoint: &RecorderEndpoint) {
 mod tests {
     use std::time::Duration;
 
-    use clipper_core::recording::RecorderCommand;
+    use clipper_core::recording::{REPLAY_NOT_RUNNING, RecorderCommand};
 
     use super::*;
 
@@ -149,6 +159,32 @@ mod tests {
             assert!(matches!(next(&handle), RecorderEvent::Error { .. }));
         }
         drop(recorder);
+    }
+
+    fn not_running() -> RecorderEvent {
+        RecorderEvent::ReplaySaveFailed {
+            message: REPLAY_NOT_RUNNING.into(),
+        }
+    }
+
+    #[test]
+    fn save_replay_without_buffer_reports_not_running() {
+        let recorder = Recorder::spawn(4, 8).unwrap();
+        let handle = recorder.handle();
+        handle.send(RecorderCommand::SaveReplay).unwrap();
+        assert_eq!(next(&handle), not_running());
+    }
+
+    #[test]
+    fn repeated_save_replay_is_answered_each_time_and_worker_stays_usable() {
+        let recorder = Recorder::spawn(4, 8).unwrap();
+        let handle = recorder.handle();
+        for _ in 0..3 {
+            handle.send(RecorderCommand::SaveReplay).unwrap();
+            assert_eq!(next(&handle), not_running());
+        }
+        handle.send(RecorderCommand::Shutdown).unwrap();
+        assert_eq!(next(&handle), RecorderEvent::Stopped);
     }
 
     #[test]
