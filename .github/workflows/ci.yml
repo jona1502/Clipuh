@@ -22,9 +22,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
+      # Toolchain and components come from rust-toolchain.toml.
+      - run: rustup show active-toolchain || rustup toolchain install
       - run: cargo fmt --all --check
 
   check:
@@ -32,9 +31,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+      # Toolchain and components come from rust-toolchain.toml.
+      - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
