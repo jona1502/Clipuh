@@ -110,10 +110,13 @@
 /* Scroll reveal: CSS only, opacity + transform. Without animation-timeline
    support, or under prefers-reduced-motion, content is simply visible. */
 @supports (animation-timeline: view()) {
-  @media (prefers-reduced-motion: no-preference) {
+  @media screen and (prefers-reduced-motion: no-preference) {
+    /* The timeline goes through a custom property so the minifier cannot
+       fold it into the animation shorthand (browsers drop that shorthand). */
     .reveal {
+      --reveal-timeline: view();
       animation: reveal-in linear both;
-      animation-timeline: view();
+      animation-timeline: var(--reveal-timeline);
       animation-range: entry 0% entry 40%;
     }
   }
