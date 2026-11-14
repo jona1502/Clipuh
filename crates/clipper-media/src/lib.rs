@@ -7,3 +7,6 @@ pub mod player;
 pub mod thumbnail;
 #[cfg(windows)]
 pub mod trim;
+
+#[cfg(windows)]
+pub mod exact;

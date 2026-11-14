@@ -1,0 +1,756 @@
+//! Editor workspace presentation and timeline interactions.
+use super::*;
+
+impl Render for ClipEditor {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = *cx.theme();
+        let loaded = self.ready && self.edits.is_some();
+        let exporting = matches!(self.export, Export::Running { .. });
+        let duration = self.duration.unwrap_or_default();
+        let has_segments = self
+            .edits
+            .as_ref()
+            .is_some_and(|e| !e.segments().is_empty());
+        let header = panel(&t)
+            .px_3()
+            .py_2()
+            .flex()
+            .items_center()
+            .gap_3()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(file_name(&self.path)),
+            )
+            .child(muted(&t).child("Non-destructive edits"))
+            .child(
+                button(
+                    &t,
+                    "editor-export",
+                    "Export",
+                    ButtonVariant::Primary,
+                    None,
+                    loaded && has_segments && !exporting,
+                )
+                .when(loaded && has_segments && !exporting, |el| {
+                    el.on_click(cx.listener(|this, _, _, cx| this.choose_export(cx)))
+                }),
+            );
+        let preview_height = (f32::from(window.viewport_size().height) * 0.43).clamp(180., 440.);
+        let preview = div()
+            .id("editor-preview")
+            .relative()
+            .w_full()
+            .h(px(preview_height))
+            .rounded_lg()
+            .overflow_hidden()
+            .bg(t.colors.media_background)
+            .flex()
+            .items_center()
+            .justify_center()
+            .when(loaded, |el| {
+                el.cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_playback(cx)))
+            })
+            .map(|el| match (&self.error, &self.frame) {
+                (Some(error), _) => el.child(
+                    div()
+                        .max_w(px(420.))
+                        .text_sm()
+                        .text_center()
+                        .text_color(t.colors.danger)
+                        .child(error.clone()),
+                ),
+                (None, Some(frame)) => el.child(
+                    img(frame.clone())
+                        .size_full()
+                        .object_fit(ObjectFit::Contain),
+                ),
+                _ => el.child(muted(&t).child("Loading clip…")),
+            });
+        let controls = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .child(muted(&t).child(format!(
+                "{} / {}",
+                format_timestamp(self.position),
+                format_timestamp(duration)
+            )))
+            .child(
+                button(
+                    &t,
+                    "editor-back",
+                    "−10s",
+                    ButtonVariant::Ghost,
+                    None,
+                    loaded,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.seek(this.position.saturating_sub(Duration::from_secs(10)), cx)
+                })),
+            )
+            .child(
+                button(
+                    &t,
+                    "editor-play",
+                    if self.playing { "Pause" } else { "Play" },
+                    ButtonVariant::Primary,
+                    Some(&["Space"]),
+                    loaded && has_segments,
+                )
+                .when(loaded && has_segments, |el| {
+                    el.on_click(cx.listener(|this, _, _, cx| this.toggle_playback(cx)))
+                }),
+            )
+            .child(
+                button(
+                    &t,
+                    "editor-forward",
+                    "+10s",
+                    ButtonVariant::Ghost,
+                    None,
+                    loaded,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.seek(this.position + Duration::from_secs(10), cx)
+                })),
+            );
+        let controls = controls.child(
+            button(
+                &t,
+                "editor-fullscreen",
+                if self.preview_fullscreen {
+                    "Exit fullscreen"
+                } else {
+                    "Fullscreen"
+                },
+                ButtonVariant::Ghost,
+                None,
+                loaded,
+            )
+            .when(loaded, |el| {
+                el.on_click(cx.listener(|this, _, window, cx| this.toggle_preview(window, cx)))
+            }),
+        );
+        if self.preview_fullscreen {
+            return div()
+                .id("clip-editor-fullscreen")
+                .key_context(CONTEXT)
+                .track_focus(&self.focus)
+                .on_action(cx.listener(|this, _: &TogglePlayback, _, cx| this.toggle_playback(cx)))
+                .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                    if event.keystroke.key == "escape" {
+                        this.toggle_preview(window, cx);
+                        cx.stop_propagation();
+                    }
+                }))
+                .size_full()
+                .bg(t.colors.media_background)
+                .flex()
+                .flex_col()
+                .child(preview.h(px(0.)).flex_1().min_h_0())
+                .child(div().p_3().child(controls));
+        }
+        let tabs = div().flex().w_full().gap_1().children(
+            ["Trim", "Effects", "Audio", "Text", "Export"]
+                .into_iter()
+                .enumerate()
+                .map(|(i, label)| {
+                    button(
+                        &t,
+                        ("editor-tab", i),
+                        label,
+                        if self.tab == i {
+                            ButtonVariant::Primary
+                        } else {
+                            ButtonVariant::Ghost
+                        },
+                        None,
+                        true,
+                    )
+                    .flex_1()
+                    .min_w_0()
+                    .px_1()
+                    .justify_center()
+                    .text_size(px(11.))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.tab = i;
+                        cx.notify();
+                    }))
+                }),
+        );
+        let mut inspector = panel(&t)
+            .w(relative(0.30))
+            .min_w(px(290.))
+            .p_3()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(tabs);
+        inspector = match self.tab {
+            0 => {
+                let start = timestamp_row(&t, "Start", self.start_input.clone());
+                let end = timestamp_row(&t, "End", self.end_input.clone());
+                let length = self.trim.map_or_else(
+                    || "No segment selected".into(),
+                    |range| format_timestamp(range.end - range.start),
+                );
+                let split = button(
+                    &t,
+                    "editor-split",
+                    "Split",
+                    ButtonVariant::Secondary,
+                    None,
+                    loaded && has_segments,
+                )
+                .when(loaded && has_segments, |el| {
+                    el.on_click(cx.listener(|this, _, _, cx| {
+                        this.notice = this
+                            .edits
+                            .as_mut()
+                            .and_then(|edits| edits.split(this.position).err())
+                            .map(Into::into);
+                        this.sync_trim(cx);
+                    }))
+                });
+                let delete = button(
+                    &t,
+                    "editor-delete",
+                    "Delete",
+                    ButtonVariant::Secondary,
+                    None,
+                    loaded && self.trim.is_some(),
+                )
+                .when(loaded && self.trim.is_some(), |el| {
+                    el.on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(edits) = &mut this.edits {
+                            edits.delete_selected();
+                        }
+                        this.sync_trim(cx);
+                    }))
+                });
+                let reset_enabled =
+                    loaded && self.trim.is_some_and(|range| !range.is_full(duration));
+                let reset = button(
+                    &t,
+                    "editor-reset",
+                    "Reset selected trim",
+                    ButtonVariant::Ghost,
+                    None,
+                    reset_enabled,
+                )
+                .when(reset_enabled, |el| {
+                    el.on_click(cx.listener(|this, _, _, cx| this.reset_trim(cx)))
+                });
+                inspector
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child("Clip"),
+                    )
+                    .child(start)
+                    .child(end)
+                    .child(muted(&t).child(format!("Length   {length}")))
+                    .child(muted(&t).child("Enter timestamps to apply · I / O: set at playhead"))
+                    .child(div().flex().gap_2().child(split).child(delete))
+                    .child(reset)
+            }
+            4 => {
+                let enabled = loaded && has_segments && !exporting;
+                let save = button(
+                    &t,
+                    "editor-save-as",
+                    "Choose output…",
+                    ButtonVariant::Primary,
+                    None,
+                    enabled,
+                )
+                .when(enabled, |el| {
+                    el.on_click(cx.listener(|this, _, _, cx| this.choose_export(cx)))
+                });
+                let length = format_timestamp(
+                    self.edits
+                        .as_ref()
+                        .map_or(Duration::ZERO, |edits| edits.duration()),
+                );
+                inspector.child(div().text_sm().child("MP4 · H.264 video · AAC audio"))
+                    .child(muted(&t).child("Selected ranges in segment order. All source audio streams preserved. Original unchanged."))
+                    .child(muted(&t).child("AAC container duration may include encoder padding; cuts never snap to earlier keyframes."))
+                    .child(muted(&t).child(format!("Output length: {length}"))).child(save)
+            }
+            2 => {
+                let details = if self.media_duration.is_some() {
+                    format!("{} audio stream(s) in source", self.audio_tracks)
+                } else {
+                    "Reading audio tracks…".into()
+                };
+                inspector.child(muted(&t).child(details))
+                    .child(muted(&t).child("Audio plays with the preview and is preserved on export. Track gain, mute, solo and waveforms arrive in Phase 7."))
+            }
+            _ => inspector
+                .child(muted(&t).child("Coming later. This feature is not available in Phase 6.")),
+        };
+        let can_undo = self.edits.as_ref().is_some_and(|e| e.can_undo());
+        let can_redo = self.edits.as_ref().is_some_and(|e| e.can_redo());
+        let toolbar = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                button(
+                    &t,
+                    "editor-undo",
+                    "Undo",
+                    ButtonVariant::Ghost,
+                    Some(&["Ctrl", "Z"]),
+                    can_undo,
+                )
+                .when(can_undo, |el| {
+                    el.on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(e) = &mut this.edits {
+                            e.undo();
+                        }
+                        this.sync_trim(cx);
+                    }))
+                }),
+            )
+            .child(
+                button(
+                    &t,
+                    "editor-redo",
+                    "Redo",
+                    ButtonVariant::Ghost,
+                    Some(&["Ctrl", "Y"]),
+                    can_redo,
+                )
+                .when(can_redo, |el| {
+                    el.on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(e) = &mut this.edits {
+                            e.redo();
+                        }
+                        this.sync_trim(cx);
+                    }))
+                }),
+            )
+            .child(
+                muted(&t)
+                    .flex_1()
+                    .child("Source timeline · select segment · drag edges"),
+            )
+            .child(
+                button(
+                    &t,
+                    "editor-zoom-out",
+                    "−",
+                    ButtonVariant::Ghost,
+                    None,
+                    self.zoom > 1.,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.zoom = (this.zoom / 1.5).max(1.);
+                    cx.notify();
+                })),
+            )
+            .child(muted(&t).child(format!("{:.0}%", self.zoom * 100.)))
+            .child(
+                button(
+                    &t,
+                    "editor-zoom-in",
+                    "+",
+                    ButtonVariant::Ghost,
+                    None,
+                    self.zoom < 8.,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.zoom = (this.zoom * 1.5).min(8.);
+                    cx.notify();
+                })),
+            );
+        let timeline = self.timeline(duration, loaded, cx);
+        div()
+            .id("clip-editor")
+            .key_context(CONTEXT)
+            .track_focus(&self.focus)
+            .on_action(cx.listener(|this, _: &TogglePlayback, _, cx| this.toggle_playback(cx)))
+            .on_action(cx.listener(|this, _: &SetIn, _, cx| this.set_in(cx)))
+            .on_action(cx.listener(|this, _: &SetOut, _, cx| this.set_out(cx)))
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                if event.keystroke.modifiers.control {
+                    let changed = match event.keystroke.key.as_str() {
+                        "z" => this.edits.as_mut().is_some_and(|e| e.undo()),
+                        "y" => this.edits.as_mut().is_some_and(|e| e.redo()),
+                        _ => false,
+                    };
+                    if changed {
+                        this.sync_trim(cx);
+                        cx.stop_propagation();
+                    }
+                }
+            }))
+            .flex()
+            .flex_col()
+            .gap_3()
+            .min_w_0()
+            .child(header)
+            .child(
+                div()
+                    .flex()
+                    .gap_3()
+                    .min_w_0()
+                    .child(
+                        panel(&t)
+                            .flex_1()
+                            .min_w_0()
+                            .p_2()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(preview)
+                            .child(controls),
+                    )
+                    .child(inspector),
+            )
+            .child(
+                panel(&t)
+                    .p_3()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(toolbar)
+                    .child(timeline),
+            )
+            .children(
+                self.notice
+                    .clone()
+                    .map(|notice| muted(&t).text_color(t.colors.warning).child(notice)),
+            )
+            .children(self.export_status(cx))
+    }
+}
+
+impl ClipEditor {
+    fn toggle_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.preview_fullscreen {
+            self.fullscreen_before_preview = window.is_fullscreen();
+            if !self.fullscreen_before_preview {
+                window.toggle_fullscreen();
+            }
+        } else if !self.fullscreen_before_preview && window.is_fullscreen() {
+            window.toggle_fullscreen();
+        }
+        self.preview_fullscreen = !self.preview_fullscreen;
+        window.focus(&self.focus);
+        cx.emit(EditorEvent::PreviewChanged);
+        cx.notify();
+    }
+
+    fn timeline(&self, duration: Duration, loaded: bool, cx: &mut Context<Self>) -> Div {
+        let t = *cx.theme();
+        let bounds_out = self.timeline.clone();
+        let mut ruler = div().relative().h(px(26.)).w_full();
+        for i in 0..=10 {
+            ruler = ruler.child(
+                div()
+                    .absolute()
+                    .left(relative(i as f32 / 10.))
+                    .text_size(px(10.))
+                    .text_color(t.colors.text_muted)
+                    .child(ruler_timestamp(duration.mul_f32(i as f32 / 10.), duration)),
+            );
+        }
+        let mut video = div()
+            .id("editor-video-track")
+            .relative()
+            .w_full()
+            .h(px(52.))
+            .bg(t.colors.media_background)
+            .rounded_md()
+            .overflow_hidden()
+            .child(
+                canvas(move |bounds, _, _| bounds_out.set(bounds), |_, _, _, _| {})
+                    .absolute()
+                    .size_full(),
+            );
+        if !self.thumbnails.is_empty() {
+            video = video.child(div().absolute().size_full().flex().children(
+                self.thumbnails.iter().map(|image| {
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .overflow_hidden()
+                        .child(img(image.clone()).size_full().object_fit(ObjectFit::Cover))
+                }),
+            ));
+        }
+        if let Some(edits) = &self.edits {
+            for (i, segment) in edits.segments().iter().enumerate() {
+                let selected = edits.selected() == Some(i);
+                let segment = if selected {
+                    self.trim.map_or(*segment, |trim| clipper_editor::Segment {
+                        start: trim.start,
+                        end: trim.end,
+                    })
+                } else {
+                    *segment
+                };
+                video = video.child(
+                    div()
+                        .id(("editor-segment", i))
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left(relative(fraction(segment.start, duration)))
+                        .w(relative(fraction(segment.end - segment.start, duration)))
+                        .border_2()
+                        .border_color(if selected {
+                            t.colors.accent
+                        } else {
+                            t.colors.border_strong
+                        })
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                                window.focus(&this.focus);
+                                if let Some(e) = &mut this.edits {
+                                    e.select(i);
+                                }
+                                this.sync_trim(cx);
+                                this.scrubbing = true;
+                                this.seek_to_x(event.position.x, cx);
+                                cx.stop_propagation();
+                            }),
+                        ),
+                );
+            }
+        }
+        if let Some(trim) = self.trim {
+            for (start, at) in [(true, trim.start), (false, trim.end)] {
+                video = video.child(
+                    div()
+                        .id(if start {
+                            "editor-trim-start"
+                        } else {
+                            "editor-trim-end"
+                        })
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .when(start, |el| el.left(relative(fraction(at, duration))))
+                        .when(!start, |el| el.right(relative(1. - fraction(at, duration))))
+                        .w(px(9.))
+                        .bg(t.colors.accent)
+                        .cursor_pointer()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                                this.dragging = Some(start);
+                                this.drag_origin = this.trim.map(|trim| (event.position.x, trim));
+                                cx.stop_propagation();
+                                cx.notify();
+                            }),
+                        ),
+                );
+            }
+        }
+        video = video.when(loaded, |el| {
+            el.on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
+                    window.focus(&this.focus);
+                    this.scrubbing = true;
+                    this.seek_to_x(event.position.x, cx);
+                }),
+            )
+        });
+        let mut tracks = div()
+            .relative()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(ruler)
+            .child(video);
+        for i in 0..self.audio_tracks {
+            tracks = tracks.child(
+                div()
+                    .h(px(32.))
+                    .rounded_md()
+                    .bg(t.colors.accent_subtle)
+                    .border_1()
+                    .border_color(t.colors.border)
+                    .text_xs()
+                    .text_color(t.colors.text_muted)
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .child(format!("Audio {} · waveform available in Phase 7", i + 1)),
+            );
+        }
+        tracks = tracks.child(
+            div()
+                .absolute()
+                .top(px(20.))
+                .bottom_0()
+                .left(relative(fraction(self.position, duration)))
+                .w(px(2.))
+                .bg(t.colors.text),
+        );
+        let mut labels = div()
+            .w(px(110.))
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .pt(px(34.))
+            .child(muted(&t).h(px(52.)).child("Video"));
+        for i in 0..self.audio_tracks {
+            labels = labels.child(muted(&t).h(px(32.)).child(format!("Audio {}", i + 1)));
+        }
+        if self.audio_tracks == 0 {
+            labels = labels.child(muted(&t).child(if self.media_duration.is_some() {
+                "No audio tracks"
+            } else {
+                "Reading tracks…"
+            }));
+        }
+        div()
+            .flex()
+            .gap_2()
+            .min_w_0()
+            .child(labels)
+            .child(
+                div()
+                    .id("editor-timeline-scroll")
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_x_scroll()
+                    .pb_2()
+                    .child(
+                        div()
+                            .w(relative(self.zoom))
+                            .flex_shrink_0()
+                            .pr(px(48.))
+                            .child(tracks),
+                    ),
+            )
+            .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
+                if event.pressed_button != Some(MouseButton::Left) {
+                    this.finish_drag(cx);
+                    return;
+                }
+                if let Some(start) = this.dragging {
+                    if let (Some(duration), Some(mut trim)) = (this.duration, this.trim) {
+                        let bounds = this.timeline.get();
+                        let at = if let Some((pointer, original)) = this.drag_origin {
+                            let width = f32::from(bounds.size.width);
+                            let origin = if start { original.start } else { original.end };
+                            clipper_editor::pixel_to_time(
+                                clipper_editor::time_to_pixel(origin, duration, width)
+                                    + f32::from(event.position.x - pointer),
+                                duration,
+                                width,
+                            )
+                        } else {
+                            duration.mul_f32(position_fraction(event.position.x, bounds))
+                        };
+                        let result = if start {
+                            trim.set_in(at)
+                        } else {
+                            trim.set_out(at, duration)
+                        };
+                        if result.is_ok() {
+                            this.trim = Some(trim);
+                            cx.notify();
+                        }
+                    }
+                } else if this.scrubbing {
+                    this.seek_to_x(event.position.x, cx);
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.finish_drag(cx)),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.finish_drag(cx)),
+            )
+    }
+    fn finish_drag(&mut self, cx: &mut Context<Self>) {
+        if self.dragging.take().is_some() {
+            if let (Some(edits), Some(trim)) = (&mut self.edits, self.trim) {
+                self.notice = edits.trim(trim.start, trim.end).err().map(Into::into);
+            }
+            self.sync_trim(cx);
+        }
+        self.scrubbing = false;
+        self.drag_origin = None;
+    }
+    pub(super) fn sync_trim(&mut self, cx: &mut Context<Self>) {
+        self.trim = self
+            .edits
+            .as_ref()
+            .and_then(|e| e.selected_segment())
+            .map(|s| Trim {
+                start: s.start,
+                end: s.end,
+            });
+        let (a, b) = self.trim.map_or((String::new(), String::new()), |r| {
+            (format_timestamp(r.start), format_timestamp(r.end))
+        });
+        self.start_input
+            .update(cx, |input, cx| input.set_text(a, cx));
+        self.end_input.update(cx, |input, cx| input.set_text(b, cx));
+        cx.notify();
+    }
+    fn choose_export(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.export, Export::Running { .. }) {
+            return;
+        }
+        let suggested = trim::export_path(
+            &self.path,
+            Duration::ZERO,
+            self.duration.unwrap_or_default(),
+        );
+        let name = file_name(&suggested);
+        let picker =
+            cx.prompt_for_new_path(self.path.parent().unwrap_or(Path::new(".")), Some(&name));
+        cx.spawn(async move |this, cx| match picker.await {
+            Ok(Ok(Some(path))) => {
+                let _ = this.update(cx, |this, cx| this.export_to(path, cx));
+            }
+            Ok(Ok(None)) => {}
+            _ => {
+                let _ = this.update(cx, |this, cx| {
+                    this.notice = Some("Could not open the output file picker.".into());
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+}
+
+fn ruler_timestamp(at: Duration, duration: Duration) -> String {
+    if duration < Duration::from_secs(10) {
+        format!("{:.1}s", at.as_secs_f64())
+    } else {
+        format!("{}:{:02}", at.as_secs() / 60, at.as_secs() % 60)
+    }
+}
+
+fn timestamp_row(theme: &Theme, label: &'static str, input: Entity<TextInput>) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .gap_3()
+        .child(muted(theme).w(px(42.)).child(label))
+        .child(div().flex_1().child(input))
+}
