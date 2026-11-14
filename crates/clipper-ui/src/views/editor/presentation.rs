@@ -630,6 +630,10 @@ impl ClipEditor {
                     this.finish_drag(cx);
                     return;
                 }
+                if this.audio_dragging.is_some() {
+                    this.drag_audio(event.position.x, cx);
+                    return;
+                }
                 if let Some(start) = this.dragging {
                     if let (Some(duration), Some(mut trim)) = (this.duration, this.trim) {
                         let bounds = this.timeline.get();
@@ -668,7 +672,8 @@ impl ClipEditor {
                 cx.listener(|this, _, _, cx| this.finish_drag(cx)),
             )
     }
-    fn finish_drag(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn finish_drag(&mut self, cx: &mut Context<Self>) {
+        self.finish_audio_drag(cx);
         if self.dragging.take().is_some() {
             if let (Some(edits), Some(trim)) = (&mut self.edits, self.trim) {
                 self.notice = edits.trim(trim.start, trim.end).err().map(Into::into);

@@ -126,6 +126,7 @@ pub struct ClipEditor {
     audio_start_input: Entity<TextInput>,
     audio_end_input: Entity<TextInput>,
     audio_slider_focus: Vec<(FocusHandle, FocusHandle)>,
+    audio_dragging: Option<(bool, Pixels, clipper_editor::Segment)>,
     pending_seek: Option<Duration>,
     media_duration: Option<Duration>,
     pub(super) preview_fullscreen: bool,
@@ -252,6 +253,7 @@ impl ClipEditor {
             audio_start_input,
             audio_end_input,
             audio_slider_focus: Vec::new(),
+            audio_dragging: None,
             pending_seek: None,
             media_duration: None,
             preview_fullscreen: false,
@@ -400,6 +402,10 @@ impl ClipEditor {
 
     /// Releases the decoder, audio output and preview frame; keeps trim state.
     pub fn suspend(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.finish_drag(cx);
+        if let Some(edits) = &mut self.edits {
+            edits.finish_audio_gesture();
+        }
         self._player_events = None;
         self.thumbnail_task = None;
         self.waveform_task = None;

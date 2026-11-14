@@ -7,6 +7,37 @@ fn row_height(theme: &Theme) -> f32 {
 }
 
 impl ClipEditor {
+    pub(super) fn drag_audio(&mut self, x: Pixels, cx: &mut Context<Self>) {
+        let Some((start, pointer, original)) = self.audio_dragging else {
+            return;
+        };
+        let Some(duration) = self.duration else {
+            return;
+        };
+        let width = f32::from(self.timeline.get().size.width);
+        let origin = if start { original.start } else { original.end };
+        let at = clipper_editor::pixel_to_time(
+            clipper_editor::time_to_pixel(origin, duration, width) + f32::from(x - pointer),
+            duration,
+            width,
+        );
+        if let Some(edits) = &mut self.edits {
+            let result = edits.trim_audio(
+                if start { at } else { original.start },
+                if start { original.end } else { at },
+            );
+            self.notice = result.err().map(Into::into);
+        }
+        self.sync_audio(cx);
+    }
+    pub(super) fn finish_audio_drag(&mut self, cx: &mut Context<Self>) {
+        if self.audio_dragging.take().is_some() {
+            if let Some(edits) = &mut self.edits {
+                edits.finish_audio_gesture();
+            }
+            cx.notify();
+        }
+    }
     pub(super) fn sync_audio(&mut self, cx: &mut Context<Self>) {
         let Some(edits) = &self.edits else { return };
         let mut tracks = edits.preview_audio_tracks();
@@ -415,6 +446,45 @@ impl ClipEditor {
                         t.colors.border_strong
                     }),
             );
+        }
+        if selected
+            && let Some(segment) = track
+                .selected_segment
+                .and_then(|i| track.segments.get(i))
+                .copied()
+        {
+            for (start, at) in [(true, segment.start), (false, segment.end)] {
+                row = row.child(
+                    div()
+                        .id((
+                            if start {
+                                "audio-trim-start"
+                            } else {
+                                "audio-trim-end"
+                            },
+                            index,
+                        ))
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .w(px(8.))
+                        .when(start, |el| el.left(relative(fraction(at, duration))))
+                        .when(!start, |el| el.right(relative(1. - fraction(at, duration))))
+                        .bg(t.colors.accent)
+                        .cursor_pointer()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                                window.focus(&this.focus);
+                                if let Some(edits) = &mut this.edits {
+                                    edits.begin_audio_gesture();
+                                }
+                                this.audio_dragging = Some((start, event.position.x, segment));
+                                cx.stop_propagation();
+                            }),
+                        ),
+                );
+            }
         }
         if self.waveforms.is_none() {
             row = row.child(muted(&t).p_2().child(if self.waveform_error.is_some() {

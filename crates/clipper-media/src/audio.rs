@@ -109,7 +109,7 @@ fn discover_reader(reader: &IMFSourceReader) -> Result<Vec<AudioTrack>, String> 
     for (index, track) in tracks.iter_mut().enumerate() {
         if track.label.is_empty() {
             track.label = if single {
-                "Mixed audio".into()
+                "Audio (single stream)".into()
             } else {
                 format!("Audio {}", index + 1)
             };
@@ -1058,7 +1058,7 @@ mod tests {
         assert_eq!(tracks.len(), 1);
         assert_eq!(tracks[0].channels, 1);
         assert_eq!(tracks[0].sample_rate, 44_100);
-        assert_eq!(tracks[0].label, "Mixed audio");
+        assert_eq!(tracks[0].label, "Audio (single stream)");
         let cancel = AtomicBool::new(false);
         let mut decoder = Decoder::open(&path, &[tracks[0].stream_index]).unwrap();
         let mut frames = 0;
