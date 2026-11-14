@@ -39,6 +39,17 @@ pub struct Clip {
 }
 
 impl Clip {
+    /// Whether this file was saved from the instant replay buffer (as opposed
+    /// to a manual recording), going by the recorder's file name.
+    // shortcut: a replay renamed by the user counts as a recording; store the
+    // kind in the library index if that matters.
+    pub fn is_replay(&self) -> bool {
+        self.path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("Clipper_Replay_"))
+    }
+
     /// Whether the ID comes from the operating system's stable file identity.
     pub fn has_stable_identity(&self) -> bool {
         self.id.starts_with("win:")
