@@ -128,7 +128,7 @@ pub(super) fn levels_need_redraw(
 }
 
 /// Name and subtitle of a row. `resolved` is the friendly application name or the device name.
-fn row_labels(
+pub(super) fn row_labels(
     kind: AudioSourceType,
     target: Option<&str>,
     resolved: Option<&str>,
@@ -286,7 +286,7 @@ impl ClipperWindow {
             .is_none_or(|c| c.process_loopback)
     }
 
-    fn resolved_name(&self, source: &AudioSourceSettings) -> Option<String> {
+    pub(super) fn resolved_name(&self, source: &AudioSourceSettings) -> Option<String> {
         let target = source.target.as_deref()?;
         match source.kind {
             AudioSourceType::Application => self

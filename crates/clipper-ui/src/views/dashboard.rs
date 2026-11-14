@@ -55,7 +55,7 @@ pub(super) fn content(
 /// Narrowest a dashboard card gets before the row wraps.
 const MIN_CARD_WIDTH: f32 = 240.0;
 
-fn error_banner(message: String, cx: &mut Context<ClipperWindow>) -> Div {
+pub(super) fn error_banner(message: String, cx: &mut Context<ClipperWindow>) -> Div {
     let t = *cx.theme();
     panel(&t)
         .px_4()
