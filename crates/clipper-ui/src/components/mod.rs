@@ -74,6 +74,8 @@ pub fn panel(t: &Theme) -> Div {
 }
 
 /// Small uppercase-free section label with optional trailing note.
+// shortcut: no caller since the Phase 8 Settings cards; drop the allow when a page uses it.
+#[allow(dead_code)]
 pub fn section_header(
     t: &Theme,
     title: impl Into<SharedString>,
@@ -250,6 +252,8 @@ pub fn chip(
 }
 
 /// One label/value line inside a panel. Rows after the first draw a top divider.
+// shortcut: no caller since the Phase 8 Settings cards; drop the allow when a page uses it.
+#[allow(dead_code)]
 pub fn property_row(
     t: &Theme,
     label: impl Into<SharedString>,
@@ -283,35 +287,14 @@ pub fn property_row(
 }
 
 /// Right-aligned secondary value for `property_row`.
+// shortcut: no caller since the Phase 8 Settings cards; drop the allow when a page uses it.
+#[allow(dead_code)]
 pub fn value_text(t: &Theme, text: impl Into<SharedString>) -> Div {
     div()
         .flex_none()
         .text_sm()
         .text_color(t.colors.text_secondary)
         .child(text.into())
-}
-
-/// Read-only switch visual. Settings are not editable from the UI yet.
-pub fn switch(t: &Theme, on: bool) -> Div {
-    div()
-        .flex_none()
-        .w(px(28.))
-        .h(px(16.))
-        .p(px(2.))
-        .flex()
-        .rounded_full()
-        .bg(if on {
-            t.colors.accent
-        } else {
-            t.colors.border_strong
-        })
-        .when(on, |this| this.justify_end())
-        .child(
-            div()
-                .size(px(12.))
-                .rounded_full()
-                .bg(t.colors.accent_foreground),
-        )
 }
 
 /// Label, large value and one line of context.
