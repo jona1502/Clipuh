@@ -1,0 +1,36 @@
+---
+import { statusLabel, type FeatureStatus } from "@/data/features";
+
+interface Props {
+  status: FeatureStatus;
+  class?: string;
+}
+
+const { status, class: className } = Astro.props;
+// Text colors: text-accent-hover on accent-subtle and text-text-secondary on
+// background both exceed 4.5:1.
+const tone =
+  status === "in-development"
+    ? "bg-accent-subtle text-accent-hover border-transparent"
+    : "bg-transparent text-text-secondary border-border-hover";
+---
+
+<span
+  data-status={status}
+  class:list={[
+    "text-caption inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 font-semibold whitespace-nowrap",
+    tone,
+    className,
+  ]}
+>
+  <span
+    class:list={[
+      "size-1.5 rounded-full",
+      status === "in-development"
+        ? "bg-accent-hover"
+        : "border-text-muted border",
+    ]}
+    aria-hidden="true"
+  ></span>
+  {statusLabel[status]}
+</span>

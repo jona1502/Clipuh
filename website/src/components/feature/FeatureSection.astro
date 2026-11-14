@@ -1,0 +1,60 @@
+---
+import Container from "@/components/ui/Container.astro";
+import StatusBadge from "./StatusBadge.astro";
+import type { FeatureCopy } from "@/data/features";
+
+interface Props {
+  id: string;
+  copy: FeatureCopy;
+  /** Demo left, text right from lg up. Mobile is always text first. */
+  reverse?: boolean;
+  class?: string;
+}
+
+const { id, copy, reverse = false, class: className } = Astro.props;
+---
+
+<section
+  id={id}
+  aria-labelledby={`${id}-title`}
+  class:list={["border-border/60 py-section border-t", className]}
+>
+  <Container>
+    <div class="grid items-center gap-10 lg:grid-cols-2 lg:gap-16">
+      <div class:list={["reveal flex flex-col gap-5", reverse && "lg:order-2"]}>
+        <div class="flex flex-wrap items-center gap-3">
+          <p class="text-caption text-accent font-semibold tracking-widest uppercase">
+            {copy.eyebrow}
+          </p>
+          <StatusBadge status={copy.status} />
+        </div>
+        <h2 id={`${id}-title`}>{copy.title}</h2>
+        <p class="text-lead text-text-secondary max-w-prose">
+          {copy.description}
+        </p>
+        <ul class="flex flex-col gap-3">
+          {copy.points.map((point) => (
+            <li class="text-body text-text-secondary flex gap-3">
+              <svg
+                viewBox="0 0 24 24"
+                class="text-accent mt-1 size-5 shrink-0"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+              >
+                <path d="M5 12.5l4.5 4.5L19 7.5" />
+              </svg>
+              <span>{point}</span>
+            </li>
+          ))}
+        </ul>
+      </div>
+      <div class:list={["reveal min-w-0", reverse && "lg:order-1"]}>
+        <slot name="demo" />
+      </div>
+    </div>
+  </Container>
+</section>

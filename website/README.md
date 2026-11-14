@@ -156,3 +156,37 @@ All accept `class` and pass remaining attributes to the root element.
 - `Container`: `size?: "page" | "narrow"`, `as?: HTMLTag` (div). Padding 16/24/32px.
 - `SectionHeading`: `title`, `eyebrow?`, `description?`, `level?: 1 | 2 | 3` (2),
   `align?: "left" | "center"` (left).
+
+## W2 feature components
+
+Zero-JS Astro primitives in `src/components/feature/`; copy comes from
+`src/data/features.ts` (`FeatureCopy`).
+
+```astro
+<FeatureSection id={replay.id} copy={replay} reverse>
+  <DemoFrame slot="demo" title="Replay buffer" minHeight="22rem">
+    <ReplayDemo client:visible />
+  </DemoFrame>
+</FeatureSection>
+<BentoCard title="..." description="..." status="planned" size="wide" />
+```
+
+- `FeatureSection`: `id`, `copy`, `reverse?`, `class?`; named slot `demo`.
+  Text first on mobile; demo beside text from `lg`. Top divider, `py-section`.
+- `StatusBadge`: `status` ("in-development" | "planned"), `class?`.
+- `DemoFrame`: `label?` (default "Interactive demo"; use e.g. "Interactive demo
+  · not real capture"), `title?`, `minHeight?` (CSS length, default `20rem`,
+  prevents layout shift), default slot.
+- `BentoCard`: `title`, `description`, `status`, `size?: "wide" | "regular"`;
+  non-interactive `<article>`, default slot for extra content.
+- Islands: mount with `client:visible`; use `useReducedMotion()` from
+  `interactive/shared/useReducedMotion.ts` (no autoplay or looping when true).
+- Shared classes in `global.css` ("W2 demo + reveal" block): `.demo-toggle`
+  (use `aria-pressed`), `.demo-slider` (native range, optional inline
+  `--demo-fill`), `.reveal` (scroll reveal, CSS only via
+  `animation-timeline: view()`; no-op without support or under reduced motion,
+  so content is never hidden; no script needed).
+
+Honesty rules: every demo is visibly labelled (`DemoFrame` label) and is not a
+real capture; every feature shows its status badge; `planned` features are never
+presented as available; no performance numbers unless measured and sourced.
