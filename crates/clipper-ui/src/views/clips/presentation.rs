@@ -1,4 +1,5 @@
 use super::*;
+use crate::components::RasterIcon;
 
 /// Gap between cards, in pixels.
 const GAP: f32 = 16.0;
@@ -43,6 +44,52 @@ fn origin_label(clip: &Clip) -> String {
     }
 }
 
+/// [`control`] with an approved icon before the label (selection bar).
+#[allow(clippy::too_many_arguments)] // Matches `control` plus the icon.
+fn icon_control(
+    t: &Theme,
+    index: usize,
+    icon: gpui::AnyElement,
+    label: impl Into<SharedString>,
+    enabled: bool,
+    variant: ButtonVariant,
+    focus: &FocusHandle,
+    cx: &mut Context<ClipLibrary>,
+    activate: impl Fn(&mut ClipLibrary, &mut Window, &mut Context<ClipLibrary>) + 'static,
+) -> Stateful<Div> {
+    wire_control(
+        crate::components::button_with_icon(
+            t,
+            ("library-control", index),
+            icon,
+            label,
+            variant,
+            enabled,
+        ),
+        t,
+        enabled,
+        focus,
+        cx,
+        activate,
+    )
+}
+
+/// Icon tinted like a `variant` button label.
+fn control_icon(
+    t: &Theme,
+    icon: crate::components::RasterIcon,
+    variant: ButtonVariant,
+    window: &Window,
+) -> gpui::AnyElement {
+    crate::components::raster_icon(
+        icon,
+        px(16.),
+        crate::components::button_text_color(t, variant),
+        window,
+    )
+    .into_any_element()
+}
+
 #[allow(clippy::too_many_arguments)] // Matches the shared button API plus focus and activation.
 fn control(
     t: &Theme,
@@ -54,9 +101,27 @@ fn control(
     cx: &mut Context<ClipLibrary>,
     activate: impl Fn(&mut ClipLibrary, &mut Window, &mut Context<ClipLibrary>) + 'static,
 ) -> Stateful<Div> {
+    wire_control(
+        button(t, ("library-control", index), label, variant, None, enabled),
+        t,
+        enabled,
+        focus,
+        cx,
+        activate,
+    )
+}
+
+fn wire_control(
+    button: Stateful<Div>,
+    t: &Theme,
+    enabled: bool,
+    focus: &FocusHandle,
+    cx: &mut Context<ClipLibrary>,
+    activate: impl Fn(&mut ClipLibrary, &mut Window, &mut Context<ClipLibrary>) + 'static,
+) -> Stateful<Div> {
     let activate = std::rc::Rc::new(activate);
     let clicked = activate.clone();
-    button(t, ("library-control", index), label, variant, None, enabled)
+    button
         .when(enabled, |d| {
             d.track_focus(focus).key_context("LibraryButton")
         })
@@ -79,28 +144,28 @@ fn control(
         )
 }
 
-/// Square checkbox drawn over thumbnails and in the selection bar.
-fn check_mark(t: &Theme, checked: bool, size: f32) -> Div {
-    div()
-        .flex_none()
-        .size(px(size))
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(px(5.))
-        .border_1()
-        .text_xs()
-        .font_weight(gpui::FontWeight::BOLD)
-        .text_color(t.colors.accent_foreground)
-        .map(|d| {
-            if checked {
-                d.border_color(t.colors.accent)
-                    .bg(t.colors.accent)
-                    .child("✓")
-            } else {
-                d.border_color(t.colors.border_strong).bg(t.colors.scrim)
-            }
+/// Approved checkbox icon drawn over thumbnails (`on_media`: white outline
+/// on a light scrim, readable on any frame in any theme) and in the selection
+/// bar (theme text colour).
+fn check_mark(t: &Theme, checked: bool, size: f32, on_media: bool, window: &Window) -> Div {
+    let unchecked = if on_media {
+        gpui::white()
+    } else {
+        t.colors.text_secondary
+    };
+    crate::components::raster_checkbox(t, checked, px(size), unchecked, window)
+        .when(on_media && !checked, |d| {
+            d.rounded(px(6.)).bg(t.colors.scrim)
         })
+}
+
+/// Icon of a card action: an approved raster icon, or the theme-aware icon
+/// font where no approved asset exists for the state (a filled star for
+/// "favorited"; the approved favourite icon is an outline only).
+#[derive(Clone, Copy)]
+enum CardIcon {
+    Raster(crate::components::RasterIcon),
+    Font(crate::components::Icon),
 }
 
 impl ClipLibrary {
@@ -186,10 +251,15 @@ impl ClipLibrary {
             )
     }
 
-    fn view_toggle(&self, t: &Theme, cx: &mut Context<Self>) -> Div {
+    fn view_toggle(&self, t: &Theme, window: &Window, cx: &mut Context<Self>) -> Div {
         let current = self.settings.view;
-        let item = |slot: usize, view: LibraryView, glyph: &'static str, hint: &'static str| {
+        let item = |slot: usize, view: LibraryView, glyph: RasterIcon, hint: &'static str| {
             let active = current == view;
+            let color = if active {
+                t.colors.accent_foreground
+            } else {
+                t.colors.text_secondary
+            };
             div()
                 .id(("library-view", slot))
                 .size(t.metrics.control_height)
@@ -212,7 +282,12 @@ impl ClipLibrary {
                 .track_focus(&self.controls[slot])
                 .key_context("LibraryButton")
                 .focus(|s| s.border_color(t.colors.focus_ring))
-                .child(glyph)
+                .child(crate::components::raster_icon(
+                    glyph,
+                    px(18.),
+                    color,
+                    window,
+                ))
         };
         let switch = |view: LibraryView| {
             move |this: &mut ClipLibrary, _: &mut Window, cx: &mut Context<ClipLibrary>| {
@@ -232,7 +307,7 @@ impl ClipLibrary {
             .rounded_lg()
             .bg(t.colors.surface)
             .child(
-                item(1, LibraryView::Grid, "▦", "Grid view")
+                item(1, LibraryView::Grid, RasterIcon::GridView, "Grid view")
                     .on_click(cx.listener(move |this, _, w, cx| grid(this, w, cx)))
                     .on_action(
                         cx.listener(move |this, _: &crate::components::Activate, w, cx| {
@@ -241,7 +316,7 @@ impl ClipLibrary {
                     ),
             )
             .child(
-                item(3, LibraryView::List, "☰", "List view")
+                item(3, LibraryView::List, RasterIcon::ListView, "List view")
                     .on_click(cx.listener(move |this, _, w, cx| list(this, w, cx)))
                     .on_action(
                         cx.listener(move |this, _: &crate::components::Activate, w, cx| {
@@ -292,7 +367,7 @@ impl Render for ClipLibrary {
             .child(search)
             .child(self.menu_control(&t, Menu::Source, window, cx))
             .child(self.menu_control(&t, Menu::Sort, window, cx))
-            .child(self.view_toggle(&t, cx))
+            .child(self.view_toggle(&t, window, cx))
             // Only needed when Windows cannot watch the folder for changes.
             .when(self.watcher.is_none(), |d| {
                 d.child(control(
@@ -571,7 +646,7 @@ impl Render for ClipLibrary {
                 } else {
                     "Select all (Ctrl+A)"
                 }))
-                .child(check_mark(&t, all_selected, 22.))
+                .child(check_mark(&t, all_selected, 22., false, window))
                 .child(div().text_sm().text_color(t.colors.text_secondary).child(
                     if selected == 0 {
                         "No clips selected".to_owned()
@@ -643,23 +718,31 @@ impl Render for ClipLibrary {
             .child(select_all)
             .child(div().flex_1())
             .children(pager)
-            .child(control(
+            .child(icon_control(
                 &t,
                 10,
-                "✕  Delete",
+                control_icon(&t, RasterIcon::Delete, ButtonVariant::Secondary, window),
+                "Delete",
                 enabled && selected > 0,
                 ButtonVariant::Secondary,
                 &self.controls[10],
                 cx,
                 |this, _, cx| this.confirm_delete(cx),
             ))
-            .child(control(
+            .child(icon_control(
                 &t,
                 7,
                 if all_favorite {
-                    "★  Unfavorite"
+                    // No approved filled star: keep the theme-aware icon font.
+                    crate::components::icon(crate::components::Icon::StarFilled, px(16.))
+                        .into_any_element()
                 } else {
-                    "☆  Favorite"
+                    control_icon(&t, RasterIcon::Favorite, ButtonVariant::Secondary, window)
+                },
+                if all_favorite {
+                    "Unfavorite"
+                } else {
+                    "Favorite"
                 },
                 enabled && selected > 0,
                 ButtonVariant::Secondary,
@@ -667,20 +750,22 @@ impl Render for ClipLibrary {
                 cx,
                 |this, window, cx| this.favorite(window, cx),
             ))
-            .child(control(
+            .child(icon_control(
                 &t,
                 8,
-                "↗  Open Folder",
+                control_icon(&t, RasterIcon::OpenFolder, ButtonVariant::Secondary, window),
+                "Open Folder",
                 enabled && selected == 1,
                 ButtonVariant::Secondary,
                 &self.controls[8],
                 cx,
                 |this, _, cx| this.folder(cx),
             ))
-            .child(control(
+            .child(icon_control(
                 &t,
                 6,
-                "✂  Open in Editor",
+                control_icon(&t, RasterIcon::Edit, ButtonVariant::Primary, window),
+                "Open in Editor",
                 enabled && selected == 1,
                 ButtonVariant::Primary,
                 &self.controls[6],
@@ -782,16 +867,36 @@ impl ClipLibrary {
         t: &Theme,
         id: &str,
         slot: usize,
-        glyph: crate::components::Icon,
+        glyph: CardIcon,
         hint: &'static str,
         primary: bool,
+        window: &Window,
         cx: &mut Context<Self>,
         act: impl Fn(&mut ClipLibrary, &str, &mut Window, &mut Context<ClipLibrary>) + 'static,
     ) -> Stateful<Div> {
         let target = id.to_owned();
         let enabled = !self.busy;
+        let name = SharedString::from(format!("clip-action-{slot}-{id}"));
+        let size = px(16.);
+        let icon = match glyph {
+            CardIcon::Raster(icon) if primary => {
+                crate::components::raster_icon(icon, size, t.colors.accent_foreground, window)
+                    .into_any_element()
+            }
+            CardIcon::Raster(icon) => crate::components::raster_icon_hover(
+                icon,
+                size,
+                t.colors.text_secondary,
+                t.colors.text,
+                name.clone(),
+                window,
+            )
+            .into_any_element(),
+            CardIcon::Font(icon) => crate::components::icon(icon, size).into_any_element(),
+        };
         div()
-            .id(SharedString::from(format!("clip-action-{slot}-{id}")))
+            .id(name.clone())
+            .group(name)
             .flex_1()
             .h(px(30.))
             .flex()
@@ -815,7 +920,7 @@ impl ClipLibrary {
             })
             .when(enabled, |d| d.cursor_pointer())
             .when(!enabled, |d| d.opacity(0.45))
-            .child(crate::components::icon(glyph, px(16.)))
+            .child(icon)
             .on_click(cx.listener(move |this, _, window, cx| {
                 cx.stop_propagation();
                 if enabled {
@@ -854,7 +959,7 @@ impl ClipLibrary {
             .left(px(10.))
             .cursor_pointer()
             .tooltip(crate::components::tooltip("Select (Ctrl+click)"))
-            .child(check_mark(t, selected, 22.))
+            .child(check_mark(t, selected, 22., true, window))
             .on_click(cx.listener(move |this, _, window, cx| {
                 cx.stop_propagation();
                 if !this.busy {
@@ -904,8 +1009,10 @@ impl ClipLibrary {
             .children(badge);
 
         let date = relative_time(SystemTime::now(), clip.created.unwrap_or(clip.modified));
+        let more_group = SharedString::from(format!("clip-more-{id}"));
         let more = div()
-            .id(SharedString::from(format!("clip-more-{id}")))
+            .id(more_group.clone())
+            .group(more_group.clone())
             .flex_none()
             .px_1()
             .rounded_md()
@@ -913,9 +1020,13 @@ impl ClipLibrary {
             .text_color(t.colors.text_secondary)
             .hover(|s| s.bg(t.colors.surface_hover).text_color(t.colors.text))
             .tooltip(crate::components::tooltip("More actions"))
-            .child(crate::components::icon(
-                crate::components::Icon::More,
+            .child(crate::components::raster_icon_hover(
+                crate::components::RasterIcon::More,
                 px(16.),
+                t.colors.text_secondary,
+                t.colors.text,
+                more_group,
+                window,
             ))
             .on_mouse_down(
                 gpui::MouseButton::Left,
@@ -975,9 +1086,10 @@ impl ClipLibrary {
                 t,
                 &id,
                 0,
-                crate::components::Icon::Play,
+                CardIcon::Raster(crate::components::RasterIcon::Play),
                 "Play",
                 true,
+                window,
                 cx,
                 |this, id, _, cx| {
                     this.focus_clip(id);
@@ -988,9 +1100,10 @@ impl ClipLibrary {
                 t,
                 &id,
                 1,
-                crate::components::Icon::Cut,
+                CardIcon::Raster(crate::components::RasterIcon::Edit),
                 "Open in Editor",
                 false,
+                window,
                 cx,
                 |this, id, _, cx| {
                     this.focus_clip(id);
@@ -1002,9 +1115,9 @@ impl ClipLibrary {
                 &id,
                 2,
                 if favorite {
-                    crate::components::Icon::StarFilled
+                    CardIcon::Font(crate::components::Icon::StarFilled)
                 } else {
-                    crate::components::Icon::Star
+                    CardIcon::Raster(crate::components::RasterIcon::Favorite)
                 },
                 if favorite {
                     "Remove from favorites"
@@ -1012,6 +1125,7 @@ impl ClipLibrary {
                     "Add to favorites"
                 },
                 false,
+                window,
                 cx,
                 |this, id, window, cx| this.toggle_favorite(id, window, cx),
             ))
@@ -1019,9 +1133,10 @@ impl ClipLibrary {
                 t,
                 &id,
                 3,
-                crate::components::Icon::Delete,
+                CardIcon::Raster(crate::components::RasterIcon::Delete),
                 "Delete",
                 false,
+                window,
                 cx,
                 |this, id, _, cx| {
                     this.focus_clip(id);
@@ -1032,9 +1147,10 @@ impl ClipLibrary {
                 t,
                 &id,
                 4,
-                crate::components::Icon::FolderOpen,
+                CardIcon::Raster(crate::components::RasterIcon::OpenFolder),
                 "Show in folder",
                 false,
+                window,
                 cx,
                 |this, id, _, cx| {
                     this.focus_clip(id);

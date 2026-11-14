@@ -10,7 +10,7 @@ async-channel.workspace = true
 clipper-editor = { path = "../clipper-editor" }
 clipper-core.workspace = true
 clipper-media.workspace = true
-image.workspace = true
+image = { workspace = true, features = ["png"] }
 clipper-audio.workspace = true
 clipper-platform.workspace = true
 clipper-recorder.workspace = true

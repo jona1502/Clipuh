@@ -2,8 +2,7 @@
 
 use crate::{
     components::{
-        ButtonVariant, DropdownOption, TextInput, TextInputEvent, button, dropdown, empty_state,
-        panel,
+        ButtonVariant, DropdownOption, TextInput, TextInputEvent, button, empty_state, panel,
     },
     library_worker::{Event, LibraryWorker, Request},
     recent_clips::{RecentClip, RecentClips, relative_time, size_label},
@@ -143,6 +142,7 @@ impl ClipLibrary {
         let (watch_tx, watch_rx) = async_channel::bounded(1);
         let search = cx.new(|cx| {
             TextInput::new(cx)
+                .leading_icon(crate::components::RasterIcon::Search)
                 .placeholder("Search clips…")
                 .tab_index(20)
         });
@@ -398,9 +398,20 @@ impl ClipLibrary {
         let toggle = cx.entity().downgrade();
         let select = toggle.clone();
         let dismiss = toggle.clone();
+        let enabled = !self.busy && (menu == Menu::Sort || sources.len() > 1);
+        let icon = |icon, size: f32| {
+            crate::components::raster_icon(icon, px(size), t.colors.text_muted, window)
+                .into_any_element()
+        };
+        let decor = crate::components::Decor {
+            ghost: false,
+            leading: (menu == Menu::Source)
+                .then(|| icon(crate::components::RasterIcon::Filter, 16.)),
+            chevron: Some(icon(crate::components::RasterIcon::ChevronDown, 14.)),
+        };
         div()
             .w(px(if menu == Menu::Sort { 160. } else { 140. }))
-            .child(dropdown(
+            .child(crate::components::dropdown_decorated(
                 t,
                 ("library-menu", slot),
                 &options,
@@ -408,7 +419,8 @@ impl ClipLibrary {
                 highlighted,
                 &self.controls[slot],
                 self.controls[slot].is_focused(window),
-                !self.busy && (menu == Menu::Sort || sources.len() > 1),
+                enabled,
+                decor,
                 move |_, cx| {
                     toggle
                         .update(cx, |this, cx| {

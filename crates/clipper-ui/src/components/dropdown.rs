@@ -4,8 +4,8 @@ use std::{cell::Cell, rc::Rc};
 
 use gpui::prelude::*;
 use gpui::{
-    App, Bounds, Div, ElementId, FocusHandle, MouseButton, Pixels, SharedString, Stateful, Window,
-    anchored, canvas, deferred, div, px,
+    AnyElement, App, Bounds, Div, ElementId, FocusHandle, MouseButton, Pixels, SharedString,
+    Stateful, Window, anchored, canvas, deferred, div, px,
 };
 
 use super::{Icon, icon};
@@ -67,7 +67,7 @@ pub fn dropdown(
         focus,
         focused,
         enabled,
-        false,
+        Decor::default(),
         on_toggle,
         on_select,
         on_dismiss,
@@ -99,7 +99,52 @@ pub fn dropdown_ghost(
         focus,
         focused,
         enabled,
-        true,
+        Decor {
+            ghost: true,
+            ..Decor::default()
+        },
+        on_toggle,
+        on_select,
+        on_dismiss,
+    )
+}
+
+/// Optional trigger decoration: an icon before the value and a custom
+/// chevron (both default to the plain text trigger with the icon-font
+/// chevron).
+#[derive(Default)]
+pub struct Decor {
+    pub ghost: bool,
+    pub leading: Option<AnyElement>,
+    pub chevron: Option<AnyElement>,
+}
+
+/// [`dropdown`] with a decorated trigger (see [`Decor`]).
+#[allow(clippy::too_many_arguments)] // same API as `dropdown`
+pub fn dropdown_decorated(
+    t: &Theme,
+    id: impl Into<ElementId>,
+    options: &[DropdownOption],
+    selected: usize,
+    highlighted: Option<usize>,
+    focus: &FocusHandle,
+    focused: bool,
+    enabled: bool,
+    decor: Decor,
+    on_toggle: impl Fn(&mut Window, &mut App) + 'static,
+    on_select: impl Fn(usize, &mut Window, &mut App) + 'static,
+    on_dismiss: impl Fn(&mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
+    styled_dropdown(
+        t,
+        id,
+        options,
+        selected,
+        highlighted,
+        focus,
+        focused,
+        enabled,
+        decor,
         on_toggle,
         on_select,
         on_dismiss,
@@ -116,11 +161,16 @@ fn styled_dropdown(
     focus: &FocusHandle,
     focused: bool,
     enabled: bool,
-    ghost: bool,
+    decor: Decor,
     on_toggle: impl Fn(&mut Window, &mut App) + 'static,
     on_select: impl Fn(usize, &mut Window, &mut App) + 'static,
     on_dismiss: impl Fn(&mut Window, &mut App) + 'static,
 ) -> Stateful<Div> {
+    let Decor {
+        ghost,
+        leading,
+        chevron,
+    } = decor;
     let id: ElementId = id.into();
     let open = highlighted.is_some();
     let label = options
@@ -160,6 +210,9 @@ fn styled_dropdown(
                 .absolute()
                 .size_full(),
         )
+        .when_some(leading, |this, leading| {
+            this.gap_2().child(div().flex_none().child(leading))
+        })
         // Long labels (device names) truncate instead of spilling over
         // neighbouring controls; the full text is in the open menu.
         .child(
@@ -169,7 +222,12 @@ fn styled_dropdown(
                 .when(!ghost, |this| this.flex_1())
                 .child(label),
         )
-        .child(icon(Icon::ChevronDown, px(12.)).text_color(t.colors.text_muted))
+        .child(match chevron {
+            Some(chevron) => chevron,
+            None => icon(Icon::ChevronDown, px(12.))
+                .text_color(t.colors.text_muted)
+                .into_any_element(),
+        })
         .when(enabled, |this| {
             this.cursor_pointer()
                 .hover(|s| s.bg(t.colors.surface_hover))
