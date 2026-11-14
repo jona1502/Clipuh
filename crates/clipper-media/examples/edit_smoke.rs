@@ -7,7 +7,7 @@ fn main() {
     use std::time::{Duration, Instant};
 
     use clipper_media::player::{Player, PlayerEvent};
-    use clipper_media::trim;
+    use clipper_media::{exact, trim};
 
     let source = std::path::PathBuf::from(std::env::args().nth(1).expect("usage: <clip.mp4>"));
     let before = std::fs::read(&source).expect("read source");
@@ -89,22 +89,29 @@ fn main() {
     let (start, end) = (info.duration / 3, info.duration * 2 / 3);
     let destination = trim::export_path(&source, start, end);
     let began = Instant::now();
-    let outcome = trim::trim(
+    let quarter = info.duration / 4;
+    let ranges = [
+        (Duration::from_millis(150), quarter),
+        (quarter * 2 + Duration::from_millis(75), quarter * 3),
+    ];
+    let expected: Duration = ranges.iter().map(|(start, end)| *end - *start).sum();
+    let outcome = exact::export(
         &source,
         &destination,
-        start,
-        end,
+        &ranges,
         &mut |_| {},
         &std::sync::atomic::AtomicBool::new(false),
     )
-    .expect("trim");
+    .expect("exact segment export");
     println!(
-        "trim {start:?}..{end:?} -> {outcome:?} in {:?}",
+        "exact ranges {ranges:?} -> {outcome:?} in {:?}",
         began.elapsed()
     );
     let exported = trim::probe(&destination).expect("probe export");
     println!("export: {exported:?}");
     assert_eq!(exported.audio_tracks, info.audio_tracks);
+    assert_eq!(outcome.start, ranges[0].0);
+    assert!(exported.duration.abs_diff(expected) < Duration::from_millis(100));
     assert_eq!(
         std::fs::read(&source).expect("reread source"),
         before,

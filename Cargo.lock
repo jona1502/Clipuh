@@ -794,6 +794,7 @@ dependencies = [
  "async-channel 2.5.0",
  "clipper-audio",
  "clipper-core",
+ "clipper-editor",
  "clipper-media",
  "clipper-platform",
  "clipper-recorder",

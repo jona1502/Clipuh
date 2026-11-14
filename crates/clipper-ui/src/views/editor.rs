@@ -8,17 +8,19 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use clipper_editor::{EditSession, format_timestamp, parse_timestamp};
 use clipper_media::player::{Player, PlayerEvent, PlayerFrame};
 use clipper_media::trim::{self, TrimOutcome};
 use clipper_platform::windows::shell;
 use gpui::prelude::*;
 use gpui::{
-    Bounds, Context, Div, FocusHandle, FontWeight, MouseButton, ObjectFit, Pixels, RenderImage,
-    SharedString, Task, Window, actions, canvas, div, img, px, relative,
+    Bounds, Context, Div, Entity, EventEmitter, FocusHandle, FontWeight, MouseButton, ObjectFit,
+    Pixels, RenderImage, SharedString, Task, Window, actions, canvas, div, img, px, relative,
 };
 
-use crate::components::{ButtonVariant, button, empty_state, kbd, panel, shortcut};
-use crate::state::format_elapsed;
+use crate::components::{
+    ButtonVariant, TextInput, TextInputEvent, button, empty_state, kbd, panel, shortcut,
+};
 use crate::theme::{ActiveTheme, Theme};
 
 actions!(clip_editor, [TogglePlayback, SetIn, SetOut]);
@@ -26,7 +28,7 @@ actions!(clip_editor, [TogglePlayback, SetIn, SetOut]);
 pub(super) const CONTEXT: &str = "ClipEditor";
 /// Preview frames are decoded at most this wide; the preview never shows more.
 const PREVIEW_MAX_WIDTH: u32 = 1280;
-const PREVIEW_HEIGHT: f32 = 360.0;
+
 const CANCELLED: &str = "cancelled";
 /// Shortest selection the exporter accepts.
 const MIN_SELECTION: Duration = Duration::from_millis(100);
@@ -105,12 +107,65 @@ pub struct ClipEditor {
     export: Export,
     timeline: Rc<Cell<Bounds<Pixels>>>,
     scrubbing: bool,
+    edits: Option<EditSession>,
+    start_input: Entity<TextInput>,
+    end_input: Entity<TextInput>,
+    tab: usize,
+    zoom: f32,
+    dragging: Option<bool>,
+    drag_origin: Option<(Pixels, Trim)>,
+    thumbnails: Vec<Arc<RenderImage>>,
+    thumbnail_task: Option<Task<()>>,
+    audio_tracks: usize,
+    pending_seek: Option<Duration>,
+    media_duration: Option<Duration>,
+    pub(super) preview_fullscreen: bool,
+    fullscreen_before_preview: bool,
 }
+
+pub(super) enum EditorEvent {
+    Exported,
+    PreviewChanged,
+}
+impl EventEmitter<EditorEvent> for ClipEditor {}
 
 impl ClipEditor {
     pub fn new(path: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
         window.focus(&focus);
+        let start_input = cx.new(|cx| TextInput::new(cx).placeholder("00:00.000").tab_index(30));
+        let end_input = cx.new(|cx| TextInput::new(cx).placeholder("00:00.000").tab_index(31));
+        for (input, start) in [(&start_input, true), (&end_input, false)] {
+            cx.subscribe_in(
+                input,
+                window,
+                move |this, input, event, window, cx| match event {
+                    TextInputEvent::Submitted(text) => {
+                        let result = parse_timestamp(text).and_then(|at| {
+                            let trim = this.trim.ok_or("Select a segment first.")?;
+                            let (a, b) = if start {
+                                (at, trim.end)
+                            } else {
+                                (trim.start, at)
+                            };
+                            this.edits.as_mut().ok_or("Clip is loading.")?.trim(a, b)
+                        });
+                        if let Err(error) = result {
+                            input.update(cx, |input, cx| input.set_error(Some(error.into()), cx));
+                        } else {
+                            this.sync_trim(cx);
+                            window.focus(&this.focus);
+                        }
+                    }
+                    TextInputEvent::Dismissed => {
+                        this.sync_trim(cx);
+                        window.focus(&this.focus);
+                    }
+                    _ => {}
+                },
+            )
+            .detach();
+        }
         let mut this = Self {
             path,
             focus,
@@ -128,8 +183,46 @@ impl ClipEditor {
             export: Export::Idle,
             timeline: Rc::default(),
             scrubbing: false,
+            edits: None,
+            start_input,
+            end_input,
+            tab: 0,
+            zoom: 1.,
+            dragging: None,
+            drag_origin: None,
+            thumbnails: Vec::new(),
+            thumbnail_task: None,
+            audio_tracks: 0,
+            pending_seek: None,
+            media_duration: None,
+            preview_fullscreen: false,
+            fullscreen_before_preview: false,
         };
         this.resume(window, cx);
+        let path = this.path.clone();
+        cx.spawn(async move |this, cx| {
+            let info = cx.background_spawn(async move { trim::probe(&path) }).await;
+            let _ = this.update(cx, |this, cx| {
+                match info {
+                    Ok(info) => {
+                        this.audio_tracks = info.audio_tracks;
+                        this.media_duration = Some(info.duration);
+                        if let Some(duration) = this.duration {
+                            let duration = duration.min(info.duration);
+                            this.duration = Some(duration);
+                            this.edits.get_or_insert_with(|| EditSession::new(duration));
+                            this.sync_trim(cx);
+                        }
+                    }
+                    Err(error) => {
+                        this.error = Some(error.to_string());
+                        this.ready = false;
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
         this
     }
 
@@ -147,6 +240,46 @@ impl ClipEditor {
         self.player = Some(player);
         self.ready = false;
         self.error = None;
+        self.ended = false;
+        self.pending_seek = None;
+        if self.thumbnails.is_empty() && self.thumbnail_task.is_none() {
+            let frames = clipper_media::thumbnail::strip(&self.path, 12, 160);
+            self.thumbnail_task = Some(cx.spawn_in(window, async move |this, cx| {
+                while let Ok(frame) = frames.recv().await {
+                    let (_, frame) = match frame {
+                        Ok(frame) => frame,
+                        Err(error) => {
+                            let _ = this.update_in(cx, |this, _, cx| {
+                                this.notice = Some(
+                                    format!("Timeline thumbnails unavailable: {error}").into(),
+                                );
+                                cx.notify();
+                            });
+                            break;
+                        }
+                    };
+                    if this
+                        .update_in(cx, |this, _, cx| {
+                            if this.thumbnails.len() < 12 {
+                                let frame = Arc::new(PlayerFrame {
+                                    width: frame.width,
+                                    height: frame.height,
+                                    bgra: frame.bgra,
+                                    position: Duration::ZERO,
+                                });
+                                if let Some(image) = render_image(frame) {
+                                    this.thumbnails.push(image);
+                                }
+                                cx.notify();
+                            }
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }));
+        }
         self._player_events = Some(cx.spawn_in(window, async move |this, cx| {
             while let Ok(event) = events.recv().await {
                 if this
@@ -162,6 +295,7 @@ impl ClipEditor {
     /// Releases the decoder, audio output and preview frame; keeps trim state.
     pub fn suspend(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self._player_events = None;
+        self.thumbnail_task = None;
         release(self.player.take());
         self.ready = false;
         self.playing = false;
@@ -171,18 +305,68 @@ impl ClipEditor {
 
     /// Frees the preview image from the GPU atlas; call before dropping the editor.
     pub fn release_images(&mut self, window: &mut Window) {
+        for image in self.thumbnails.drain(..) {
+            let _ = window.drop_image(image);
+        }
         if let Some(image) = self.frame.take() {
             let _ = window.drop_image(image);
         }
     }
 
     fn on_player(&mut self, event: PlayerEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let at = match &event {
+            PlayerEvent::Frame(frame) => Some(frame.position),
+            PlayerEvent::Position(position) => Some(*position),
+            _ => None,
+        };
+        if self.ended && !self.playing && at.is_some() {
+            return;
+        }
+        if self.playing
+            && let Some(at) = at
+        {
+            if let Some(target) = self.pending_seek {
+                if at.abs_diff(target) > Duration::from_millis(200) {
+                    return;
+                }
+                self.pending_seek = None;
+            }
+            if let Some(edits) = &self.edits {
+                match playback_step(edits, at) {
+                    PlaybackStep::Continue => {}
+                    PlaybackStep::Seek(target) => {
+                        self.pending_seek = Some(target);
+                        if let Some(player) = &self.player {
+                            player.seek(target);
+                        }
+                        return;
+                    }
+                    PlaybackStep::End(end) => {
+                        if let Some(player) = &self.player {
+                            player.pause();
+                        }
+                        self.playing = false;
+                        self.ended = true;
+                        self.position = end;
+                        cx.notify();
+                        return;
+                    }
+                }
+            }
+        }
         match event {
             PlayerEvent::Loaded { duration, .. } => {
                 self.ready = true;
+                let duration = self
+                    .media_duration
+                    .map_or(duration, |actual| duration.min(actual));
                 self.duration = Some(duration);
+                if self.media_duration.is_some() && self.edits.is_none() {
+                    self.edits = Some(EditSession::new(duration));
+                }
                 let trim = self.trim.get_or_insert(Trim::full(duration));
                 trim.end = trim.end.min(duration);
+                self.sync_trim(cx);
                 // The player ignores commands until it has loaded; return to where we were.
                 if let Some(player) = &self.player
                     && self.position > Duration::ZERO
@@ -220,14 +404,37 @@ impl ClipEditor {
     }
 
     fn toggle_playback(&mut self, cx: &mut Context<Self>) {
+        if self.edits.as_ref().is_none_or(|e| e.segments().is_empty()) {
+            return;
+        }
         let Some(player) = self.player.as_ref().filter(|_| self.ready) else {
             return;
         };
         if self.playing {
+            self.pending_seek = None;
             player.pause();
         } else {
-            if self.ended {
-                player.seek(Duration::ZERO);
+            if let Some(edits) = &self.edits {
+                let start = if self.ended {
+                    edits.segments().first().map(|s| s.start)
+                } else if edits
+                    .segments()
+                    .iter()
+                    .any(|s| self.position >= s.start && self.position < s.end)
+                {
+                    None
+                } else {
+                    edits
+                        .segments()
+                        .iter()
+                        .find(|s| s.start > self.position)
+                        .or_else(|| edits.segments().first())
+                        .map(|s| s.start)
+                };
+                if let Some(start) = start {
+                    self.pending_seek = Some(start);
+                    player.seek(start);
+                }
             }
             player.play();
         }
@@ -243,6 +450,7 @@ impl ClipEditor {
             return;
         };
         let position = position.min(duration);
+        self.pending_seek = self.playing.then_some(position);
         player.seek(position);
         self.position = position;
         self.ended = false;
@@ -269,10 +477,19 @@ impl ClipEditor {
     }
 
     fn reset_trim(&mut self, cx: &mut Context<Self>) {
-        self.edit_trim(cx, |trim, duration| {
-            *trim = Trim::full(duration);
-            Ok(())
-        });
+        if let Some(edits) = &mut self.edits
+            && let Some(i) = edits.selected()
+        {
+            let start = i
+                .checked_sub(1)
+                .map_or(Duration::ZERO, |i| edits.segments()[i].end);
+            let end = edits
+                .segments()
+                .get(i + 1)
+                .map_or(edits.source_duration(), |s| s.start);
+            self.notice = edits.trim(start, end).err().map(Into::into);
+        }
+        self.sync_trim(cx);
     }
 
     fn edit_trim(
@@ -283,17 +500,34 @@ impl ClipEditor {
         let (Some(trim), Some(duration)) = (self.trim.as_mut(), self.duration) else {
             return;
         };
-        self.notice = edit(trim, duration).err().map(SharedString::from);
-        cx.notify();
+        let mut candidate = *trim;
+        let result = edit(&mut candidate, duration).and_then(|()| {
+            self.edits
+                .as_mut()
+                .ok_or("Clip is loading.")?
+                .trim(candidate.start, candidate.end)
+        });
+        self.notice = result.err().map(SharedString::from);
+        self.sync_trim(cx);
     }
 
-    fn export(&mut self, cx: &mut Context<Self>) {
+    fn export_to(&mut self, destination: PathBuf, cx: &mut Context<Self>) {
         if matches!(self.export, Export::Running { .. }) {
             return;
         }
-        let Some(trim) = self.trim else { return };
+        let ranges = self.edits.as_ref().map(|e| e.ranges()).unwrap_or_default();
+        if ranges.is_empty() {
+            return;
+        }
+        if !destination
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("mp4"))
+        {
+            self.notice = Some("Choose an .mp4 output file.".into());
+            cx.notify();
+            return;
+        }
         let source = self.path.clone();
-        let destination = trim::export_path(&source, trim.start, trim.end);
         let cancel = Arc::new(AtomicBool::new(false));
         let (sender, receiver) = async_channel::bounded(4);
         let thread_cancel = cancel.clone();
@@ -305,11 +539,10 @@ impl ClipEditor {
                     // Dropped when the UI is behind; the next update catches up.
                     let _ = progress_sender.try_send(ExportMessage::Progress(value));
                 };
-                let result = trim::trim(
+                let result = clipper_media::exact::export(
                     &source,
                     &destination,
-                    trim.start,
-                    trim.end,
+                    &ranges,
                     &mut progress,
                     &thread_cancel,
                 )
@@ -334,7 +567,10 @@ impl ClipEditor {
                                 *progress = value;
                             }
                         }
-                        ExportMessage::Finished(Ok(outcome)) => this.export = Export::Done(outcome),
+                        ExportMessage::Finished(Ok(outcome)) => {
+                            this.export = Export::Done(outcome);
+                            cx.emit(EditorEvent::Exported);
+                        }
                         ExportMessage::Finished(Err(message)) if message == CANCELLED => {
                             this.export = Export::Idle
                         }
@@ -402,6 +638,24 @@ fn render_image(frame: Arc<PlayerFrame>) -> Option<Arc<RenderImage>> {
     Some(Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])))
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum PlaybackStep {
+    Continue,
+    Seek(Duration),
+    End(Duration),
+}
+
+/// Uses source timestamps from the player; removed source spans never create a second clock.
+fn playback_step(edits: &EditSession, at: Duration) -> PlaybackStep {
+    if edits.segments().iter().any(|s| at >= s.start && at < s.end) {
+        PlaybackStep::Continue
+    } else if let Some(next) = edits.segments().iter().find(|s| s.start > at) {
+        PlaybackStep::Seek(next.start)
+    } else {
+        PlaybackStep::End(edits.segments().last().map_or(Duration::ZERO, |s| s.end))
+    }
+}
+
 fn position_fraction(x: Pixels, bounds: Bounds<Pixels>) -> f32 {
     let width = f32::from(bounds.size.width);
     if width <= 0.0 {
@@ -438,311 +692,8 @@ pub(super) fn empty(t: &Theme) -> Div {
     ))
 }
 
-impl Render for ClipEditor {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let t = *cx.theme();
-        let loaded = self.ready;
-        let duration = self.duration.unwrap_or_default();
-        let exporting = matches!(self.export, Export::Running { .. });
-
-        let header = div()
-            .flex()
-            .items_center()
-            .gap_3()
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_sm()
-                    .font_weight(FontWeight::MEDIUM)
-                    .child(file_name(&self.path)),
-            )
-            .child(
-                button(
-                    &t,
-                    "editor-export",
-                    "Export Selection",
-                    ButtonVariant::Primary,
-                    None,
-                    loaded && !exporting,
-                )
-                .when(loaded && !exporting, |this| {
-                    this.on_click(cx.listener(|this, _, _, cx| this.export(cx)))
-                }),
-            );
-
-        let preview = div()
-            .id("editor-preview")
-            .relative()
-            .w_full()
-            .h(px(PREVIEW_HEIGHT))
-            .rounded_lg()
-            .overflow_hidden()
-            .bg(t.colors.media_background)
-            .flex()
-            .items_center()
-            .justify_center()
-            .when(loaded, |this| {
-                this.cursor_pointer()
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_playback(cx)))
-            })
-            .map(|this| match (&self.error, &self.frame) {
-                (Some(error), _) => this.child(
-                    div()
-                        .max_w(px(420.))
-                        .text_sm()
-                        .text_center()
-                        .text_color(t.colors.danger)
-                        .child(error.clone()),
-                ),
-                (None, Some(frame)) => this.child(
-                    img(frame.clone())
-                        .size_full()
-                        .object_fit(ObjectFit::Contain),
-                ),
-                (None, None) => this.child(muted(&t).child("Loading clip…")),
-            });
-
-        let play_label = if self.playing { "Pause" } else { "Play" };
-        let controls = div()
-            .flex()
-            .items_center()
-            .gap_3()
-            .child(
-                button(
-                    &t,
-                    "editor-play",
-                    play_label,
-                    ButtonVariant::Secondary,
-                    Some(&["Space"]),
-                    loaded,
-                )
-                .when(loaded, |this| {
-                    this.on_click(cx.listener(|this, _, _, cx| this.toggle_playback(cx)))
-                }),
-            )
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(t.colors.text_secondary)
-                    .child(format!(
-                        "{} / {}",
-                        format_elapsed(self.position),
-                        if loaded {
-                            format_elapsed(duration)
-                        } else {
-                            "--:--".into()
-                        }
-                    )),
-            );
-
-        let timeline = self.timeline(duration, loaded, cx);
-
-        let trim = self.trim.unwrap_or(Trim::full(duration));
-        let value = |label: &'static str, text: String| {
-            div()
-                .flex()
-                .items_baseline()
-                .gap_2()
-                .child(muted(&t).child(label))
-                .child(div().text_sm().child(text))
-        };
-        let trim_row = div()
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .gap_x_6()
-            .gap_y_3()
-            .child(value("Trim start", format_elapsed(trim.start)))
-            .child(value("Trim end", format_elapsed(trim.end)))
-            .child(value("Length", format_elapsed(trim.end - trim.start)))
-            .child(div().flex_1())
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .child(
-                        button(
-                            &t,
-                            "editor-in",
-                            "Set In",
-                            ButtonVariant::Secondary,
-                            Some(&["I"]),
-                            loaded,
-                        )
-                        .when(loaded, |this| {
-                            this.on_click(cx.listener(|this, _, _, cx| this.set_in(cx)))
-                        }),
-                    )
-                    .child(
-                        button(
-                            &t,
-                            "editor-out",
-                            "Set Out",
-                            ButtonVariant::Secondary,
-                            Some(&["O"]),
-                            loaded,
-                        )
-                        .when(loaded, |this| {
-                            this.on_click(cx.listener(|this, _, _, cx| this.set_out(cx)))
-                        }),
-                    )
-                    .child({
-                        let enabled = loaded && !trim.is_full(duration);
-                        button(
-                            &t,
-                            "editor-reset",
-                            "Reset Trim",
-                            ButtonVariant::Ghost,
-                            None,
-                            enabled,
-                        )
-                        .when(enabled, |this| {
-                            this.on_click(cx.listener(|this, _, _, cx| this.reset_trim(cx)))
-                        })
-                    }),
-            );
-
-        div()
-            .id("clip-editor")
-            .key_context(CONTEXT)
-            .track_focus(&self.focus)
-            .on_action(cx.listener(|this, _: &TogglePlayback, _, cx| this.toggle_playback(cx)))
-            .on_action(cx.listener(|this, _: &SetIn, _, cx| this.set_in(cx)))
-            .on_action(cx.listener(|this, _: &SetOut, _, cx| this.set_out(cx)))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, window, _| window.focus(&this.focus)),
-            )
-            .flex()
-            .flex_col()
-            .gap_4()
-            .child(header)
-            .child(
-                panel(&t)
-                    .p_3()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .child(preview)
-                    .child(controls),
-            )
-            .child(
-                panel(&t)
-                    .p_3()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .child(timeline)
-                    .child(trim_row),
-            )
-            .children(self.notice.clone().map(|notice| {
-                div()
-                    .px_1()
-                    .text_xs()
-                    .text_color(t.colors.warning)
-                    .child(notice)
-            }))
-            .children(self.export_status(cx))
-    }
-}
-
+mod presentation;
 impl ClipEditor {
-    fn timeline(&self, duration: Duration, loaded: bool, cx: &mut Context<Self>) -> Div {
-        let t = *cx.theme();
-        let trim = self.trim.unwrap_or(Trim::full(duration));
-        let (start, end) = (fraction(trim.start, duration), fraction(trim.end, duration));
-        let head = fraction(self.position, duration);
-        let bounds_out = self.timeline.clone();
-        let marker = |at: f32, label: &'static str| {
-            div()
-                .absolute()
-                .top_0()
-                .bottom_0()
-                .left(relative(at))
-                .w(px(2.))
-                .bg(t.colors.accent)
-                .child(
-                    div()
-                        .absolute()
-                        .bottom(px(-16.))
-                        .text_size(px(10.))
-                        .text_color(t.colors.text_muted)
-                        .child(label),
-                )
-        };
-        let track = div()
-            .id("editor-timeline")
-            .relative()
-            .flex_1()
-            .h(px(36.))
-            .mb_4()
-            .rounded_md()
-            .bg(t.colors.surface_raised)
-            .border_1()
-            .border_color(t.colors.border)
-            .child(
-                canvas(move |bounds, _, _| bounds_out.set(bounds), |_, _, _, _| {})
-                    .absolute()
-                    .size_full(),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .bottom_0()
-                    .left(relative(start))
-                    .w(relative(end - start))
-                    .bg(t.colors.accent_subtle),
-            )
-            .child(marker(start, "IN"))
-            .child(marker(end, "OUT"))
-            .child(
-                div()
-                    .absolute()
-                    .top(px(-3.))
-                    .bottom(px(-3.))
-                    .left(relative(head))
-                    .w(px(2.))
-                    .rounded_full()
-                    .bg(t.colors.text),
-            )
-            .when(loaded, |this| {
-                this.cursor_pointer()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
-                            this.scrubbing = true;
-                            this.seek_to_x(event.position.x, cx);
-                        }),
-                    )
-                    .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
-                        if this.scrubbing && event.pressed_button == Some(MouseButton::Left) {
-                            this.seek_to_x(event.position.x, cx);
-                        } else {
-                            this.scrubbing = false;
-                        }
-                    }))
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, _| this.scrubbing = false),
-                    )
-            });
-
-        div()
-            .flex()
-            .items_start()
-            .gap_3()
-            .child(muted(&t).pt_2().child(format_elapsed(self.position)))
-            .child(track)
-            .child(muted(&t).pt_2().child(if loaded {
-                format_elapsed(duration)
-            } else {
-                "--:--".into()
-            }))
-    }
-
     fn export_status(&self, cx: &mut Context<Self>) -> Option<Div> {
         let t = *cx.theme();
         let line = div()
@@ -754,9 +705,9 @@ impl ClipEditor {
             .text_color(t.colors.text_secondary);
         match &self.export {
             Export::Idle => Some(
-                line.child(muted(&t).child(
-                    "Exports a new MP4 next to the original. The original stays unchanged.",
-                ))
+                line.child(
+                    muted(&t).child("Choose an MP4 destination. Exact cuts preserve the original."),
+                )
                 .child(div().flex_1())
                 .child(shortcut(&t, &["Space"]))
                 .child(muted(&t).child("Play"))
@@ -804,19 +755,11 @@ impl ClipEditor {
                             .truncate()
                             .text_color(t.colors.success)
                             .child(format!(
-                                "Exported {} ({}){}",
+                                "Exported {} ({})",
                                 file_name(&outcome.path),
-                                format_elapsed(outcome.duration),
-                                // Stream copy starts on a keyframe; say so when it moved.
-                                match self.trim {
-                                    Some(trim) if outcome.start + MIN_SELECTION < trim.start => {
-                                        format!(
-                                            " · starts at {}, the nearest keyframe",
-                                            format_elapsed(outcome.start)
-                                        )
-                                    }
-                                    _ => String::new(),
-                                }
+                                format_timestamp(outcome.duration),
+                                // Previous behavior: Stream copy starts on a keyframe; say so when it moved.
+                                // Exact export now reports length without keyframe diagnostics.
                             )),
                     )
                     .child(
@@ -910,5 +853,50 @@ mod tests {
         assert_eq!(position_fraction(px(50.), bounds), 0.0);
         assert_eq!(fraction(secs(15.0), secs(60.0)), 0.25);
         assert_eq!(fraction(secs(1.0), Duration::ZERO), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod playback_tests {
+    use super::*;
+    #[test]
+    fn source_timeline_skips_deleted_ranges_and_stops_at_edited_end() {
+        let mut edits = EditSession::new(Duration::from_secs(10));
+        edits.split(Duration::from_secs(4)).unwrap();
+        edits.select(0);
+        edits.delete_selected();
+        assert_eq!(
+            playback_step(&edits, Duration::from_secs(2)),
+            PlaybackStep::Seek(Duration::from_secs(4))
+        );
+        assert_eq!(
+            playback_step(&edits, Duration::from_secs(5)),
+            PlaybackStep::Continue
+        );
+        edits
+            .trim(Duration::from_secs(6), Duration::from_secs(8))
+            .unwrap();
+        assert_eq!(
+            playback_step(&edits, Duration::from_secs(5)),
+            PlaybackStep::Seek(Duration::from_secs(6))
+        );
+        assert_eq!(
+            playback_step(&edits, Duration::from_secs(8)),
+            PlaybackStep::End(Duration::from_secs(8))
+        );
+        edits.delete_selected();
+        assert_eq!(
+            playback_step(&edits, Duration::from_secs(2)),
+            PlaybackStep::End(Duration::ZERO)
+        );
+    }
+    #[test]
+    fn scrolled_zoom_bounds_share_source_time_mapping() {
+        let bounds = Bounds::new(
+            gpui::point(px(-100.), px(0.)),
+            gpui::size(px(1000.), px(52.)),
+        );
+        assert_eq!(position_fraction(px(150.), bounds), 0.25);
+        assert_eq!(position_fraction(px(900.), bounds), 1.);
     }
 }

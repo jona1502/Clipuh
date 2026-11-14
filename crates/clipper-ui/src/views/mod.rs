@@ -571,7 +571,22 @@ impl ClipperWindow {
             if let Some(old) = self.editor.take() {
                 old.update(cx, |old, _| old.release_images(window));
             }
-            self.editor = Some(cx.new(|cx| editor::ClipEditor::new(path, window, cx)));
+            let editor = cx.new(|cx| editor::ClipEditor::new(path, window, cx));
+            cx.subscribe_in(
+                &editor,
+                window,
+                |this, _, event: &editor::EditorEvent, window, cx| {
+                    if matches!(event, editor::EditorEvent::PreviewChanged) {
+                        cx.notify();
+                        return;
+                    }
+                    this.library.update(cx, |library, cx| library.refresh(cx));
+                    this.refresh_recent_clips(window, cx);
+                    this.refresh_storage(cx);
+                },
+            )
+            .detach();
+            self.editor = Some(editor);
         }
         self.navigate(Page::Editor, window, cx);
     }
@@ -805,7 +820,19 @@ impl ClipperWindow {
             Page::Clips => div().h_full().child(self.library.clone()),
             Page::Editor => match &self.editor {
                 Some(editor) => div().child(editor.clone()),
-                None => editor::empty(cx.theme()),
+                None => editor::empty(cx.theme()).child(
+                    crate::components::button(
+                        cx.theme(),
+                        "editor-open-library",
+                        "Open Library",
+                        crate::components::ButtonVariant::Primary,
+                        None,
+                        true,
+                    )
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.navigate(Page::Clips, window, cx)),
+                    ),
+                ),
             },
             Page::Settings => settings::content(self, window, cx),
         }
@@ -994,6 +1021,15 @@ fn hint(t: &Theme, keys: &[&'static str], label: &'static str) -> Div {
 
 impl Render for ClipperWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.active_page == Page::Editor
+            && let Some(editor) = &self.editor
+            && editor.read(cx).preview_fullscreen
+        {
+            return div()
+                .id("clipper-fullscreen-preview")
+                .size_full()
+                .child(editor.clone());
+        }
         let full_height = matches!(self.active_page, Page::Clips | Page::Settings);
         let t = *cx.theme();
         self.snapshot_audio_focus(window);
@@ -1070,9 +1106,11 @@ impl Render for ClipperWindow {
                                     .when(self.active_page == Page::Settings, |d| {
                                         d.max_w(px(1440.)).mx_auto()
                                     })
-                                    .when(!full_height, |d| d.max_w(px(960.)).mx_auto())
-                                    .px_8()
-                                    .py_6()
+                                    .when(!full_height && self.active_page != Page::Editor, |d| {
+                                        d.max_w(px(960.)).mx_auto()
+                                    })
+                                    .when(self.active_page == Page::Editor, |d| d.p_3())
+                                    .when(self.active_page != Page::Editor, |d| d.px_8().py_6())
                                     .child(self.page_content(window, cx)),
                             ),
                     ),
