@@ -1,0 +1,44 @@
+---
+interface Props {
+  /** Visible honesty label. Keep it visible; never hide it. */
+  label?: string;
+  /** Optional title next to the label. */
+  title?: string;
+  /** CSS length reserved for the demo body (avoids layout shift). */
+  minHeight?: string;
+  /** Override from `lg` up (two-column layout); defaults to `minHeight`. */
+  minHeightLg?: string;
+  class?: string;
+}
+
+const {
+  label = "Interactive demo",
+  title,
+  minHeight = "20rem",
+  minHeightLg = minHeight,
+  class: className,
+} = Astro.props;
+---
+
+<figure
+  class:list={[
+    "border-border bg-surface shadow-md m-0 w-full overflow-hidden rounded-xl border",
+    className,
+  ]}
+>
+  <figcaption class="border-border flex flex-wrap items-center gap-x-3 gap-y-1 border-b px-4 py-2.5">
+    <span
+      class="text-caption bg-surface-raised text-text-secondary rounded-sm px-2 py-0.5 font-semibold tracking-wide uppercase"
+      data-demo-label
+    >
+      {label}
+    </span>
+    {title && <span class="text-small text-text-secondary">{title}</span>}
+  </figcaption>
+  <div
+    class="min-h-(--demo-min) lg:min-h-(--demo-min-lg) relative"
+    style={`--demo-min:${minHeight};--demo-min-lg:${minHeightLg}`}
+  >
+    <slot />
+  </div>
+</figure>

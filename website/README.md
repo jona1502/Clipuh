@@ -32,6 +32,8 @@ website/
 ├── src/
 │   ├── components/
 │   │   ├── ui/             Button, Container, SectionHeading
+│   │   ├── feature/        FeatureSection, DemoFrame, BentoCard, StatusBadge, status.ts
+│   │   ├── showcase/       homepage showcase sections (Replay, Mixer, Editor, ...)
 │   │   └── interactive/    React islands (.tsx)
 │   ├── data/               site constants and content data
 │   ├── layouts/            page shells (BaseLayout.astro)
@@ -67,10 +69,10 @@ Planned routes: `/features`, `/showcase`, `/download`, `/changelog`, `/docs`, `/
 - Set `site` in `astro.config.mjs` once the production domain is known
   (enables canonical URLs and later a sitemap).
 
-`IntegrationCheck.tsx` only proves the React integration works and is not used
-on any page; replace it with the first real island. Because it is
-unreferenced, visitors download no JavaScript, but `dist/` still contains an
-unused React client chunk. That is expected until the first island lands.
+Islands live in `src/components/interactive/`: `ReplayDemo`, `MixerDemo`,
+`EditorDemo` (with `editor/`), mounted with `client:visible`. The React runtime
+loads when the first demo scrolls into view (about 66 KB gzip); the rest of the
+page ships no JavaScript.
 
 ## Design system
 
@@ -156,3 +158,41 @@ All accept `class` and pass remaining attributes to the root element.
 - `Container`: `size?: "page" | "narrow"`, `as?: HTMLTag` (div). Padding 16/24/32px.
 - `SectionHeading`: `title`, `eyebrow?`, `description?`, `level?: 1 | 2 | 3` (2),
   `align?: "left" | "center"` (left).
+
+## W2 feature components
+
+Zero-JS Astro primitives in `src/components/feature/`; copy comes from
+`src/data/features.ts` (`FeatureCopy`).
+
+```astro
+<FeatureSection id={replay.id} copy={replay} reverse>
+  <DemoFrame slot="demo" title="Replay buffer" minHeight="22rem">
+    <ReplayDemo client:visible />
+  </DemoFrame>
+</FeatureSection>
+<BentoCard title="..." description="..." status="planned" size="wide" />
+```
+
+- `FeatureSection`: `id`, `copy`, `reverse?`, `class?`; named slot `demo`.
+  Text first on mobile; demo beside text from `lg`. Top divider, `py-section`.
+- `StatusBadge`: `status` ("in-development" | "planned"), `class?`. Classes come
+  from `feature/status.ts` (`statusBadgeClass`), shared with the React demos.
+  Status rules live in `src/data/features.ts`: "planned" = not implemented in
+  the app; nothing is "released" (no public build).
+- `DemoFrame`: `label?` (default "Interactive demo"; used as "Interactive demo ·
+  nothing is recorded", "... · no audio is captured", "... · sample timeline",
+  "Architecture overview"), `title?`, `minHeight?` (default `20rem`) and
+  `minHeightLg?` (from `lg`), both prevent layout shift, default slot.
+- `BentoCard`: `title`, `description`, `status`, `size?: "wide" | "regular"`;
+  non-interactive `<article>`, default slot for extra content.
+- Islands: mount with `client:visible`; use `useReducedMotion()` from
+  `interactive/shared/useReducedMotion.ts` (no autoplay or looping when true).
+- Shared classes in `global.css` ("W2 demo + reveal" block): `.demo-toggle`
+  (use `aria-pressed`), `.demo-slider` (native range, optional inline
+  `--demo-fill`), `.reveal` (scroll reveal, CSS only via
+  `animation-timeline: view()`; no-op without support or under reduced motion,
+  so content is never hidden; no script needed).
+
+Honesty rules: every demo is visibly labelled (`DemoFrame` label) and is not a
+real capture; every feature shows its status badge; `planned` features are never
+presented as available; no performance numbers unless measured and sourced.

@@ -1,0 +1,99 @@
+---
+import Container from "@/components/ui/Container.astro";
+import SectionHeading from "@/components/ui/SectionHeading.astro";
+import BentoCard from "@/components/feature/BentoCard.astro";
+import { featureIds, moreFeatures } from "@/data/features";
+
+// Accent presets mirror ACCENT_PRESETS in crates/clipper-storage/src/config.rs.
+// Data only; keep in sync with that list.
+const swatches = [
+  { name: "Purple", hex: "#9B5CF6" },
+  { name: "Blue", hex: "#3B82F6" },
+  { name: "Cyan", hex: "#06B6D4" },
+  { name: "Green", hex: "#22C55E" },
+  { name: "Orange", hex: "#F97316" },
+  { name: "Pink", hex: "#EC4899" },
+  { name: "Red", hex: "#EF4444" },
+];
+const durations = ["15 s", "30 s", "1 min", "2 min", "5 min"];
+const kbd =
+  "border-border-hover bg-surface-raised text-text-secondary text-small inline-flex min-w-8 items-center justify-center rounded-md border border-b-2 px-1.5 py-1 font-mono";
+const chip =
+  "border-border text-caption text-text-secondary rounded-full border px-2.5 py-1";
+const chipOn = "bg-accent-subtle text-text border-transparent";
+const pane =
+  "border-border bg-surface-raised text-caption text-text-secondary rounded-md border px-3 py-2";
+---
+
+<section
+  id={featureIds.more}
+  aria-labelledby={`${featureIds.more}-title`}
+  class="border-border/60 py-section border-t"
+>
+  <Container>
+    <SectionHeading
+      id={`${featureIds.more}-title`}
+      eyebrow={moreFeatures.eyebrow}
+      title={moreFeatures.title}
+    />
+    <!-- 1 col <md; 2 cols md (wide = full row); 4 cols lg (wide = 2). Dense flow
+         fills gaps: the 8 column units divide evenly, so no holes. -->
+    <div class="mt-10 grid grid-flow-dense gap-4 md:grid-cols-[repeat(2,minmax(0,1fr))] lg:grid-cols-[repeat(4,minmax(0,1fr))]">
+      {moreFeatures.items.map((item) => (
+        <BentoCard {...item}>
+          <div class="mt-auto pt-3" aria-hidden="true">
+            {item.title === "Customizable hotkeys" && (
+              <div class="flex flex-nowrap items-center gap-1">
+                <kbd class={kbd}>Ctrl</kbd>
+                <span class="text-text-muted">+</span>
+                <kbd class={kbd}>Shift</kbd>
+                <span class="text-text-muted">+</span>
+                <kbd class={kbd}>F10</kbd>
+              </div>
+            )}
+            {item.title === "Clip library" && (
+              <div class="grid grid-cols-3 gap-2">
+                {[0, 1, 2].map(() => (
+                  <div class="border-border bg-surface-raised rounded-md border p-2">
+                    <div class="bg-background-elevated aspect-video rounded-sm" />
+                    <div class="bg-border mt-2 h-1.5 w-2/3 rounded-sm" />
+                  </div>
+                ))}
+              </div>
+            )}
+            {item.title === "Resolution and FPS" && (
+              <div class="flex flex-wrap gap-2">
+                <span class={`${chip} ${chipOn}`}>1080p · 60 fps</span>
+                <span class={chip}>Quality preset</span>
+              </div>
+            )}
+            {item.title === "Themes" && (
+              <ul class="flex flex-wrap gap-2">
+                {swatches.map((s) => (
+                  <li
+                    class="size-6 rounded-full border border-border-hover"
+                    style={`background:${s.hex}`}
+                    title={s.name}
+                  />
+                ))}
+              </ul>
+            )}
+            {item.title === "Replay length" && (
+              <ul class="flex flex-wrap gap-2">
+                {durations.map((d, i) => (
+                  <li class:list={[chip, i === 2 && chipOn]}>{d}</li>
+                ))}
+              </ul>
+            )}
+            {item.title === "Source selection" && (
+              <div class="grid grid-cols-2 gap-2">
+                <div class={pane}>Monitor</div>
+                <div class={pane}>Window</div>
+              </div>
+            )}
+          </div>
+        </BentoCard>
+      ))}
+    </div>
+  </Container>
+</section>

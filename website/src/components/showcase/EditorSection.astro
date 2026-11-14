@@ -1,0 +1,16 @@
+---
+import FeatureSection from "@/components/feature/FeatureSection.astro";
+import DemoFrame from "@/components/feature/DemoFrame.astro";
+import EditorDemo from "@/components/interactive/EditorDemo";
+import { editor, featureIds } from "@/data/features";
+---
+
+<FeatureSection id={featureIds.editor} copy={editor}>
+  <DemoFrame
+    slot="demo"
+    label="Interactive demo · sample timeline"
+    minHeight="41rem"
+  >
+    <EditorDemo client:visible />
+  </DemoFrame>
+</FeatureSection>

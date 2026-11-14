@@ -1,0 +1,55 @@
+---
+import Container from "@/components/ui/Container.astro";
+import SectionHeading from "@/components/ui/SectionHeading.astro";
+import { featureIds, intro } from "@/data/features";
+
+// Every target below is a real section rendered by the showcase.
+const overview = [
+  { label: "Instant replay", href: `#${featureIds.replay}` },
+  { label: "Audio mixer", href: `#${featureIds.mixer}` },
+  { label: "Editor", href: `#${featureIds.editor}` },
+  { label: "Architecture", href: `#${featureIds.performance}` },
+  { label: "More features", href: `#${featureIds.more}` },
+];
+---
+
+<section
+  id={featureIds.intro}
+  aria-labelledby={`${featureIds.intro}-title`}
+  class="pb-section"
+>
+  <Container>
+    <div class="flex flex-col gap-10 lg:flex-row lg:items-end lg:justify-between lg:gap-16">
+      <SectionHeading
+        id={`${featureIds.intro}-title`}
+        eyebrow={intro.eyebrow}
+        title={intro.title}
+        description={intro.description}
+        class="max-w-2xl"
+      />
+      <nav aria-label="In this section" class="lg:shrink-0">
+        <p class="text-caption text-text-muted font-semibold tracking-widest uppercase">
+          In this section
+        </p>
+        <ol class="mt-3 flex flex-wrap gap-2 lg:max-w-sm">
+          {overview.map((item, i) => (
+            <li>
+              <a
+                href={item.href}
+                class="border-border text-small text-text-secondary hover:border-border-hover hover:text-text inline-flex min-h-11 items-center gap-2 rounded-full border px-3 py-1.5 transition-colors"
+              >
+                <span
+                  class="text-caption text-text-muted tabular-nums"
+                  aria-hidden="true"
+                >
+                  {String(i + 1).padStart(2, "0")}
+                </span>
+                {item.label}
+              </a>
+            </li>
+          ))}
+        </ol>
+      </nav>
+    </div>
+  </Container>
+</section>

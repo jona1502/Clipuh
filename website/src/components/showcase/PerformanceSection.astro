@@ -1,0 +1,113 @@
+---
+import FeatureSection from "@/components/feature/FeatureSection.astro";
+import DemoFrame from "@/components/feature/DemoFrame.astro";
+import { featureIds, performance } from "@/data/features";
+
+// Main path: 2-column grid at every width (compact boxes below sm).
+const main = [
+  { name: "Game", note: "Your running title" },
+  { name: "Windows Graphics Capture", note: "Frames from monitor or window" },
+  { name: "GPU encoder", note: "H.264" },
+  { name: "Replay buffer", note: "RAM, then SSD" },
+  { name: "Save", note: "Copy, no re-encode" },
+  { name: "Clip", note: "Saved file" },
+];
+const steps = [
+  "Game",
+  "Windows Graphics Capture",
+  "GPU encoder (H.264)",
+  "Replay buffer (RAM, then SSD)",
+  "Save by copying encoded data, without re-encoding",
+  "Clip",
+];
+const box =
+  "border-border bg-surface-raised rounded-lg border px-3 py-2 sm:px-4 sm:py-3";
+---
+
+<FeatureSection id={featureIds.performance} copy={performance}>
+  <DemoFrame
+    slot="demo"
+    label="Architecture overview"
+    title="Capture pipeline"
+    minHeight="0"
+  >
+    <div
+      class="flex flex-col gap-4 p-4 sm:gap-6 sm:p-6"
+      role="group"
+      aria-label="Capture pipeline diagram"
+      aria-describedby="pipeline-steps"
+    >
+      <ol class="grid grid-cols-2 gap-2 sm:gap-3" aria-hidden="true">
+        {main.map((s, i) => (
+          <li class="relative">
+            <div
+              class:list={[
+                box,
+                s.name === "GPU encoder" && "border-accent/50",
+                s.name === "Clip" && "bg-accent-subtle border-transparent",
+              ]}
+            >
+              <p class="text-small font-semibold">
+                <span class="text-text-muted mr-2 tabular-nums">{i + 1}</span>
+                {s.name}
+              </p>
+              <p class="text-caption text-text-muted mt-0.5">{s.note}</p>
+            </div>
+          </li>
+        ))}
+      </ol>
+
+      <div class="border-border border-t pt-4 sm:pt-5" aria-hidden="true">
+        <p class="text-caption text-text-muted mb-3 font-semibold tracking-widest uppercase">
+          Audio branch
+        </p>
+        <div class="flex flex-col gap-1 sm:flex-row sm:items-center sm:gap-2">
+          <div class:list={[box, "sm:flex-1"]}>
+            <p class="text-small font-semibold">Desktop + Mic</p>
+            <p class="text-caption text-text-muted mt-0.5">Audio sources</p>
+          </div>
+          <svg
+            viewBox="0 0 24 24"
+            class="text-text-muted size-4 shrink-0 self-center rotate-90 sm:rotate-0"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          >
+            <path d="M5 12h14M13 6l6 6-6 6"></path>
+          </svg>
+          <div class:list={[box, "sm:flex-1"]}>
+            <p class="text-small font-semibold">AAC</p>
+            <p class="text-caption text-text-muted mt-0.5">Encoded audio</p>
+          </div>
+          <svg
+            viewBox="0 0 24 24"
+            class="text-text-muted size-4 shrink-0 self-center rotate-90 sm:rotate-0"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          >
+            <path d="M5 12h14M13 6l6 6-6 6"></path>
+          </svg>
+          <div class:list={[box, "sm:flex-1"]}>
+            <p class="text-small font-semibold">Replay buffer</p>
+            <p class="text-caption text-text-muted mt-0.5">Next to video</p>
+          </div>
+        </div>
+      </div>
+
+      <ol id="pipeline-steps" class="sr-only">
+        {steps.map((s) => (
+          <li>{s}</li>
+        ))}
+        <li>
+          Audio branch: desktop audio and microphone, encoded as AAC, written
+          into the replay buffer
+        </li>
+      </ol>
+    </div>
+  </DemoFrame>
+</FeatureSection>

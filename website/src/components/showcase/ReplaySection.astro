@@ -1,0 +1,16 @@
+---
+import FeatureSection from "@/components/feature/FeatureSection.astro";
+import DemoFrame from "@/components/feature/DemoFrame.astro";
+import ReplayDemo from "@/components/interactive/ReplayDemo";
+import { featureIds, replay } from "@/data/features";
+---
+
+<FeatureSection id={featureIds.replay} copy={replay}>
+  <DemoFrame
+    slot="demo"
+    label="Interactive demo · nothing is recorded"
+    minHeight="30rem"
+  >
+    <ReplayDemo client:visible />
+  </DemoFrame>
+</FeatureSection>
