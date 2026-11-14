@@ -1,0 +1,10 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>clipuh perf workload</title>
+<style>html,body{margin:0;height:100%;background:#111;overflow:hidden}#b{position:absolute;top:30%;width:160px;height:160px;background:#e5482b}#f{position:absolute;left:10px;top:10px;color:#ccc;font:16px monospace}</style>
+</head><body><div id="b"></div><div id="f"></div><script>
+// Moves a block every animation frame (display refresh rate) and shows the
+// measured frame rate, so DWM composes a new desktop frame every refresh.
+const b=document.getElementById('b'),f=document.getElementById('f');let n=0,t0=performance.now();
+function tick(t){b.style.left=(Math.sin(t/500)*0.4+0.45)*innerWidth+'px';n++;if(t-t0>1000){f.textContent=(n*1000/(t-t0)).toFixed(0)+' fps';n=0;t0=t}requestAnimationFrame(tick)}
+requestAnimationFrame(tick);
+</script></body></html>

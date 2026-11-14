@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use clipper_core::recording::{CaptureSource, SourceKind};
 use clipper_platform::windows::{D3DContext, WinError};
-use windows::Foundation::TypedEventHandler;
+use windows::Foundation::{TimeSpan, TypedEventHandler};
 use windows::Graphics::Capture::{
     Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession,
 };
@@ -34,6 +34,24 @@ const MAX_WINDOWS: usize = 256;
 const BUFFER_COUNT: i32 = 2;
 const PIXEL_FORMAT: DirectXPixelFormat = DirectXPixelFormat::B8G8R8A8UIntNormalized;
 const MONITORINFOF_PRIMARY: u32 = 1;
+const TICKS_PER_SECOND: i64 = 10_000_000;
+/// Jitter margin subtracted from the minimum update interval (0.5 ms), so a
+/// source at exactly twice the target rate is not halved by timing noise.
+const MIN_INTERVAL_MARGIN_TICKS: i64 = 5_000;
+
+/// Minimum time between two WGC frames for a capture paced to `fps`, in
+/// 100 ns ticks: half a frame interval minus a small margin.
+///
+/// Without it WGC uses its built-in default (about 60 updates per second on
+/// current Windows 11 builds), which starves 120 fps captures and leaves a
+/// 60 fps pacer with no spare frame when one arrives late, so the slot is
+/// filled with a repeated frame. Half an interval lets at most ~2x the target
+/// rate through: every slot has a candidate, while a faster source (a 180 Hz
+/// or 240 Hz game) is still not copied at its full rate.
+pub fn min_update_interval_ticks(fps: u32) -> i64 {
+    let interval = TICKS_PER_SECOND / i64::from(fps.max(1));
+    (interval / 2 - MIN_INTERVAL_MARGIN_TICKS).max(interval / 4)
+}
 
 #[derive(Debug)]
 pub enum CaptureError {
@@ -313,6 +331,8 @@ pub struct CaptureSession {
     frame_token: i64,
     closed_token: i64,
     size: (u32, u32),
+    /// Every frame taken from the pool, including superseded ones.
+    delivered: u64,
 }
 
 impl CaptureSession {
@@ -388,6 +408,7 @@ impl CaptureSession {
                 item_size.Width.max(0) as u32,
                 item_size.Height.max(0) as u32,
             ),
+            delivered: 0,
         })
     }
 
@@ -396,9 +417,29 @@ impl CaptureSession {
         self.size
     }
 
-    fn poll(&self) -> Result<Option<Direct3D11CaptureFrame>, CaptureError> {
+    /// Paces WGC to the target frame rate (see [`min_update_interval_ticks`]).
+    /// Returns `false` on Windows builds without
+    /// `GraphicsCaptureSession.MinUpdateInterval`; WGC then keeps its default.
+    pub fn set_target_fps(&self, fps: u32) -> bool {
+        self.session
+            .SetMinUpdateInterval(TimeSpan {
+                Duration: min_update_interval_ticks(fps),
+            })
+            .is_ok()
+    }
+
+    /// Frames WGC delivered so far, including the ones superseded by a newer
+    /// frame before they were used. Diagnostics only.
+    pub fn frames_delivered(&self) -> u64 {
+        self.delivered
+    }
+
+    fn poll(&mut self) -> Result<Option<Direct3D11CaptureFrame>, CaptureError> {
         match self.pool.TryGetNextFrame() {
-            Ok(frame) => Ok(Some(frame)),
+            Ok(frame) => {
+                self.delivered += 1;
+                Ok(Some(frame))
+            }
             // WinRT yields a null/empty result when no frame is pending.
             Err(error) if error.code().is_ok() || error.code() == E_POINTER => Ok(None),
             Err(error) => Err(error.into()),
@@ -491,6 +532,23 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn min_update_interval_allows_about_twice_the_target_rate() {
+        // 60 fps: 8.33 ms - 0.5 ms margin.
+        assert_eq!(min_update_interval_ticks(60), 83_333 - 5_000);
+        // 120 fps: 4.17 ms - 0.5 ms margin.
+        assert_eq!(min_update_interval_ticks(120), 41_666 - 5_000);
+        for fps in [1, 24, 30, 60, 120, 144, 240, 1000] {
+            let interval = TICKS_PER_SECOND / i64::from(fps);
+            let min = min_update_interval_ticks(fps);
+            // Never slower than the target, never below a quarter interval.
+            assert!(min < interval / 2 + 1, "fps {fps}");
+            assert!(min >= interval / 4, "fps {fps}");
+        }
+        // 0 is treated as 1 fps instead of dividing by zero.
+        assert_eq!(min_update_interval_ticks(0), min_update_interval_ticks(1));
+    }
 
     #[test]
     #[ignore = "needs a monitor"]
