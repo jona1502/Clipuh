@@ -14,7 +14,7 @@ param([string]$Exe, [string]$Label = '', [int]$Seconds = 8, [int]$StripY = 905,
 $log = Join-Path ([IO.Path]::GetTempPath()) "clipuh-editor-$Label-$PID.log"
 Start-ClipApp $Exe $log
 Send-Page 2; Start-Sleep 3
-Click-At 800 15; Start-Sleep 2
+Click-At 700 222; Start-Sleep 2       # neutral spot (title bar clicks can maximize)
 Click-At 1000 180; Start-Sleep 1           # search field
 Add-Type -AssemblyName System.Windows.Forms
 [System.Windows.Forms.SendKeys]::SendWait($Clip); Start-Sleep 2

@@ -75,7 +75,10 @@ impl SmoothScrollState {
             clamp(self.target.x + delta.x, max.width),
             clamp(self.target.y + delta.y, max.height),
         );
-        if self.last_tick.is_none() {
+        if self.target == self.visual {
+            // Already at the edge (or nothing to scroll): no frames needed.
+            self.last_tick = None;
+        } else if self.last_tick.is_none() {
             self.last_tick = Some(now);
         }
         self.visual
@@ -245,6 +248,23 @@ mod tests {
         s.observe(p(0.));
         s.wheel(p(60.), true, MAX, t0);
         assert_eq!(s.target, p(0.));
+    }
+
+    #[test]
+    fn wheel_at_the_edge_does_not_animate() {
+        let mut s = SmoothScrollState::default();
+        s.observe(p(0.));
+        // Content fits (max 0): GPUI applied a jump that layout will undo.
+        let none = Size {
+            width: px(0.),
+            height: px(0.),
+        };
+        assert_eq!(s.wheel(p(-60.), true, none, Instant::now()), p(0.));
+        assert!(!s.is_animating());
+        // At the top, scrolling further up.
+        s.observe(p(0.));
+        s.wheel(p(60.), true, MAX, Instant::now());
+        assert!(!s.is_animating());
     }
 
     #[test]
