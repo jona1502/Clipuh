@@ -17,17 +17,13 @@ const url = download.available ? download.url : null;
         </p>
       )}
       <p class="text-text-secondary mt-4">{download.note}</p>
-      <div class="mt-8 flex justify-center">
-        {url ? (
+      {url && (
+        <div class="mt-8 flex justify-center">
           <Button href={url} size="lg">
             Download for {download.platform}
           </Button>
-        ) : (
-          <Button href={`#${sections.download}`} size="lg" disabled>
-            Download for {download.platform}
-          </Button>
-        )}
-      </div>
+        </div>
+      )}
     </div>
   </Container>
 </section>

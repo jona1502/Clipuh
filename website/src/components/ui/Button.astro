@@ -5,7 +5,10 @@ interface Props {
   variant?: "primary" | "secondary" | "ghost";
   /** md = 40px min height, lg = 44px+ (touch target). */
   size?: "md" | "lg";
-  /** With href: renders a non-focusable, non-clickable aria-disabled <span>. */
+  /**
+   * Disabled with href: plain non-interactive <span> (not a link, not
+   * focusable). Disabled without href: native <button disabled>.
+   */
   disabled?: boolean;
   /** Only for <button>. */
   type?: "button" | "submit" | "reset";
@@ -54,7 +57,7 @@ const classes = [
     <slot />
   </a>
 ) : href ? (
-  <span role="link" aria-disabled="true" class:list={classes} {...rest}>
+  <span class:list={classes} {...rest}>
     <slot name="icon" />
     <slot />
   </span>
