@@ -10,7 +10,7 @@ use gpui::prelude::*;
 use gpui::{AnyElement, Context, Div, ObjectFit, RenderImage, SharedString, Window, div, img, px};
 
 use super::{ClipperWindow, Page};
-use crate::components::{ButtonVariant, button, card};
+use crate::components::{ButtonVariant, Icon, button, icon, icon_card, tooltip};
 use crate::recent_clips::{RecentClip, RecentClips, relative_time, size_label};
 use crate::theme::{ActiveTheme, Theme};
 
@@ -78,9 +78,15 @@ impl ClipperWindow {
                 div().flex().flex_col().gap_2().children(rows)
             }
         };
-        card(&t, Some("Recent Clips".into()), Some(view_all))
-            .h_full()
-            .child(body)
+        icon_card(
+            &t,
+            Icon::Folder,
+            "Last Clips",
+            "Your most recently saved clips.",
+            Some(view_all),
+        )
+        .h_full()
+        .child(body)
     }
 }
 
@@ -89,6 +95,28 @@ fn note(t: &Theme, text: impl Into<SharedString>) -> Div {
         .text_sm()
         .text_color(t.colors.text_muted)
         .child(text.into())
+}
+
+/// Square icon-only button with a tooltip (row actions).
+fn icon_button(
+    t: &Theme,
+    id: impl Into<gpui::ElementId>,
+    glyph: Icon,
+    label: &'static str,
+) -> gpui::Stateful<Div> {
+    div()
+        .id(id)
+        .flex_none()
+        .size(px(32.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_md()
+        .cursor_pointer()
+        .text_color(t.colors.text_secondary)
+        .hover(|style| style.bg(t.colors.surface_hover).text_color(t.colors.text))
+        .tooltip(tooltip(label))
+        .child(icon(glyph, px(16.)))
 }
 
 fn row(
@@ -116,6 +144,7 @@ fn row(
     let expected_open = clip.clip.clone();
     let expected_folder = clip.clip.clone();
     let (open, folder): (PathBuf, PathBuf) = (clip.clip.path.clone(), clip.clip.path.clone());
+    let edit = clip.clip.path.clone();
     div()
         .id(("recent-clip", index))
         .flex()
@@ -150,23 +179,25 @@ fn row(
                 ),
         )
         .child(
-            button(
-                t,
-                ("recent-folder", index),
-                "Folder",
-                ButtonVariant::Ghost,
-                None,
-                true,
-            )
-            .on_click(cx.listener(move |this, _, _, cx| {
-                cx.stop_propagation();
-                if let Err(error) = clipper_storage::library::verify(&expected_folder)
-                    .and_then(|()| shell::reveal_in_folder(&folder))
-                {
-                    this.recording.fail(error.to_string());
-                    cx.notify();
-                }
-            })),
+            icon_button(t, ("recent-edit", index), Icon::Cut, "Open in Editor").on_click(
+                cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.open_in_editor(edit.clone(), window, cx);
+                }),
+            ),
+        )
+        .child(
+            icon_button(t, ("recent-folder", index), Icon::FolderOpen, "Open Folder").on_click(
+                cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    if let Err(error) = clipper_storage::library::verify(&expected_folder)
+                        .and_then(|()| shell::reveal_in_folder(&folder))
+                    {
+                        this.recording.fail(error.to_string());
+                        cx.notify();
+                    }
+                }),
+            ),
         )
         .into_any_element()
 }

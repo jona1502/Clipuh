@@ -8,6 +8,7 @@ use gpui::{
     anchored, canvas, deferred, div, px,
 };
 
+use super::{Icon, icon};
 use crate::theme::Theme;
 
 #[derive(Clone, Debug)]
@@ -57,6 +58,69 @@ pub fn dropdown(
     on_select: impl Fn(usize, &mut Window, &mut App) + 'static,
     on_dismiss: impl Fn(&mut Window, &mut App) + 'static,
 ) -> Stateful<Div> {
+    styled_dropdown(
+        t,
+        id,
+        options,
+        selected,
+        highlighted,
+        focus,
+        focused,
+        enabled,
+        false,
+        on_toggle,
+        on_select,
+        on_dismiss,
+    )
+}
+
+/// [`dropdown`] whose closed trigger is just the value and a chevron (no box
+/// until hovered or focused), for dense toolbars such as the capture bar.
+#[allow(clippy::too_many_arguments)] // same API as `dropdown`
+pub fn dropdown_ghost(
+    t: &Theme,
+    id: impl Into<ElementId>,
+    options: &[DropdownOption],
+    selected: usize,
+    highlighted: Option<usize>,
+    focus: &FocusHandle,
+    focused: bool,
+    enabled: bool,
+    on_toggle: impl Fn(&mut Window, &mut App) + 'static,
+    on_select: impl Fn(usize, &mut Window, &mut App) + 'static,
+    on_dismiss: impl Fn(&mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
+    styled_dropdown(
+        t,
+        id,
+        options,
+        selected,
+        highlighted,
+        focus,
+        focused,
+        enabled,
+        true,
+        on_toggle,
+        on_select,
+        on_dismiss,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn styled_dropdown(
+    t: &Theme,
+    id: impl Into<ElementId>,
+    options: &[DropdownOption],
+    selected: usize,
+    highlighted: Option<usize>,
+    focus: &FocusHandle,
+    focused: bool,
+    enabled: bool,
+    ghost: bool,
+    on_toggle: impl Fn(&mut Window, &mut App) + 'static,
+    on_select: impl Fn(usize, &mut Window, &mut App) + 'static,
+    on_dismiss: impl Fn(&mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
     let id: ElementId = id.into();
     let open = highlighted.is_some();
     let label = options
@@ -80,11 +144,14 @@ pub fn dropdown(
         .border_1()
         .border_color(if focused || open {
             t.colors.focus_ring
+        } else if ghost {
+            gpui::transparent_black()
         } else {
             t.colors.border
         })
-        .bg(t.colors.surface_raised)
+        .when(!ghost, |this| this.bg(t.colors.surface_raised))
         .text_sm()
+        .when(ghost, |this| this.justify_center().gap_2().text_base())
         .text_color(t.colors.text)
         .track_focus(focus)
         .key_context("Dropdown")
@@ -93,8 +160,16 @@ pub fn dropdown(
                 .absolute()
                 .size_full(),
         )
-        .child(div().child(label))
-        .child(div().text_color(t.colors.text_muted).child("▾"))
+        // Long labels (device names) truncate instead of spilling over
+        // neighbouring controls; the full text is in the open menu.
+        .child(
+            div()
+                .min_w_0()
+                .truncate()
+                .when(!ghost, |this| this.flex_1())
+                .child(label),
+        )
+        .child(icon(Icon::ChevronDown, px(12.)).text_color(t.colors.text_muted))
         .when(enabled, |this| {
             this.cursor_pointer()
                 .hover(|s| s.bg(t.colors.surface_hover))

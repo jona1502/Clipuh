@@ -2,11 +2,13 @@
 //! spacing and states stay consistent across pages.
 
 mod dropdown;
+mod icon;
 mod slider;
 mod text_input;
 mod toggle;
 mod tooltip;
-pub use dropdown::{DropdownOption, dropdown, step};
+pub use dropdown::{DropdownOption, dropdown, dropdown_ghost, step};
+pub use icon::{Icon, icon, icon_tile};
 pub use slider::slider;
 pub use text_input::{TextInput, TextInputEvent};
 pub use toggle::toggle;
@@ -379,12 +381,12 @@ pub fn empty_state(
         )
 }
 
-/// Selectable list row shared by the sidebar and the command palette.
+/// Selectable list row (command palette).
 /// `selected` is the keyboard/active selection; hover is a lighter preview of it.
 pub fn list_item(
     t: &Theme,
     id: impl Into<ElementId>,
-    glyph: &'static str,
+    glyph: Icon,
     label: impl Into<SharedString>,
     keys: Option<&[&'static str]>,
     selected: bool,
@@ -407,18 +409,11 @@ pub fn list_item(
                     .hover(|style| style.bg(t.colors.surface_hover))
             }
         })
-        .child(
-            div()
-                .w(px(16.))
-                .flex()
-                .justify_center()
-                .text_color(if selected {
-                    t.colors.accent
-                } else {
-                    t.colors.text_muted
-                })
-                .child(glyph),
-        )
+        .child(icon(glyph, px(16.)).text_color(if selected {
+            t.colors.accent
+        } else {
+            t.colors.text_muted
+        }))
         .child(div().flex_1().truncate().child(label.into()))
         .children(keys.map(|k| shortcut(t, k)))
 }
@@ -461,6 +456,51 @@ pub fn card(t: &Theme, title: Option<SharedString>, actions: Option<AnyElement>)
         .flex_col()
         .gap(t.metrics.gap)
         .children(header)
+}
+
+/// Page card with the reference header: accent icon tile, title, one-line
+/// subtitle and optional trailing actions. The body goes in as children.
+pub fn icon_card(
+    t: &Theme,
+    glyph: Icon,
+    title: impl Into<SharedString>,
+    subtitle: impl Into<SharedString>,
+    actions: Option<AnyElement>,
+) -> Div {
+    panel(t)
+        .p(t.metrics.card_padding * 1.25)
+        .flex()
+        .flex_col()
+        .gap(t.metrics.gap * 2.)
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_3()
+                .child(icon_tile(t, glyph, px(44.)))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .text_lg()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .truncate()
+                                .child(title.into()),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(t.colors.text_muted)
+                                .truncate()
+                                .child(subtitle.into()),
+                        ),
+                )
+                .children(actions),
+        )
 }
 
 /// `card` lifted off the page: raised fill plus a small shadow.

@@ -20,8 +20,8 @@ use gpui::{
 
 use super::{ClipperWindow, Confirm, Dismiss, SelectNext, SelectPrevious};
 use crate::components::{
-    ButtonVariant, DropdownOption, Tone, button, card, dropdown, slider, status_dot, step, toggle,
-    tooltip,
+    ButtonVariant, DropdownOption, Icon, Tone, button, dropdown, icon_card, icon_tile, slider,
+    status_dot, step, toggle, tooltip,
 };
 use crate::theme::{ActiveTheme, Theme};
 
@@ -554,6 +554,23 @@ impl ClipperWindow {
 
 // ---- view -----------------------------------------------------------------------------
 
+/// Mixer row layout (reference: tall rows, aligned columns).
+const ROW_HEIGHT: f32 = 64.0;
+const NAME_MIN_WIDTH: f32 = 100.0;
+const NAME_MAX_WIDTH: f32 = 260.0;
+const TARGET_WIDTH: f32 = 180.0;
+const METER_MIN_WIDTH: f32 = 72.0;
+const SLIDER_WIDTH: f32 = 120.0;
+
+fn kind_icon(kind: AudioSourceType) -> Icon {
+    match kind {
+        AudioSourceType::Game => Icon::Game,
+        AudioSourceType::Application => Icon::Volume,
+        AudioSourceType::Desktop => Icon::Monitor,
+        AudioSourceType::Microphone => Icon::Microphone,
+    }
+}
+
 fn muted(t: &Theme, text: impl Into<SharedString>) -> Div {
     div()
         .text_xs()
@@ -817,8 +834,8 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
     let pending = topology_pending(&enabled_ids, &window.audio_sources);
 
     let at_enabled_max = enabled_ids.len() >= MAX_RECORDED_AUDIO_SOURCES;
-    let mut rows = div().flex().flex_col();
-    for (index, source) in sources.iter().enumerate() {
+    let mut rows = div().flex().flex_col().gap_2();
+    for source in sources {
         let id = source.id;
         let focus = window.row_focus(id, cx);
         let resolved = window.resolved_name(source);
@@ -903,7 +920,7 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
         let status_cell = if meter {
             div()
                 .w_full()
-                .h(px(6.))
+                .h(px(8.))
                 .rounded_full()
                 .bg(t.colors.border)
                 .child(
@@ -946,7 +963,7 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
                 cx.listener(|this, _, _, cx| this.audio_commit_gain(cx)),
             )
             .on_key_up(cx.listener(|this, _, _, cx| this.audio_commit_gain(cx)))
-            .child(div().w(px(110.)).child(slider(
+            .child(div().w(px(SLIDER_WIDTH)).child(slider(
                 &t,
                 ("audio-gain", id as usize),
                 gain_to_value(gain),
@@ -958,42 +975,64 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
             .child(
                 div()
                     .w(px(44.))
-                    .text_xs()
+                    .flex_none()
+                    .text_sm()
                     .text_color(t.colors.text_secondary)
                     .child(format!("{gain} %")),
             );
 
+        let full_label = format!("{name} — {subtitle}");
+        // Reference rows: kind tile, name, then fixed-width control columns.
+        // Every text column truncates (full text in a tooltip), so long device
+        // names can never push into the meter, slider or buttons.
         rows = rows.child(
             div()
+                .id(("audio-row", id as usize))
                 .flex()
                 .items_center()
                 .gap_3()
-                .min_h(px(40.))
-                .py_1()
-                .when(index > 0, |r| r.border_t_1().border_color(t.colors.border))
+                .min_h(px(ROW_HEIGHT))
+                .px_3()
+                .py_2()
+                .rounded_lg()
+                .bg(t.colors.surface_raised)
+                .child(icon_tile(&t, kind_icon(source.kind), px(40.)))
                 .child(
                     div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
+                        .id(("audio-name", id as usize))
                         .flex_1()
-                        .min_w(px(120.))
-                        .child(status_dot(&t, tone))
+                        .min_w(px(NAME_MIN_WIDTH))
+                        .max_w(px(NAME_MAX_WIDTH))
+                        .flex()
+                        .flex_col()
+                        .tooltip(tooltip(full_label))
                         .child(
                             div()
                                 .flex()
-                                .flex_col()
+                                .items_center()
+                                .gap_2()
                                 .min_w_0()
-                                .child(div().text_sm().truncate().child(name))
-                                .child(muted(&t, subtitle).truncate())
-                                .children(overlap.map(|note| {
-                                    div().text_xs().text_color(t.colors.warning).child(note)
-                                })),
-                        ),
+                                .child(status_dot(&t, tone))
+                                .child(div().min_w_0().text_base().truncate().child(name)),
+                        )
+                        .child(muted(&t, subtitle).truncate())
+                        .children(overlap.map(|note| {
+                            div()
+                                .text_xs()
+                                .text_color(t.colors.warning)
+                                .truncate()
+                                .child(note)
+                        })),
                 )
-                .child(div().w(px(180.)).flex_none().child(target_cell))
-                .child(div().w(px(100.)).flex_none().child(status_cell))
-                .child(slider_cell)
+                .child(
+                    div()
+                        .w(px(TARGET_WIDTH))
+                        .flex_none()
+                        .min_w_0()
+                        .child(target_cell),
+                )
+                .child(div().flex_1().min_w(px(METER_MIN_WIDTH)).child(status_cell))
+                .child(slider_cell.flex_none())
                 .child(div().flex_none().child(toggle(
                     &t,
                     ("audio-on", id as usize),
@@ -1083,8 +1122,13 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
         )
         .child(test);
 
-    card(&t, Some("Audio Mixer".into()), Some(add.into_any_element()))
-        .child(muted(&t, "Manage your recording sources"))
+    icon_card(
+        &t,
+        Icon::Volume,
+        "Audio Mixer",
+        "Manage and control your audio sources.",
+        Some(add.into_any_element()),
+    )
         .children(pending.then(|| {
             muted(
                 &t,

@@ -7,7 +7,7 @@ use gpui::{Context, Div, SharedString, Window, div};
 
 use super::{ClipperWindow, Confirm, Dismiss, SelectNext, SelectPrevious};
 use crate::components::{
-    ButtonVariant, DropdownOption, Tone, button, card, dropdown, status_dot, step,
+    ButtonVariant, DropdownOption, Icon, Tone, button, dropdown, icon_card, status_dot, step,
 };
 use crate::state::{Phase, ReplayPhase, format_elapsed};
 use crate::theme::ActiveTheme;
@@ -267,9 +267,11 @@ impl ClipperWindow {
             _ => None,
         };
 
-        card(
+        icon_card(
             &t,
-            Some("Capture Source".into()),
+            Icon::Game,
+            "Capture Source",
+            "Select what to capture.",
             Some(refresh.into_any_element()),
         )
         .h_full()

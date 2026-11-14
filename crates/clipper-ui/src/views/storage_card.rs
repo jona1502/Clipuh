@@ -5,7 +5,7 @@ use gpui::prelude::*;
 use gpui::{Context, Div, FontWeight, Window, div, px};
 
 use super::{CaptureMenu, ClipperWindow, Confirm, Dismiss, SelectNext, SelectPrevious};
-use crate::components::{card, dropdown};
+use crate::components::{Icon, dropdown, icon_card};
 use crate::state::{ReplayPhase, resolution_label};
 use crate::theme::ActiveTheme;
 
@@ -181,17 +181,23 @@ impl ClipperWindow {
                 .on_action(cx.listener(|this, _: &Dismiss, _, cx| this.capture_close(cx)))
         });
 
-        let mut c = card(&t, Some("Storage & Quality".into()), None)
-            .flex_1()
-            .min_w(px(240.))
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(t.colors.text_muted)
-                    .child("Estimated size and encoding settings."),
-            )
-            .child(body)
-            .child(div().flex().gap_3().children(menus));
+        let mut c = icon_card(
+            &t,
+            Icon::Drive,
+            "Storage & Quality",
+            "Estimated size and encoding settings.",
+            None,
+        )
+        .flex_1()
+        .min_w(px(240.))
+        .child(
+            div()
+                .text_xs()
+                .text_color(t.colors.text_muted)
+                .child("Estimated size and encoding settings."),
+        )
+        .child(body)
+        .child(div().flex().gap_3().children(menus));
         if !self.recording.settings_enabled() {
             c = c.child(
                 div()

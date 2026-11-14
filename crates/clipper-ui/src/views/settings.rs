@@ -28,8 +28,8 @@ use super::{
     CaptureMenu, ClipperWindow, Confirm, Dismiss, HOTKEY_CONTEXT, Page, SelectNext, SelectPrevious,
 };
 use crate::components::{
-    Activate, ButtonVariant, DropdownOption, TextInput, TextInputEvent, button, chip, dropdown,
-    kbd, step, tooltip,
+    Activate, ButtonVariant, DropdownOption, Icon, TextInput, TextInputEvent, button, chip,
+    dropdown, icon, icon_tile, kbd, step, tooltip,
 };
 use crate::state::ReplayPhase;
 use crate::storage_status::{self, StorageStatus};
@@ -72,15 +72,35 @@ const _: () = {
 };
 
 /// The section list, in page order: (glyph, name, subtitle).
-pub(super) const SECTIONS: [(&str, &str, &str); 8] = [
-    ("▶", "Video", "Capture quality and encoding settings."),
-    ("♪", "Audio", "Recorded audio and track layout."),
-    ("↻", "Replay", "Instant replay and buffer settings."),
-    ("⌨", "Hotkeys", "Global shortcuts for clipping."),
-    ("▤", "Storage", "Where clips are saved and disk usage."),
-    ("◐", "Appearance", "Customize the look and feel of clipuh."),
-    ("⚙", "General", "Startup and notifications."),
-    ("ℹ", "Advanced", "Settings file and engine details."),
+pub(super) const SECTIONS: [(Icon, &str, &str); 8] = [
+    (
+        Icon::Video,
+        "Video",
+        "Capture quality and encoding settings.",
+    ),
+    (Icon::Volume, "Audio", "Recorded audio and track layout."),
+    (
+        Icon::History,
+        "Replay",
+        "Instant replay and buffer settings.",
+    ),
+    (Icon::Keyboard, "Hotkeys", "Global shortcuts for clipping."),
+    (
+        Icon::Drive,
+        "Storage",
+        "Where clips are saved and disk usage.",
+    ),
+    (
+        Icon::Palette,
+        "Appearance",
+        "Customize the look and feel of clipuh.",
+    ),
+    (Icon::Settings, "General", "Startup and notifications."),
+    (
+        Icon::Settings,
+        "Advanced",
+        "Settings file and engine details.",
+    ),
 ];
 
 fn size_label(megabytes: u32) -> String {
@@ -1032,7 +1052,7 @@ fn card(t: &Theme, index: usize, anchor: &ScrollAnchor) -> Stateful<Div> {
         .flex()
         .flex_col()
         .gap_3()
-        .p(px(18.))
+        .p(px(16.))
         .rounded_lg()
         .border_1()
         .border_color(t.colors.border)
@@ -1043,18 +1063,7 @@ fn card(t: &Theme, index: usize, anchor: &ScrollAnchor) -> Stateful<Div> {
                 .items_center()
                 .gap_3()
                 .pb_1()
-                .child(
-                    div()
-                        .flex_none()
-                        .size(px(36.))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded_md()
-                        .bg(t.colors.surface_raised)
-                        .text_color(t.colors.text_secondary)
-                        .child(glyph),
-                )
+                .child(icon_tile(t, glyph, px(36.)))
                 .child(
                     div()
                         .flex()
@@ -1062,7 +1071,7 @@ fn card(t: &Theme, index: usize, anchor: &ScrollAnchor) -> Stateful<Div> {
                         .min_w_0()
                         .child(
                             div()
-                                .text_base()
+                                .text_lg()
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .child(title),
                         )
@@ -1690,23 +1699,24 @@ impl ClipperWindow {
                     .flex()
                     .items_center()
                     .gap_3()
-                    .h(px(40.))
+                    .h(px(48.))
                     .px_3()
-                    .rounded_md()
+                    .rounded_lg()
                     .border_1()
                     .border_color(gpui::transparent_black())
-                    .text_sm()
+                    .text_base()
                     .cursor_pointer()
                     .map(|this| {
                         if active {
-                            this.bg(t.colors.accent)
+                            // Same active treatment as the app sidebar.
+                            this.bg(t.colors.accent.opacity(super::ACTIVE_NAV_ALPHA))
                                 .text_color(t.colors.accent_foreground)
                         } else {
                             this.text_color(t.colors.text_secondary)
                                 .hover(|style| style.bg(t.colors.surface_hover))
                         }
                     })
-                    .child(div().w(px(18.)).child(*glyph))
+                    .child(icon(*glyph, px(18.)))
                     .child(*title);
                 activatable(
                     item,
@@ -1720,7 +1730,7 @@ impl ClipperWindow {
             .collect::<Vec<_>>();
         div()
             .flex_none()
-            .w(px(200.))
+            .w(px(214.))
             .h_full()
             .p_2()
             .flex()
@@ -1832,7 +1842,7 @@ pub(super) fn content(
         .gap_4()
         .child(
             div()
-                .text_2xl()
+                .text_3xl()
                 .font_weight(FontWeight::SEMIBOLD)
                 .child("Settings"),
         )

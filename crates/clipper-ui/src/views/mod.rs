@@ -17,10 +17,10 @@ use clipper_storage::AppConfig;
 use gpui::prelude::*;
 use gpui::{
     App, Context, Div, Entity, FocusHandle, FontWeight, KeyBinding, KeyDownEvent, NoAction, Render,
-    Task, Window, actions, div, img, px,
+    Stateful, Task, Window, actions, div, img, px,
 };
 
-use crate::components::{kbd, list_item, shortcut};
+use crate::components::{Icon, icon, kbd, list_item, shortcut, tooltip};
 use crate::notifications::{Notifier, Toast};
 use crate::state::{Phase, RecordingState, StorageProjectionCache, StorageProjectionRun};
 use crate::storage_status::{self, StorageStatus};
@@ -157,12 +157,12 @@ impl Page {
         }
     }
 
-    fn glyph(self) -> &'static str {
+    fn icon(self) -> Icon {
         match self {
-            Self::Dashboard => "◧",
-            Self::Clips => "▤",
-            Self::Editor => "◫",
-            Self::Settings => "◎",
+            Self::Dashboard => Icon::Camera,
+            Self::Clips => Icon::Folder,
+            Self::Editor => Icon::Cut,
+            Self::Settings => Icon::Settings,
         }
     }
 
@@ -792,45 +792,73 @@ impl ClipperWindow {
         }
     }
 
-    fn sidebar(&self, window: &Window, cx: &mut Context<Self>) -> Div {
+    /// The one sidebar of every page (sidebar reference: the left column of
+    /// the approved screenshots): logo, four tall navigation rows with a
+    /// filled accent active row, storage at the bottom.
+    fn sidebar(&self, window: &Window, cx: &mut Context<Self>) -> Stateful<Div> {
         let t = *cx.theme();
         let navigation = Page::ALL
             .into_iter()
             .zip(&self.nav_focus)
             .map(|(page, focus)| {
+                let active = self.active_page == page;
                 let focused = focus.is_focused(window);
-                list_item(
-                    &t,
-                    ("nav", page.index()),
-                    page.glyph(),
-                    page.label(),
-                    Some(page.shortcut()),
-                    self.active_page == page,
-                )
-                .track_focus(focus)
-                .border_1()
-                .border_color(if focused {
-                    t.colors.focus_ring
-                } else {
-                    gpui::transparent_black()
-                })
-                .on_click(cx.listener(move |this, _, window, cx| this.navigate(page, window, cx)))
-                .on_action(
-                    cx.listener(move |this, _: &Confirm, window, cx| {
+                div()
+                    .id(("nav", page.index()))
+                    .track_focus(focus)
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .h(px(NAV_ITEM_HEIGHT))
+                    .px_4()
+                    .rounded_lg()
+                    .border_1()
+                    .cursor_pointer()
+                    .text_lg()
+                    .map(|this| {
+                        if active {
+                            this.bg(t.colors.accent.opacity(ACTIVE_NAV_ALPHA))
+                                .border_color(t.colors.accent.opacity(ACTIVE_NAV_ALPHA))
+                                .text_color(t.colors.accent_foreground)
+                                .font_weight(FontWeight::MEDIUM)
+                        } else {
+                            this.border_color(gpui::transparent_black())
+                                .text_color(t.colors.text)
+                                .hover(|style| style.bg(t.colors.surface_hover))
+                        }
+                    })
+                    .when(focused, |this| this.border_color(t.colors.focus_ring))
+                    .tooltip(tooltip(format!(
+                        "{} ({})",
+                        page.label(),
+                        page.shortcut().join("+")
+                    )))
+                    .child(
+                        icon(page.icon(), px(20.))
+                            .when(!active, |icon| icon.text_color(t.colors.text_secondary)),
+                    )
+                    .child(div().flex_1().truncate().child(page.label()))
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| this.navigate(page, window, cx)),
+                    )
+                    .on_action(cx.listener(move |this, _: &Confirm, window, cx| {
                         this.navigate(page, window, cx)
-                    }),
-                )
+                    }))
             });
 
         div()
+            .id("sidebar")
             .w(px(SIDEBAR_WIDTH))
             .flex_none()
             .h_full()
             .flex()
             .flex_col()
-            .gap(t.metrics.section_gap)
-            .px_3()
-            .py_4()
+            .gap(px(28.))
+            .px_4()
+            .pt_6()
+            .pb_8()
+            // Short windows scroll the sidebar instead of clipping storage.
+            .overflow_y_scroll()
             .bg(t.colors.sidebar)
             .border_r_1()
             .border_color(t.colors.border)
@@ -838,24 +866,24 @@ impl ClipperWindow {
                 div()
                     .flex()
                     .items_center()
-                    .gap_2()
+                    .gap_2p5()
                     .px_2()
-                    .h(px(28.))
-                    .child(img(brand_logo()).size(px(22.)).flex_none())
+                    .h(px(40.))
+                    .child(img(brand_logo()).size(px(34.)).flex_none())
                     .child(
                         div()
-                            .text_base()
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_2xl()
+                            .font_weight(FontWeight::BOLD)
                             .child("clipuh"),
                     ),
             )
-            .child(div().flex().flex_col().gap_0p5().children(navigation))
+            .child(div().flex().flex_col().gap_2().children(navigation))
             .child(
                 div()
                     .mt_auto()
                     .flex()
                     .flex_col()
-                    .gap_3()
+                    .gap_4()
                     .child(
                         // The command palette's only visible entry point.
                         div()
@@ -912,7 +940,7 @@ impl ClipperWindow {
             list_item(
                 &t,
                 ("palette", index),
-                page.glyph(),
+                page.icon(),
                 format!("Open {}", page.label()),
                 Some(page.shortcut()),
                 index == palette.selected,
@@ -1019,22 +1047,41 @@ impl ClipperWindow {
 }
 
 /// Sidebar width at the default density; the capture bar takes the rest.
-const SIDEBAR_WIDTH: f32 = 236.0;
+const SIDEBAR_WIDTH: f32 = 240.0;
+/// Navigation row height and the active row's accent fill (references: tall
+/// rows, a solid but dimmed accent so the label stays readable).
+const NAV_ITEM_HEIGHT: f32 = 52.0;
+const ACTIVE_NAV_ALPHA: f32 = 0.6;
 
-/// Free space on the recordings volume with a compact usage bar. Shows a
-/// neutral state until the first (background) read finishes or when the
-/// volume cannot be read; never an invented number.
+/// Free space on the recordings volume with a usage bar, laid out like the
+/// references: "Storage · N free", bar, "used / total". Shows a neutral state
+/// until the first (background) read finishes or when the volume cannot be
+/// read; never an invented number.
 fn storage_indicator(t: &Theme, storage: &StorageStatus) -> Div {
-    let caption = div()
-        .text_xs()
-        .text_color(t.colors.text_muted)
-        .child("Storage");
-    let base = div().px_2().flex().flex_col().gap_1p5().child(caption);
+    let free = match storage {
+        StorageStatus::Ready(usage) => usage.free_label(),
+        StorageStatus::Unknown => "Checking…".to_owned(),
+        StorageStatus::Unavailable(_) => "Unavailable".to_owned(),
+    };
+    let heading = div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .text_sm()
+        .child(icon(Icon::Drive, px(16.)).text_color(t.colors.text_secondary))
+        .child(div().flex_1().child("Storage"))
+        .child(
+            div()
+                .text_color(t.colors.text_secondary)
+                .truncate()
+                .child(free),
+        );
+    let base = div().px_2().flex().flex_col().gap_2().child(heading);
     match storage {
         StorageStatus::Ready(usage) => base
             .child(
                 div()
-                    .h(px(4.))
+                    .h(px(8.))
                     .w_full()
                     .rounded_full()
                     .bg(t.colors.surface_active)
@@ -1047,31 +1094,19 @@ fn storage_indicator(t: &Theme, storage: &StorageStatus) -> Div {
                     ),
             )
             .child(
-                div().flex().justify_between().gap_2().text_xs().child(
-                    div()
-                        .text_color(t.colors.text_secondary)
-                        .child(usage.free_label()),
-                ),
-            )
-            .child(
                 div()
-                    .text_xs()
+                    .text_sm()
                     .text_color(t.colors.text_muted)
                     .truncate()
                     .child(usage.used_label()),
             ),
-        StorageStatus::Unknown => base.child(
-            div()
-                .text_xs()
-                .text_color(t.colors.text_muted)
-                .child("Checking…"),
-        ),
+        StorageStatus::Unknown => base,
         StorageStatus::Unavailable(reason) => base.child(
             div()
                 .text_xs()
                 .text_color(t.colors.text_muted)
                 .truncate()
-                .child(format!("Unavailable: {reason}")),
+                .child(reason.clone()),
         ),
     }
 }
@@ -1172,14 +1207,11 @@ impl Render for ClipperWindow {
                                     .w_full()
                                     // Library and Settings scroll inside themselves.
                                     .when(full_height, |d| d.h_full())
-                                    .when(self.active_page == Page::Settings, |d| {
-                                        d.max_w(px(1440.)).mx_auto()
-                                    })
-                                    .when(!full_height && self.active_page != Page::Editor, |d| {
-                                        d.max_w(px(960.)).mx_auto()
-                                    })
-                                    .when(self.active_page == Page::Editor, |d| d.p_3())
-                                    .when(self.active_page != Page::Editor, |d| d.px_8().py_6())
+                                    // Pages use the full width beside the sidebar, inset
+                                    // like the capture bar (references).
+                                    .px(px(capture_bar::PAGE_GUTTER))
+                                    .pt_4()
+                                    .pb_6()
                                     .child(self.page_content(window, cx)),
                             ),
                     ),

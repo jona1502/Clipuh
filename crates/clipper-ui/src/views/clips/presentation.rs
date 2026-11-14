@@ -7,7 +7,7 @@ const MIN_CARD_WIDTH: f32 = 270.0;
 /// Sidebar plus page padding, subtracted from the viewport for the grid width.
 const CHROME_WIDTH: f32 = 304.0;
 /// Thumbnail height / card width, as in the approved Library design.
-const THUMB_RATIO: f32 = 0.39;
+const THUMB_RATIO: f32 = 9.0 / 16.0;
 
 /// Grid columns for a viewport width: as many as fit at `MIN_CARD_WIDTH`, at most four.
 fn columns_for(viewport: f32) -> usize {
@@ -18,6 +18,11 @@ fn columns_for(viewport: f32) -> usize {
 fn card_width(viewport: f32, columns: usize) -> f32 {
     ((viewport - CHROME_WIDTH - GAP * columns.saturating_sub(1) as f32) / columns as f32)
         .max(MIN_CARD_WIDTH.min(viewport))
+}
+
+/// 16:9 thumbnail height inside a card whose 2px border takes 4px of width.
+fn thumb_height_for(card_width: f32) -> f32 {
+    ((card_width - 4.) * THUMB_RATIO).max(90.)
 }
 
 fn duration_label(duration: std::time::Duration) -> String {
@@ -773,7 +778,7 @@ impl ClipLibrary {
         t: &Theme,
         id: &str,
         slot: usize,
-        glyph: &'static str,
+        glyph: crate::components::Icon,
         hint: &'static str,
         primary: bool,
         cx: &mut Context<Self>,
@@ -798,13 +803,15 @@ impl ClipLibrary {
                         .hover(|s| s.bg(t.colors.accent_hover))
                 } else {
                     d.bg(t.colors.surface_raised)
+                        .border_1()
+                        .border_color(t.colors.border)
                         .text_color(t.colors.text_secondary)
                         .hover(|s| s.bg(t.colors.surface_hover).text_color(t.colors.text))
                 }
             })
             .when(enabled, |d| d.cursor_pointer())
             .when(!enabled, |d| d.opacity(0.45))
-            .child(glyph)
+            .child(crate::components::icon(glyph, px(16.)))
             .on_click(cx.listener(move |this, _, window, cx| {
                 cx.stop_propagation();
                 if enabled {
@@ -833,7 +840,7 @@ impl ClipLibrary {
         let thumb_height = if list {
             72.
         } else {
-            (card_width(viewport, self.columns) * THUMB_RATIO).max(90.)
+            thumb_height_for(card_width(viewport, self.columns))
         };
 
         let checkbox = div()
@@ -902,7 +909,10 @@ impl ClipLibrary {
             .text_color(t.colors.text_secondary)
             .hover(|s| s.bg(t.colors.surface_hover).text_color(t.colors.text))
             .tooltip(crate::components::tooltip("More actions"))
-            .child("⋯")
+            .child(crate::components::icon(
+                crate::components::Icon::More,
+                px(16.),
+            ))
             .on_mouse_down(
                 gpui::MouseButton::Left,
                 cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
@@ -957,17 +967,24 @@ impl ClipLibrary {
             .flex()
             .gap_2()
             .when(list, |d| d.w(px(260.)).flex_none())
-            .child(
-                self.card_action(t, &id, 0, "▶", "Play", true, cx, |this, id, _, cx| {
+            .child(self.card_action(
+                t,
+                &id,
+                0,
+                crate::components::Icon::Play,
+                "Play",
+                true,
+                cx,
+                |this, id, _, cx| {
                     this.focus_clip(id);
                     this.open(false, cx);
-                }),
-            )
+                },
+            ))
             .child(self.card_action(
                 t,
                 &id,
                 1,
-                "✂",
+                crate::components::Icon::Cut,
                 "Open in Editor",
                 false,
                 cx,
@@ -980,7 +997,11 @@ impl ClipLibrary {
                 t,
                 &id,
                 2,
-                if favorite { "★" } else { "☆" },
+                if favorite {
+                    crate::components::Icon::StarFilled
+                } else {
+                    crate::components::Icon::Star
+                },
                 if favorite {
                     "Remove from favorites"
                 } else {
@@ -990,17 +1011,24 @@ impl ClipLibrary {
                 cx,
                 |this, id, window, cx| this.toggle_favorite(id, window, cx),
             ))
-            .child(
-                self.card_action(t, &id, 3, "✕", "Delete", false, cx, |this, id, _, cx| {
+            .child(self.card_action(
+                t,
+                &id,
+                3,
+                crate::components::Icon::Delete,
+                "Delete",
+                false,
+                cx,
+                |this, id, _, cx| {
                     this.focus_clip(id);
                     this.confirm_delete(cx);
-                }),
-            )
+                },
+            ))
             .child(self.card_action(
                 t,
                 &id,
                 4,
-                "↗",
+                crate::components::Icon::FolderOpen,
                 "Show in folder",
                 false,
                 cx,
@@ -1094,6 +1122,12 @@ mod tests {
         assert_eq!(columns_for(1100.), 2);
         assert_eq!(columns_for(400.), 1);
         assert!(card_width(1672., 4) >= MIN_CARD_WIDTH);
+    }
+
+    #[test]
+    fn thumbnails_are_sixteen_by_nine() {
+        assert_eq!(thumb_height_for(324.), 180.);
+        assert_eq!(thumb_height_for(100.), 90.);
     }
 
     #[test]
