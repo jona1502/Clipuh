@@ -1,51 +1,127 @@
 /*
- * Semantic design tokens.
+ * Semantic design tokens (dark theme only; the site has no light mode).
  *
- * Values mirror the desktop app theme (crates/clipper-ui/src/theme/mod.rs)
- * so the website matches the application. When the GPUI theme engine lands,
- * update or generate this file from it; components must only use the
- * semantic names below, never raw colors.
- *
- * This is a subset of the app theme: SIDEBAR, SCRIM, NEUTRAL and RECORDING*
- * are omitted for now.
- *
- * Tailwind v4 turns every --color-* into utilities (bg-surface,
- * text-text-secondary, border-border, ...).
+ * Values mirror the desktop app theme (crates/clipper-ui/src/theme/palette.rs,
+ * Base::DARK + accent derivation). Components use only the semantic names
+ * below, never raw colors. Tailwind v4 turns every --color-* into utilities
+ * (bg-surface, text-text-secondary, border-border, ...), every --text-* into
+ * font-size utilities, --radius-* into rounded-*, --shadow-* into shadow-*,
+ * --container-* into max-w-*, and --spacing-* into p-/m-/gap- utilities.
  */
 @theme {
-  /* Surfaces, darkest to lightest. Never pure black. */
-  --color-background: #0e0e11;
-  --color-surface: #17171c;
-  --color-surface-raised: #1e1e24;
-  --color-surface-hover: #24242b;
+  /* ---- Surfaces, darkest to lightest. Never pure black. ---- */
+  --color-background: #0d0e14;
+  /* App sidebar color; use for header/footer bands and elevated strips. */
+  --color-background-elevated: #111219;
+  --color-surface: #171821;
+  --color-surface-raised: #1d1e2a;
+  --color-surface-hover: #252636;
 
-  --color-border: #25252c;
-  --color-border-strong: #33333b;
+  --color-border: #262735;
+  /* app border_strong: hover/emphasis border. */
+  --color-border-hover: #303142;
 
-  /* Text hierarchy. */
-  --color-text: #ececf1;
-  --color-text-secondary: #a0a0ab;
-  /* text-tertiary is for non-body/decorative use only: it fails WCAG AA for
-     small text on surfaces (~3.35:1 on surface). Use text-secondary for copy. */
-  --color-text-tertiary: #6a6a75;
+  /* ---- Text hierarchy. text-muted is 4.5:1+ on background/surface. ---- */
+  --color-text: #f5f5f7;
+  --color-text-secondary: #a1a1b0;
+  --color-text-muted: #868699;
 
-  /* Brand accent: user-customizable in the app, so always go through these. */
-  --color-accent: #8c7bff;
-  --color-accent-hover: #9d8eff;
-  --color-accent-subtle: #8c7bff24;
-  --color-on-accent: #ffffff;
-  --color-focus-ring: #8c7bffaa;
+  /*
+   * ---- Accent: SINGLE SOURCE. Change --color-accent only. ----
+   * Everything else is derived from it, exactly like palette.rs:
+   *   hover  = mix toward white 12%
+   *   subtle = alpha 0.16
+   *   ring   = alpha 0.7
+   */
+  --color-accent: #9b5cf6;
+  --color-accent-hover: color-mix(in srgb, var(--color-accent), white 12%);
+  --color-accent-subtle: color-mix(
+    in srgb,
+    var(--color-accent) 16%,
+    transparent
+  );
+  --color-focus-ring: color-mix(in srgb, var(--color-accent) 70%, transparent);
+  /*
+   * Text on accent fills. palette.rs foreground_for() picks white or ink
+   * (#111118), whichever has higher WCAG contrast. For #9b5cf6: white 4.00:1,
+   * ink 4.70:1, so ink wins. CSS cannot compute this; if the accent changes,
+   * recompute (see README) and update this one value.
+   */
+  --color-accent-foreground: #111118;
 
-  /* Status. */
+  /* ---- Status. error = app danger. ---- */
   --color-success: #4ade80;
   --color-warning: #fbbf24;
-  --color-danger: #f87171;
+  --color-error: #f87171;
 
-  /* System stack only: no font is shipped yet. A self-hosted font comes with
-     the design phase. */
-  --font-sans: ui-sans-serif, system-ui, "Segoe UI", Roboto, sans-serif;
+  /* ---- Fonts. "Inter Variable" is declared in global.css. ---- */
+  --font-sans:
+    "Inter Variable", "Inter Fallback", ui-sans-serif, system-ui, "Segoe UI",
+    Roboto, sans-serif;
   --font-mono: ui-monospace, "Cascadia Code", "JetBrains Mono", monospace;
 
-  --radius-surface: 0.75rem;
+  /* ---- Typography scale: size / line-height / letter-spacing / weight. ----
+     Fluid with clamp(): ~375px phone up to ~1280px desktop. Use as
+     `text-h1`, `text-body`, ... (font-size + the rest in one class). */
+  --text-display: clamp(2.5rem, 1.6rem + 3.6vw, 4.5rem);
+  --text-display--line-height: 1.05;
+  --text-display--letter-spacing: -0.035em;
+  --text-display--font-weight: 700;
+  --text-h1: clamp(2rem, 1.5rem + 2vw, 3rem);
+  --text-h1--line-height: 1.1;
+  --text-h1--letter-spacing: -0.03em;
+  --text-h1--font-weight: 700;
+  --text-h2: clamp(1.625rem, 1.3rem + 1.3vw, 2.25rem);
+  --text-h2--line-height: 1.15;
+  --text-h2--letter-spacing: -0.025em;
+  --text-h2--font-weight: 650;
+  --text-h3: clamp(1.25rem, 1.1rem + 0.6vw, 1.5rem);
+  --text-h3--line-height: 1.25;
+  --text-h3--letter-spacing: -0.015em;
+  --text-h3--font-weight: 600;
+  --text-lead: clamp(1.0625rem, 1rem + 0.35vw, 1.25rem);
+  --text-lead--line-height: 1.55;
+  --text-lead--letter-spacing: -0.005em;
+  --text-lead--font-weight: 400;
+  --text-body: 1rem;
+  --text-body--line-height: 1.6;
+  --text-body--letter-spacing: 0;
+  --text-body--font-weight: 400;
+  --text-small: 0.875rem;
+  --text-small--line-height: 1.5;
+  --text-small--letter-spacing: 0;
+  --text-small--font-weight: 400;
+  --text-caption: 0.75rem;
+  --text-caption--line-height: 1.4;
+  --text-caption--letter-spacing: 0.04em;
+  --text-caption--font-weight: 500;
+
+  /* ---- Layout. max-w-page / max-w-narrow; py-section / pt-section ... ---- */
+  --container-page: 75rem; /* 1200px */
+  --container-narrow: 46rem; /* 736px */
+  --spacing-section: clamp(4rem, 3rem + 4vw, 7rem);
+  --spacing-header: 4.5rem; /* sticky header height, 72px */
+
+  /* ---- Radius: app surfaces are rounded, controls slightly less. ---- */
+  --radius-sm: 0.375rem;
+  --radius-md: 0.5rem;
+  --radius-lg: 0.75rem;
+  --radius-xl: 1rem;
+  /* Aliases kept for existing markup; prefer rounded-md / rounded-lg. */
   --radius-control: 0.5rem;
+  --radius-surface: 0.75rem;
+
+  /* ---- Elevation: subtle, dark UI relies on borders more than shadow. ---- */
+  --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.35);
+  --shadow-md: 0 4px 16px rgb(0 0 0 / 0.35);
+  --shadow-lg: 0 16px 48px rgb(0 0 0 / 0.45);
+
+  /* ---- Motion ---- */
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
 }
+
+/*
+ * Breakpoints: Tailwind defaults (sm 640, md 768, lg 1024, xl 1280, 2xl 1536).
+ * Design/QA targets: 375, 430 (phones), 768 (tablet), 1280, 1440, 1920
+ * (desktop). Build mobile-first; check each width.
+ */

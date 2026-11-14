@@ -1,0 +1,46 @@
+---
+interface Props {
+  title: string;
+  /** Small uppercase label above the title. */
+  eyebrow?: string;
+  description?: string;
+  /** Heading element; default 2. Visual size always matches the level. */
+  level?: 1 | 2 | 3;
+  align?: "left" | "center";
+  class?: string;
+  [attr: string]: unknown;
+}
+
+const {
+  title,
+  eyebrow,
+  description,
+  level = 2,
+  align = "left",
+  class: className,
+  ...rest
+} = Astro.props;
+const Heading = `h${level}` as "h1" | "h2" | "h3";
+const size = { 1: "text-h1", 2: "text-h2", 3: "text-h3" }[level];
+---
+
+<div
+  class:list={[
+    "flex flex-col gap-3",
+    align === "center"
+      ? "max-w-narrow mx-auto items-center text-center"
+      : "items-start",
+    className,
+  ]}
+  {...rest}
+>
+  {eyebrow && (
+    <p class="text-caption text-accent font-semibold tracking-widest uppercase">
+      {eyebrow}
+    </p>
+  )}
+  <Heading class={size}>{title}</Heading>
+  {description && (
+    <p class="text-lead text-text-secondary max-w-prose">{description}</p>
+  )}
+</div>
