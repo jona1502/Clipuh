@@ -1153,6 +1153,34 @@ impl PacketEncoder {
         config: &EncoderConfig,
         labels: &[String],
     ) -> Result<Self, EncoderError> {
+        let tuning = H264Tuning::new(config.profile, config.bitrate_mbps, config.fps);
+        Self::create_inner(mf, d3d, config, labels, tuning, true)
+    }
+
+    /// [`PacketEncoder::create_with_labels`] with explicit H.264 settings
+    /// instead of the ones `config.profile` implies. For encoder A/B
+    /// benchmarks (`examples/encoder_ab.rs`); the app always goes through
+    /// the profile.
+    pub fn create_with_tuning(
+        mf: &MediaFoundation,
+        d3d: &D3DContext,
+        config: &EncoderConfig,
+        labels: &[String],
+        tuning: H264Tuning,
+    ) -> Result<Self, EncoderError> {
+        Self::create_inner(mf, d3d, config, labels, tuning, false)
+    }
+
+    /// `per_vendor`: adapt `tuning` to each candidate encoder's vendor
+    /// ([`H264Tuning::for_vendor`]); off for explicit benchmark tunings.
+    fn create_inner(
+        mf: &MediaFoundation,
+        d3d: &D3DContext,
+        config: &EncoderConfig,
+        labels: &[String],
+        tuning: H264Tuning,
+        per_vendor: bool,
+    ) -> Result<Self, EncoderError> {
         if labels.len() > MAX_AUDIO_TRACKS {
             return Err(EncoderError::UnsupportedFormat(
                 "too many audio tracks".into(),
@@ -1176,9 +1204,8 @@ impl PacketEncoder {
             return Err(EncoderError::UnsupportedFormat(detail));
         }
         let _ = hardware_h264_encoders(mf)?;
-        let tuning = H264Tuning::new(config.profile, config.bitrate_mbps, config.fps);
 
-        let (video, name) = Self::open_video(d3d, config, &tuning, &detail)?;
+        let (video, name) = Self::open_video(d3d, config, &tuning, per_vendor, &detail)?;
         let mut audio = Vec::with_capacity(labels.len());
         for _ in labels {
             audio.push(AudioStage::new()?);
@@ -1205,6 +1232,7 @@ impl PacketEncoder {
         d3d: &D3DContext,
         config: &EncoderConfig,
         tuning: &H264Tuning,
+        per_vendor: bool,
         detail: &str,
     ) -> Result<(VideoStage, String), EncoderError> {
         let output = MFT_REGISTER_TYPE_INFO {
@@ -1244,7 +1272,17 @@ impl PacketEncoder {
 
         let mut last = EncoderError::NoHardwareEncoder;
         for activate in &candidates {
-            match VideoStage::configure(activate, d3d, config, tuning, detail) {
+            let tuning = if per_vendor {
+                let attributes: &IMFAttributes = activate;
+                let vendor = super::media_foundation::allocated_string(
+                    attributes,
+                    &MFT_ENUM_HARDWARE_VENDOR_ID_Attribute,
+                );
+                tuning.for_vendor(config.profile, vendor.as_deref())
+            } else {
+                *tuning
+            };
+            match VideoStage::configure(activate, d3d, config, &tuning, detail) {
                 Ok(stage) => {
                     let attributes: &IMFAttributes = activate;
                     let name = super::media_foundation::allocated_string(
