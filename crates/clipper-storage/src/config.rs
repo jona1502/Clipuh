@@ -759,6 +759,9 @@ pub struct NotificationSettings {
     pub duration_seconds: u32,
     /// Play a sound with the notification.
     pub sound: bool,
+    /// Application-owned imported WAV. None preserves the system sound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_sound: Option<PathBuf>,
     /// Offer an action to open the saved clip.
     pub open_clip_action: bool,
     /// Also notify when saving a clip fails.
@@ -777,6 +780,7 @@ impl Default for NotificationSettings {
             enabled: true,
             duration_seconds: 4,
             sound: true,
+            custom_sound: None,
             open_clip_action: true,
             notify_on_failure: true,
             in_app: true,
@@ -2093,6 +2097,7 @@ hotkey = \"F9\"
             enabled: false,
             duration_seconds: 7,
             sound: false,
+            custom_sound: None,
             open_clip_action: false,
             notify_on_failure: false,
             in_app: false,
@@ -2101,6 +2106,29 @@ hotkey = \"F9\"
         let path = temp.path("custom.toml");
         config.save_to(&path).expect("save");
         assert_eq!(AppConfig::load_from(&path).expect("load"), config);
+    }
+
+    #[test]
+    fn imported_notification_sound_setting_survives_restart_and_reset() {
+        let temp = TestDir::new();
+        let path = temp.path("sound.toml");
+        let mut config = AppConfig::default();
+        assert_eq!(config.notifications.custom_sound, None);
+        config.notifications.custom_sound = Some(temp.path("sounds/Chime.wav"));
+        config.save_to(&path).unwrap();
+        assert_eq!(
+            AppConfig::load_from(&path).unwrap().notifications,
+            config.notifications
+        );
+        config.notifications.custom_sound = None;
+        config.save_to(&path).unwrap();
+        assert_eq!(
+            AppConfig::load_from(&path)
+                .unwrap()
+                .notifications
+                .custom_sound,
+            None
+        );
     }
 
     #[test]

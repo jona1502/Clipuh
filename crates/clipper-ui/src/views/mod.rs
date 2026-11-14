@@ -324,6 +324,8 @@ pub struct ClipperWindow {
     diagnostics_notice: Option<(bool, String)>,
     /// A debug-log export is running (the button is disabled meanwhile).
     diagnostics_exporting: bool,
+    notification_sound_importing: bool,
+    notification_sound_notice: Option<String>,
 }
 
 impl ClipperWindow {
@@ -614,6 +616,8 @@ impl ClipperWindow {
             settings_notice: None,
             diagnostics_notice: None,
             diagnostics_exporting: false,
+            notification_sound_importing: false,
+            notification_sound_notice: None,
         };
         this.storage_projection_cache.refresh(&this.config);
         this.refresh_storage(cx);

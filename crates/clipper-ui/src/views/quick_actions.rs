@@ -9,10 +9,10 @@ use std::path::Path;
 use std::time::Instant;
 
 use clipper_core::recording::RecorderCommand;
-use clipper_platform::windows::shell;
 use clipper_platform::windows::tray::{
     self, Balloon, BalloonKind, TrayCommand, TrayHandle, TrayMenuState, TrayReplay,
 };
+use clipper_platform::windows::{notify, shell};
 use gpui::prelude::*;
 use gpui::{Context, Div, Task, Window, div, px};
 
@@ -29,6 +29,30 @@ use crate::theme::ActiveTheme;
 
 const TOAST_W: f32 = 340.0;
 const TOAST_GAP: f32 = 12.0;
+
+/// Sound follows the route that owns the result, independently of rendering.
+/// The overlay already owns replay results outside the focused in-app stack.
+fn notice_sound(
+    notice: &Notice,
+    settings: &clipper_storage::NotificationSettings,
+    in_front: bool,
+    native_delivered: bool,
+    quiet_time: bool,
+) -> bool {
+    if !allowed(notice, settings) || !settings.sound || notice.progress {
+        return false;
+    }
+    if notice.category == Category::ClipSave {
+        return in_front && settings.in_app;
+    }
+    if notice.category == Category::Recording
+        && notice.severity == Severity::Success
+        && matches!(notice.action, Some(ToastAction::OpenClip(_)))
+    {
+        return true;
+    }
+    native_delivered && !quiet_time
+}
 
 /// Notification and quick-action state owned by the main window.
 #[derive(Default)]
@@ -122,12 +146,23 @@ impl ClipperWindow {
             return;
         }
         let desktop = settings.native && notice.desktop && !in_front;
+        let native_delivered = desktop && self.feedback.tray.is_some();
+        if notice_sound(
+            &notice,
+            settings,
+            in_front,
+            native_delivered,
+            native_delivered && notify::notification_quiet_time_active(),
+        ) {
+            self.notifier.play_sound(settings.custom_sound.clone());
+        }
         if desktop && let Some(tray) = &self.feedback.tray {
             tray.notify(Balloon {
                 kind: balloon_kind(notice.severity),
                 title: notice.title.clone(),
                 body: notice.body.clone(),
-                sound: settings.sound,
+                // The app owns default/custom playback; no second system sound.
+                sound: false,
             });
         }
         if settings.in_app {
@@ -550,5 +585,66 @@ mod tests {
         assert!(open_error(&e, "Clip").starts_with("Clip not found"));
         let e = std::io::Error::other("denied");
         assert_eq!(open_error(&e, "Clip"), "denied");
+    }
+
+    #[test]
+    fn completed_saves_sound_once_in_the_route_that_owns_them() {
+        let settings = clipper_storage::NotificationSettings::default();
+        let saved = Notice::new(
+            "clip-save",
+            Category::ClipSave,
+            Severity::Success,
+            "Saved",
+            "",
+        );
+        assert!(notice_sound(&saved, &settings, true, false, false));
+        assert!(!notice_sound(&saved, &settings, false, false, false));
+        let mut overlay = settings.clone();
+        overlay.in_app = false;
+        assert!(!notice_sound(&saved, &overlay, true, false, false));
+        assert!(!notice_sound(
+            &saved.clone().progress(),
+            &settings,
+            true,
+            false,
+            false
+        ));
+        let manual = Notice::new(
+            "recording",
+            Category::Recording,
+            Severity::Success,
+            "Saved",
+            "",
+        )
+        .action(ToastAction::OpenClip("a.mp4".into()));
+        assert!(notice_sound(&manual, &settings, true, false, false));
+        assert!(notice_sound(&manual, &settings, false, false, false));
+        let replay = Notice::new("replay", Category::Replay, Severity::Success, "Started", "");
+        assert!(!notice_sound(&replay, &settings, true, false, false));
+    }
+
+    #[test]
+    fn notification_sound_respects_switches_failure_policy_and_native_quiet_time() {
+        let warning =
+            Notice::new("audio", Category::Audio, Severity::Error, "Failed", "").desktop();
+        let mut settings = clipper_storage::NotificationSettings::default();
+        assert!(notice_sound(&warning, &settings, false, true, false));
+        assert!(!notice_sound(&warning, &settings, false, true, true));
+        assert!(!notice_sound(&warning, &settings, false, false, false));
+        settings.sound = false;
+        assert!(!notice_sound(&warning, &settings, false, true, false));
+        settings.sound = true;
+        settings.enabled = false;
+        assert!(!notice_sound(&warning, &settings, false, true, false));
+        settings.enabled = true;
+        settings.notify_on_failure = false;
+        let failed = Notice::new(
+            "clip-save",
+            Category::ClipSave,
+            Severity::Error,
+            "Failed",
+            "",
+        );
+        assert!(!notice_sound(&failed, &settings, true, false, false));
     }
 }
