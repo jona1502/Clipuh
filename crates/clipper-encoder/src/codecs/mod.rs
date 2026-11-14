@@ -80,9 +80,77 @@ impl H264Tuning {
     }
 }
 
+/// PCI vendor id of AMD hardware encoders, as Media Foundation reports it in
+/// `MFT_ENUM_HARDWARE_VENDOR_ID_Attribute`.
+pub const AMD_VENDOR_ID: &str = "VEN_1002";
+
+/// Highest mean bitrate the encoder is configured with (as `bitrate_bps`).
+const MAX_BITRATE_BPS: u32 = 150_000_000;
+
+impl H264Tuning {
+    /// The tuning for the encoder of `vendor` (`VEN_xxxx`). Only AMD's
+    /// Quality profile changes; every other combination is `self`.
+    ///
+    /// On AMD (VCN, measured on an RX 9070 XT; `docs/performance/
+    /// replay-gpu-load.md`) Quality's QvS 100 + 2 B-frames cost 2.2x the
+    /// encoder time of QvS 50 without B-frames, while bitrate costs no
+    /// encoder time. QvS 50, no B-frames and 1.25x the bitrate scored higher
+    /// SSIM/PSNR than the shipped Quality on real gameplay (equal on UI
+    /// scenes) for 55 % less encoder time, at ~+20-30 % file size. Other
+    /// vendors' encoders were not measured, so they keep the profile as is.
+    pub fn for_vendor(self, profile: QualityProfile, vendor: Option<&str>) -> Self {
+        let amd = vendor.is_some_and(|vendor| vendor.eq_ignore_ascii_case(AMD_VENDOR_ID));
+        if !amd || profile != QualityProfile::Quality {
+            return self;
+        }
+        let bitrate_bps = self
+            .bitrate_bps
+            .saturating_add(self.bitrate_bps / 4)
+            .min(MAX_BITRATE_BPS);
+        Self {
+            bitrate_bps,
+            peak_bitrate_bps: bitrate_bps.saturating_mul(2),
+            quality_vs_speed: 50,
+            b_frames: 0,
+            ..self
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn amd_quality_spends_bits_instead_of_encoder_time() {
+        let quality = H264Tuning::new(QualityProfile::Quality, 16, 60);
+        let amd = quality.for_vendor(QualityProfile::Quality, Some("VEN_1002"));
+        assert_eq!(amd.quality_vs_speed, 50);
+        assert_eq!(amd.b_frames, 0);
+        assert_eq!(amd.bitrate_bps, 30_000_000);
+        assert_eq!(amd.peak_bitrate_bps, 60_000_000);
+        assert_eq!(
+            (amd.rate_control, amd.profile, amd.gop_frames),
+            (quality.rate_control, quality.profile, quality.gop_frames)
+        );
+        // Lower-case ids and the bitrate cap.
+        let capped = H264Tuning::new(QualityProfile::Quality, 100, 60)
+            .for_vendor(QualityProfile::Quality, Some("ven_1002"));
+        assert_eq!(capped.bitrate_bps, MAX_BITRATE_BPS);
+    }
+
+    #[test]
+    fn other_vendors_and_profiles_are_unchanged() {
+        for profile in QualityProfile::ALL {
+            let tuning = H264Tuning::new(profile, 16, 60);
+            for vendor in [Some("VEN_10DE"), Some("VEN_8086"), None] {
+                assert_eq!(tuning.for_vendor(profile, vendor), tuning);
+            }
+            if profile != QualityProfile::Quality {
+                assert_eq!(tuning.for_vendor(profile, Some(AMD_VENDOR_ID)), tuning);
+            }
+        }
+    }
 
     #[test]
     fn performance_is_fast_cbr_without_b_frames() {
