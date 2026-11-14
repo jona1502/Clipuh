@@ -4,7 +4,9 @@
 use std::{cell::Cell, rc::Rc};
 
 use clipper_audio::DeviceFlow;
-use clipper_audio::windows::{AudioApplication, capabilities, list_audio_applications, list_devices};
+use clipper_audio::windows::{
+    AudioApplication, capabilities, list_audio_applications, list_devices,
+};
 use clipper_core::recording::{
     AudioSourceState, AudioSourceStatus, MAX_AUDIO_GAIN_PERCENT, MAX_RECORDED_AUDIO_SOURCES,
     RecorderCommand,
@@ -12,8 +14,8 @@ use clipper_core::recording::{
 use clipper_storage::{AudioSourceSettings, AudioSourceType, MAX_AUDIO_SOURCES};
 use gpui::prelude::*;
 use gpui::{
-    Bounds, Context, Div, FocusHandle, MouseButton, Pixels, SharedString, Window, anchored,
-    canvas, deferred, div, px, relative,
+    Bounds, Context, Div, FocusHandle, MouseButton, Pixels, SharedString, Window, anchored, canvas,
+    deferred, div, px, relative,
 };
 
 use super::{ClipperWindow, Confirm, Dismiss, SelectNext, SelectPrevious};
@@ -149,17 +151,18 @@ impl ClipperWindow {
     pub(super) fn snapshot_audio_focus(&self, window: &Window) {
         let mut set = self.audio_focused.borrow_mut();
         set.clear();
-        for f in self.audio_focus.borrow().values() {
-            for h in [&f.menu, &f.slider, &f.toggle] {
+        for (id, f) in self.audio_focus.borrow().iter() {
+            for (slot, h) in [&f.menu, &f.slider, &f.toggle].into_iter().enumerate() {
                 if h.is_focused(window) {
-                    set.insert(h.id);
+                    set.insert((*id, slot as u8));
                 }
             }
         }
     }
 
-    fn is_focused(&self, handle: &FocusHandle) -> bool {
-        self.audio_focused.borrow().contains(&handle.id)
+    /// `slot` is 0 menu, 1 slider, 2 toggle (the `RowFocus` fields).
+    fn is_focused(&self, row: u32, slot: u8) -> bool {
+        self.audio_focused.borrow().contains(&(row, slot))
     }
 
     fn audio_source(&self, id: u32) -> Option<&AudioSourceSettings> {
@@ -167,7 +170,12 @@ impl ClipperWindow {
     }
 
     fn audio_enabled_count(&self) -> usize {
-        self.config.audio.sources.iter().filter(|s| s.enabled).count()
+        self.config
+            .audio
+            .sources
+            .iter()
+            .filter(|s| s.enabled)
+            .count()
     }
 
     /// Loads devices and (where supported) audio applications off-thread.
@@ -208,7 +216,9 @@ impl ClipperWindow {
     }
 
     fn process_loopback(&self) -> bool {
-        self.audio_capabilities.as_ref().is_none_or(|c| c.process_loopback)
+        self.audio_capabilities
+            .as_ref()
+            .is_none_or(|c| c.process_loopback)
     }
 
     fn resolved_name(&self, source: &AudioSourceSettings) -> Option<String> {
@@ -423,11 +433,18 @@ impl ClipperWindow {
         cx: &mut Context<Self>,
     ) {
         if self.config.audio.sources.len() >= MAX_AUDIO_SOURCES {
-            self.audio_add_note = Some(format!("The mixer holds at most {MAX_AUDIO_SOURCES} sources"));
+            self.audio_add_note = Some(format!(
+                "The mixer holds at most {MAX_AUDIO_SOURCES} sources"
+            ));
             cx.notify();
             return;
         }
-        if self.config.audio.duplicate_of(kind, target.as_deref()).is_some() {
+        if self
+            .config
+            .audio
+            .duplicate_of(kind, target.as_deref())
+            .is_some()
+        {
             self.audio_add_note = Some("Already in the mixer".into());
             cx.notify();
             return;
@@ -473,7 +490,10 @@ impl ClipperWindow {
 // ---- view -----------------------------------------------------------------------------
 
 fn muted(t: &Theme, text: impl Into<SharedString>) -> Div {
-    div().text_xs().text_color(t.colors.text_muted).child(text.into())
+    div()
+        .text_xs()
+        .text_color(t.colors.text_muted)
+        .child(text.into())
 }
 
 fn popup_row(
@@ -494,7 +514,11 @@ fn popup_row(
         .py_1()
         .rounded_md()
         .text_sm()
-        .text_color(if enabled { t.colors.text } else { t.colors.text_muted })
+        .text_color(if enabled {
+            t.colors.text
+        } else {
+            t.colors.text_muted
+        })
         .child(div().child(label.into()))
         .children(
             detail
@@ -559,7 +583,8 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
                 .into_iter()
                 .enumerate()
                 {
-                    let needs = matches!(kind, AudioSourceType::Game | AudioSourceType::Application);
+                    let needs =
+                        matches!(kind, AudioSourceType::Game | AudioSourceType::Application);
                     let reason = (needs && !loopback).then_some(NO_LOOPBACK);
                     let row = popup_row(&t, ("audio-cat", i), kind_label(kind), None, reason);
                     list = list.child(row.when(reason.is_none(), |r| {
@@ -581,18 +606,29 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
                     .items_center()
                     .justify_between()
                     .child(
-                        button(&t, "audio-add-back", "‹ Back", ButtonVariant::Ghost, None, true)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.audio_add = Some(AddStep::Category);
-                                this.audio_add_note = None;
-                                cx.notify();
-                            })),
+                        button(
+                            &t,
+                            "audio-add-back",
+                            "‹ Back",
+                            ButtonVariant::Ghost,
+                            None,
+                            true,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.audio_add = Some(AddStep::Category);
+                            this.audio_add_note = None;
+                            cx.notify();
+                        })),
                     )
                     .child(
                         button(
                             &t,
                             "audio-add-refresh",
-                            if window.audio_loading { "Loading…" } else { "Refresh" },
+                            if window.audio_loading {
+                                "Loading…"
+                            } else {
+                                "Refresh"
+                            },
                             ButtonVariant::Ghost,
                             None,
                             !window.audio_loading,
@@ -642,11 +678,13 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
                     );
                 }
                 for (i, (label, detail, target)) in targets.into_iter().enumerate() {
-                    list = list.child(popup_row(&t, ("audio-target", i), label, detail, None).on_click(
-                        cx.listener(move |this, _, _, cx| {
-                            this.audio_add_source(kind, target.clone(), cx)
-                        }),
-                    ));
+                    list = list.child(
+                        popup_row(&t, ("audio-target", i), label, detail, None).on_click(
+                            cx.listener(move |this, _, _, cx| {
+                                this.audio_add_source(kind, target.clone(), cx)
+                            }),
+                        ),
+                    );
                 }
             }
         }
@@ -699,12 +737,14 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
             s.enabled && matches!(s.kind, AudioSourceType::Game | AudioSourceType::Application)
         })
         .map(|s| match s.kind {
-            AudioSourceType::Application => row_labels(
-                s.kind,
-                s.target.as_deref(),
-                window.resolved_name(s).as_deref(),
-            )
-            .0,
+            AudioSourceType::Application => {
+                row_labels(
+                    s.kind,
+                    s.target.as_deref(),
+                    window.resolved_name(s).as_deref(),
+                )
+                .0
+            }
             _ => "the game".into(),
         })
         .collect();
@@ -716,7 +756,8 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
         let id = source.id;
         let focus = window.row_focus(id, cx);
         let resolved = window.resolved_name(source);
-        let (name, subtitle) = row_labels(source.kind, source.target.as_deref(), resolved.as_deref());
+        let (name, subtitle) =
+            row_labels(source.kind, source.target.as_deref(), resolved.as_deref());
         let state = window.audio_sources.iter().find(|s| s.source == id);
         let (tone, text, meter) = row_status(source.enabled, state.map(|s| &s.status));
         let peak = window
@@ -732,26 +773,31 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
             Some((options, _, selected)) => {
                 let (a, b, c) = (entity.clone(), entity.clone(), entity.clone());
                 div()
-                    .on_action(cx.listener(move |this, _: &Confirm, _, cx| {
-                        this.audio_menu_confirm(id, cx)
-                    }))
+                    .on_action(
+                        cx.listener(move |this, _: &Confirm, _, cx| {
+                            this.audio_menu_confirm(id, cx)
+                        }),
+                    )
                     .on_action(cx.listener(move |this, _: &SelectNext, _, cx| {
                         this.audio_menu_step(id, 1, cx)
                     }))
                     .on_action(cx.listener(move |this, _: &SelectPrevious, _, cx| {
                         this.audio_menu_step(id, -1, cx)
                     }))
-                    .on_action(cx.listener(move |this, _: &Dismiss, _, cx| {
-                        this.audio_menu_close(cx)
-                    }))
+                    .on_action(
+                        cx.listener(move |this, _: &Dismiss, _, cx| this.audio_menu_close(cx)),
+                    )
                     .child(dropdown(
                         &t,
                         ("audio-target-menu", id as usize),
                         &options,
                         selected,
-                        window.audio_menu.filter(|(open, _)| *open == id).map(|(_, h)| h),
+                        window
+                            .audio_menu
+                            .filter(|(open, _)| *open == id)
+                            .map(|(_, h)| h),
                         &focus.menu,
-                        window.is_focused(&focus.menu),
+                        window.is_focused(id, 0),
                         true,
                         move |_, app| a.update(app, |this, cx| this.audio_menu_toggle(id, cx)),
                         move |i, _, app| b.update(app, |this, cx| this.audio_menu_apply(id, i, cx)),
@@ -814,7 +860,7 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
                 gain_to_value(gain),
                 true,
                 &focus.slider,
-                window.is_focused(&focus.slider),
+                window.is_focused(id, 1),
                 move |v, _, app| e1.update(app, |this, cx| this.audio_set_gain(id, v, cx)),
             )))
             .child(
@@ -862,7 +908,7 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
                     source.enabled,
                     true,
                     &focus.toggle,
-                    window.is_focused(&focus.toggle),
+                    window.is_focused(id, 2),
                     move |on, _, app| e2.update(app, |this, cx| this.audio_toggle(id, on, cx)),
                 )))
                 .child(
@@ -888,20 +934,33 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
     // Footer: separate tracks + audio test.
     let tracks_focus = window.row_focus(TRACKS_KEY, cx);
     let e = entity.clone();
-    let can_test = window.recording.settings_enabled()
-        && !window.audio_testing
-        && !enabled_ids.is_empty();
+    let can_test =
+        window.recording.settings_enabled() && !window.audio_testing && !enabled_ids.is_empty();
     let test = if window.audio_testing {
-        button(&t, "stop-audio-test", "Stop audio test", ButtonVariant::Danger, None, true)
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.send(RecorderCommand::StopAudioTest);
-                cx.notify();
-            }))
+        button(
+            &t,
+            "stop-audio-test",
+            "Stop audio test",
+            ButtonVariant::Danger,
+            None,
+            true,
+        )
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.send(RecorderCommand::StopAudioTest);
+            cx.notify();
+        }))
     } else {
-        button(&t, "audio-test", "Test 30 s", ButtonVariant::Secondary, None, can_test)
-            .when(can_test, |b| {
-                b.on_click(cx.listener(|this, _, _, cx| this.start_audio_test(cx)))
-            })
+        button(
+            &t,
+            "audio-test",
+            "Test 30 s",
+            ButtonVariant::Secondary,
+            None,
+            can_test,
+        )
+        .when(can_test, |b| {
+            b.on_click(cx.listener(|this, _, _, cx| this.start_audio_test(cx)))
+        })
     };
     let footer = div()
         .flex()
@@ -916,7 +975,7 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
             window.config.audio.separate_tracks,
             true,
             &tracks_focus.toggle,
-            window.is_focused(&tracks_focus.toggle),
+            window.is_focused(TRACKS_KEY, 2),
             move |on, _, app| {
                 e.update(app, |this, cx| {
                     this.config.audio.separate_tracks = on;
@@ -925,22 +984,35 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
             },
         ))
         .child(div().text_sm().child("Separate tracks"))
-        .child(div().flex_1().child(muted(&t, "Mix + one track per source")))
+        .child(
+            div()
+                .flex_1()
+                .child(muted(&t, "Mix + one track per source")),
+        )
         .child(test);
 
     card(&t, Some("Audio Mixer".into()), Some(add.into_any_element()))
         .child(muted(&t, "Manage your recording sources"))
         .children(pending.then(|| {
-            muted(&t, "Source changes apply when replay or recording restarts.")
+            muted(
+                &t,
+                "Source changes apply when replay or recording restarts.",
+            )
         }))
         .children(window.audio_notice.as_ref().map(|n| {
-            div().text_xs().text_color(t.colors.warning).child(n.clone())
+            div()
+                .text_xs()
+                .text_color(t.colors.warning)
+                .child(n.clone())
         }))
         .child(rows)
         .child(footer)
-        .children(window.audio_test_path.as_ref().map(|path| {
-            muted(&t, format!("Test WAV saved: {path}"))
-        }))
+        .children(
+            window
+                .audio_test_path
+                .as_ref()
+                .map(|path| muted(&t, format!("Test WAV saved: {path}"))),
+        )
 }
 
 #[cfg(test)]
@@ -950,13 +1022,33 @@ mod tests {
     #[test]
     fn status_mapping() {
         use AudioSourceStatus::*;
-        assert_eq!(row_status(false, Some(&Capturing { track: None })).1.as_deref(), Some("Off"));
-        assert_eq!(row_status(true, None), (Tone::Neutral, Some("Not capturing".into()), false));
-        assert_eq!(row_status(true, Some(&Capturing { track: Some(1) })), (Tone::Success, None, true));
+        assert_eq!(
+            row_status(false, Some(&Capturing { track: None }))
+                .1
+                .as_deref(),
+            Some("Off")
+        );
+        assert_eq!(
+            row_status(true, None),
+            (Tone::Neutral, Some("Not capturing".into()), false)
+        );
+        assert_eq!(
+            row_status(true, Some(&Capturing { track: Some(1) })),
+            (Tone::Success, None, true)
+        );
         assert_eq!(row_status(true, Some(&Starting)).0, Tone::Warning);
-        assert_eq!(row_status(true, Some(&Waiting("x".into()))).0, Tone::Warning);
-        assert_eq!(row_status(true, Some(&Skipped("x".into()))).0, Tone::Neutral);
-        assert_eq!(row_status(true, Some(&Failed("x".into()))), (Tone::Danger, Some("x".into()), false));
+        assert_eq!(
+            row_status(true, Some(&Waiting("x".into()))).0,
+            Tone::Warning
+        );
+        assert_eq!(
+            row_status(true, Some(&Skipped("x".into()))).0,
+            Tone::Neutral
+        );
+        assert_eq!(
+            row_status(true, Some(&Failed("x".into()))),
+            (Tone::Danger, Some("x".into()), false)
+        );
     }
 
     #[test]
@@ -966,12 +1058,19 @@ mod tests {
             overlap_note(&["Game.exe".into()]).unwrap(),
             "Records desktop audio without Game.exe to avoid double audio"
         );
-        assert!(overlap_note(&["a".into(), "b".into()]).unwrap().starts_with("Skipped while 2+"));
+        assert!(
+            overlap_note(&["a".into(), "b".into()])
+                .unwrap()
+                .starts_with("Skipped while 2+")
+        );
     }
 
     #[test]
     fn topology_compares_sets() {
-        let st = |source| AudioSourceState { source, status: AudioSourceStatus::Starting };
+        let st = |source| AudioSourceState {
+            source,
+            status: AudioSourceStatus::Starting,
+        };
         assert!(!topology_pending(&[1, 2], &[]));
         assert!(!topology_pending(&[2, 1], &[st(1), st(2)]));
         assert!(topology_pending(&[1], &[st(1), st(2)]));
@@ -986,8 +1085,14 @@ mod tests {
 
     #[test]
     fn labels() {
-        assert_eq!(row_labels(AudioSourceType::Desktop, None, None).1, "Default output");
-        assert_eq!(row_labels(AudioSourceType::Microphone, Some("id"), None).1, "Unavailable device");
+        assert_eq!(
+            row_labels(AudioSourceType::Desktop, None, None).1,
+            "Default output"
+        );
+        assert_eq!(
+            row_labels(AudioSourceType::Microphone, Some("id"), None).1,
+            "Unavailable device"
+        );
         assert_eq!(
             row_labels(AudioSourceType::Application, Some("a.exe"), Some("App")),
             ("App".into(), "a.exe".into())

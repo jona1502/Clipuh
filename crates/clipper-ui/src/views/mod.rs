@@ -227,8 +227,9 @@ pub struct ClipperWindow {
     /// A gain changed and is not saved yet (saved when the drag or key press ends).
     audio_gain_dirty: bool,
     audio_focus: std::cell::RefCell<std::collections::HashMap<u32, audio::RowFocus>>,
-    /// Audio handles that held focus at the last render (components get no `Window`).
-    audio_focused: std::cell::RefCell<std::collections::HashSet<gpui::FocusId>>,
+    /// Audio handles that held focus at the last render (components get no `Window`),
+    /// as (row id, slot); see `ClipperWindow::is_focused` in `audio.rs`.
+    audio_focused: std::cell::RefCell<std::collections::HashSet<(u32, u8)>>,
     audio_testing: bool,
     audio_test_path: Option<String>,
     /// Replay was enabled in the config and has not been auto-started yet.
@@ -295,8 +296,7 @@ impl ClipperWindow {
                         RecorderEvent::AudioLevels(levels) => {
                             this.audio_levels = levels.clone();
                             // Meters only exist on the Capture page: store, don't redraw.
-                            quiet = !levels.is_empty()
-                                && this.active_page != Page::Dashboard;
+                            quiet = !levels.is_empty() && this.active_page != Page::Dashboard;
                         }
                         RecorderEvent::AudioSources(states) => {
                             this.audio_sources = states.clone();
