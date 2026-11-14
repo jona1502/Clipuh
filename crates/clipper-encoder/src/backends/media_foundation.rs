@@ -330,6 +330,17 @@ pub(crate) fn codec_properties(tuning: &H264Tuning) -> Vec<(GUID, Property)> {
             Property::U32(tuning.b_frames),
         ),
     ]);
+    if let Some(refs) = tuning.max_ref_frames {
+        properties.push((CODECAPI_AVEncVideoMaxNumRefFrame, Property::U32(refs)));
+    }
+    if let Some(cabac) = tuning.cabac {
+        properties.push((CODECAPI_AVEncH264CABACEnable, Property::Bool(cabac)));
+    }
+    if let Some(rows) = tuning.slice_mb_rows {
+        // Mode 2: slice size in macroblock rows.
+        properties.push((CODECAPI_AVEncSliceControlMode, Property::U32(2)));
+        properties.push((CODECAPI_AVEncSliceControlSize, Property::U32(rows)));
+    }
     properties
 }
 
@@ -893,6 +904,40 @@ impl Drop for HardwareEncoder {
 mod tests {
     use super::*;
     use clipper_platform::windows::ComApartment;
+
+    #[test]
+    fn optional_knobs_are_off_unless_set() {
+        // The profiles never set them: encoder defaults stay in effect.
+        for profile in QualityProfile::ALL {
+            let tuning = H264Tuning::new(profile, 16, 60);
+            let keys: Vec<GUID> = codec_properties(&tuning).iter().map(|(k, _)| *k).collect();
+            for knob in [
+                CODECAPI_AVEncVideoMaxNumRefFrame,
+                CODECAPI_AVEncH264CABACEnable,
+                CODECAPI_AVEncSliceControlMode,
+                CODECAPI_AVEncSliceControlSize,
+            ] {
+                assert!(!keys.contains(&knob), "{profile:?}");
+            }
+        }
+        let tuning = H264Tuning {
+            max_ref_frames: Some(1),
+            cabac: Some(false),
+            slice_mb_rows: Some(34),
+            ..H264Tuning::new(QualityProfile::Quality, 16, 60)
+        };
+        let properties = codec_properties(&tuning);
+        let value = |key: GUID| {
+            properties
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, p)| p.scalar())
+        };
+        assert_eq!(value(CODECAPI_AVEncVideoMaxNumRefFrame), Some(1));
+        assert_eq!(value(CODECAPI_AVEncH264CABACEnable), Some(0));
+        assert_eq!(value(CODECAPI_AVEncSliceControlMode), Some(2));
+        assert_eq!(value(CODECAPI_AVEncSliceControlSize), Some(34));
+    }
     use windows::Win32::Graphics::Direct3D11::ID3D11RenderTargetView;
 
     struct Env {
