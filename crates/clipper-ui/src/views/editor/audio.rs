@@ -16,6 +16,10 @@ struct PeakKey {
     stream_index: u32,
     columns: usize,
     duration: Duration,
+    /// Visible slice of the time axis, in thousandths of its width (the
+    /// waveform is computed for what is on screen only).
+    from_milli: u32,
+    to_milli: u32,
     /// Identity of the decoded waveform set (replaced when re-analysed).
     source: usize,
 }
@@ -43,26 +47,40 @@ impl PeakCache {
 
 /// Largest bucket peak under each of `columns` equal slices of `duration`
 /// (the timeline), for buckets spanning `source_duration`.
+#[cfg(test)]
 fn column_peaks(
     buckets: &[clipper_media::audio::WaveformBucket],
     duration: Duration,
     source_duration: Duration,
     columns: usize,
 ) -> Vec<f32> {
+    column_peaks_range(buckets, duration, source_duration, 0., 1., columns)
+}
+
+/// Like `column_peaks` for the slice `from..to` (fractions of the time
+/// axis): column `x` covers `duration * (from + (to - from) * x / columns)`.
+fn column_peaks_range(
+    buckets: &[clipper_media::audio::WaveformBucket],
+    duration: Duration,
+    source_duration: Duration,
+    from: f64,
+    to: f64,
+    columns: usize,
+) -> Vec<f32> {
     let len = buckets.len();
+    if columns == 0 || source_duration.is_zero() {
+        return Vec::new();
+    }
+    let bucket_at = |fraction: f64| {
+        duration.as_secs_f64() * fraction / source_duration.as_secs_f64() * len as f64
+    };
+    let span = (to - from).max(0.);
     (0..columns)
         .map(|x| {
-            let from = ((duration.as_secs_f64() * x as f64
-                / columns as f64
-                / source_duration.as_secs_f64())
-                * len as f64) as usize;
-            let to = ((duration.as_secs_f64() * (x + 1) as f64
-                / columns as f64
-                / source_duration.as_secs_f64())
-                * len as f64)
-                .ceil() as usize;
+            let a = bucket_at(from + span * x as f64 / columns as f64) as usize;
+            let b = bucket_at(from + span * (x + 1) as f64 / columns as f64).ceil() as usize;
             buckets
-                .get(from.min(len)..to.min(len).max(from.min(len)))
+                .get(a.min(len)..b.min(len).max(a.min(len)))
                 .map_or(0., |b| b.iter().map(|b| b.peak).fold(0f32, f32::max))
         })
         .collect()
@@ -287,6 +305,25 @@ impl ClipEditor {
             )
             .on_key_up(cx.listener(|this, _, _, cx| this.finish_audio_gain(cx)))
     }
+    /// Height limits of audio rows (the header controls set the minimum).
+    pub(super) fn audio_limits(t: &Theme) -> clipper_editor::timeline::HeightLimits {
+        clipper_editor::timeline::HeightLimits::audio(row_height(t))
+    }
+
+    /// Height of audio row `index` (default until the user resizes it).
+    pub(super) fn audio_row_height(&self, index: usize, t: &Theme) -> f32 {
+        let limits = Self::audio_limits(t);
+        self.edits
+            .as_ref()
+            .and_then(|e| e.audio_tracks().get(index))
+            .map_or(limits.default, |track| {
+                self.track_height(
+                    clipper_editor::timeline::TrackId::Audio(track.stream_index),
+                    limits,
+                )
+            })
+    }
+
     pub(super) fn audio_header(
         &self,
         index: usize,
@@ -294,7 +331,7 @@ impl ClipEditor {
         cx: &mut Context<Self>,
     ) -> Div {
         let t = *cx.theme();
-        let row_height = row_height(&t);
+        let row_height = self.audio_row_height(index, &t);
         let Some(edits) = &self.edits else {
             return div().h(px(row_height));
         };
@@ -302,7 +339,15 @@ impl ClipEditor {
             return div().h(px(row_height));
         };
         let selected = edits.selected_audio() == Some(index);
+        let resize = self.resize_handle(
+            &t,
+            clipper_editor::timeline::TrackId::Audio(track.stream_index),
+            row_height,
+            Self::audio_limits(&t),
+            cx,
+        );
         div()
+            .relative()
             .h(px(row_height))
             .p_1()
             .rounded_md()
@@ -320,7 +365,7 @@ impl ClipEditor {
                 button(
                     &t,
                     ("audio-select", index),
-                    track.label.clone(),
+                    clipper_editor::display_label(track).to_owned(),
                     if selected {
                         ButtonVariant::Ghost
                     } else {
@@ -339,6 +384,7 @@ impl ClipEditor {
                 })),
             )
             .child(self.audio_controls(index, false, window, cx))
+            .child(resize)
     }
     pub(super) fn audio_inspector(&self, window: &Window, cx: &mut Context<Self>) -> Div {
         let t = *cx.theme();
@@ -386,7 +432,7 @@ impl ClipEditor {
             }))
         });
         div().flex().flex_col().gap_3()
-            .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(track.label.clone()))
+            .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(clipper_editor::display_label(track).to_owned()))
             .child(muted(&t).child(format!("Source stream {} · {} channels · {} Hz",track.stream_index,track.channels,track.sample_rate)))
             .child(self.audio_controls(index,true,window,cx))
             .child(super::presentation::timestamp_row(&t,"Start",self.audio_start_input.clone()))
@@ -402,7 +448,7 @@ impl ClipEditor {
         cx: &mut Context<Self>,
     ) -> Div {
         let t = *cx.theme();
-        let row_height = row_height(&t);
+        let row_height = self.audio_row_height(index, &t);
         let Some(edits) = &self.edits else {
             return div().h(px(row_height));
         };
@@ -445,19 +491,47 @@ impl ClipEditor {
                         if data.buckets.is_empty() || waveforms.duration.is_zero() {
                             return;
                         }
+                        // Only the part inside the scrolled viewport is drawn,
+                        // about one column per pixel: sharp at any zoom, with
+                        // a bounded cost however long the timeline gets.
                         let width = f32::from(bounds.size.width).max(1.);
-                        let columns = (width.ceil() as usize).min(2048);
+                        let visible = window.content_mask().bounds.intersect(&bounds);
+                        if visible.size.width <= px(0.) || visible.size.height <= px(0.) {
+                            return;
+                        }
+                        let from =
+                            (f32::from(visible.origin.x - bounds.origin.x) / width).clamp(0., 1.);
+                        let to =
+                            (f32::from(visible.right() - bounds.origin.x) / width).clamp(from, 1.);
+                        let visible_width = f32::from(visible.size.width).max(1.);
+                        let columns = (visible_width.ceil() as usize).clamp(1, 2048);
                         let key = PeakKey {
                             stream_index: data.stream_index,
                             columns,
                             duration,
+                            from_milli: (from * 1000.).round() as u32,
+                            to_milli: (to * 1000.).round() as u32,
                             source: Arc::as_ptr(waveforms) as usize,
                         };
+                        let (from, to) = (
+                            f64::from(key.from_milli) / 1000.,
+                            f64::from(key.to_milli) / 1000.,
+                        );
                         let peaks = peak_cache.borrow_mut().get(key, || {
-                            column_peaks(&data.buckets, duration, waveforms.duration, columns)
+                            column_peaks_range(
+                                &data.buckets,
+                                duration,
+                                waveforms.duration,
+                                from,
+                                to,
+                                columns,
+                            )
                         });
+                        let start_x = bounds.origin.x + px(width * from as f32);
+                        let span_width = width * (to - from) as f32;
                         for (x, peak) in peaks.iter().copied().enumerate() {
-                            let at = duration.mul_f64((x as f64 + 0.5) / columns as f64);
+                            let at = duration
+                                .mul_f64(from + (to - from) * (x as f64 + 0.5) / columns as f64);
                             if !draw_track.contains(at)
                                 || !source_ranges.iter().any(|s| at >= s.start && at < s.end)
                             {
@@ -470,10 +544,10 @@ impl ClipEditor {
                             let height = (amplitude * (row_height - 12.)).max(1.);
                             let bar = Bounds::new(
                                 gpui::point(
-                                    bounds.origin.x + px(x as f32 * width / columns as f32),
+                                    start_x + px(x as f32 * span_width / columns as f32),
                                     bounds.origin.y + px((row_height - height) / 2.),
                                 ),
-                                gpui::size(px((width / columns as f32).max(1.)), px(height)),
+                                gpui::size(px((span_width / columns as f32).max(1.)), px(height)),
                             );
                             window.paint_quad(gpui::fill(
                                 bar,
@@ -604,11 +678,23 @@ mod display_tests {
     }
 
     #[test]
+    fn visible_range_peaks_match_the_same_slice_of_the_full_waveform() {
+        let b = buckets(&[0.1, 0.9, 0.2, 0.3, 0.8, 0.1, 0.0, 0.4]);
+        let d = Duration::from_secs(8);
+        // Second half of the axis at two columns = last two of four.
+        assert_eq!(column_peaks_range(&b, d, d, 0.5, 1.0, 2), vec![0.8, 0.4]);
+        assert_eq!(column_peaks_range(&b, d, d, 0.25, 0.5, 1), vec![0.3]);
+        assert!(column_peaks_range(&b, d, d, 0.5, 1.0, 0).is_empty());
+    }
+
+    #[test]
     fn peak_cache_reuses_layouts_and_stays_bounded() {
         let mut cache = PeakCache::default();
         let key = |columns| PeakKey {
             stream_index: 1,
             columns,
+            from_milli: 0,
+            to_milli: 1000,
             duration: Duration::from_secs(10),
             source: 42,
         };

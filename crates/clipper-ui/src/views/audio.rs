@@ -1455,7 +1455,7 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
         .child(
             div()
                 .flex_1()
-                .child(muted(&t, "Mix + one track per source")),
+                .child(muted(&t, "Combined/Master + one track per source")),
         )
         .child(test);
 

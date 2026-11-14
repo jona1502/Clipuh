@@ -2,12 +2,14 @@
 //! The source file is only ever read; exports go to a new file next to it.
 
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use clipper_editor::timeline::{self as view, HeightLimits, TrackId};
 use clipper_editor::{AudioTrack, EditSession, format_timestamp, parse_timestamp};
 use clipper_media::audio::WaveformSet;
 use clipper_media::player::{Player, PlayerEvent, PlayerFrame};
@@ -120,7 +122,18 @@ pub struct ClipEditor {
     start_input: Entity<TextInput>,
     end_input: Entity<TextInput>,
     tab: usize,
+    /// Horizontal zoom: the time axis is `viewport * zoom - TIMELINE_END_PAD`
+    /// pixels wide (see `clipper_editor::timeline`).
     zoom: f32,
+    /// Horizontal scroll of the timeline tracks.
+    timeline_scroll: gpui::ScrollHandle,
+    /// Visible timeline viewport (screen bounds of the scrolling area).
+    timeline_viewport: Rc<Cell<Bounds<Pixels>>>,
+    zoom_focus: FocusHandle,
+    /// Row heights the user dragged, per track; others use the defaults.
+    track_heights: HashMap<TrackId, f32>,
+    /// Row being resized: track, pointer y at the start, height at the start.
+    resizing: Option<(TrackId, Pixels, f32)>,
     dragging: Option<bool>,
     drag_origin: Option<(Pixels, Trim)>,
     thumbnails: Vec<Arc<RenderImage>>,
@@ -253,6 +266,11 @@ impl ClipEditor {
             end_input,
             tab: 0,
             zoom: 1.,
+            timeline_scroll: gpui::ScrollHandle::new(),
+            timeline_viewport: Rc::default(),
+            zoom_focus: cx.focus_handle().tab_stop(true),
+            track_heights: HashMap::new(),
+            resizing: None,
             dragging: None,
             drag_origin: None,
             thumbnails: Vec::new(),
@@ -664,6 +682,84 @@ impl ClipEditor {
         cx.notify();
     }
 
+    /// Height of a timeline row (header and track share it).
+    pub(super) fn track_height(&self, id: TrackId, limits: HeightLimits) -> f32 {
+        self.track_heights
+            .get(&id)
+            .map_or(limits.default, |height| limits.clamp(*height))
+    }
+
+    /// Continues a row resize drag at pointer `y`.
+    pub(super) fn drag_resize(&mut self, y: Pixels, limits: HeightLimits, cx: &mut Context<Self>) {
+        let Some((id, start_y, start_height)) = self.resizing else {
+            return;
+        };
+        let height = limits.clamp(start_height + f32::from(y - start_y));
+        if self.track_heights.insert(id, height) != Some(height) {
+            cx.notify();
+        }
+    }
+
+    fn timeline_viewport_width(&self) -> f32 {
+        f32::from(self.timeline_viewport.get().size.width)
+    }
+
+    /// Width of the time axis at `zoom` for the current viewport.
+    pub(super) fn axis_width(&self, zoom: f32) -> f32 {
+        (self.timeline_viewport_width() * zoom - TIMELINE_END_PAD).max(1.)
+    }
+
+    pub(super) fn max_zoom(&self) -> f32 {
+        self.duration.map_or(view::MIN_MAX_ZOOM, |duration| {
+            view::max_zoom(duration, self.timeline_viewport_width())
+        })
+    }
+
+    /// Sets the zoom, keeping the instant at `anchor_x` (pixels from the
+    /// viewport's left edge) in place: the pointer for Ctrl+wheel, otherwise
+    /// the playhead when visible, else the viewport centre. Only the view
+    /// changes; no media time or edit is touched.
+    pub(super) fn set_zoom(&mut self, zoom: f32, anchor_x: Option<f32>, cx: &mut Context<Self>) {
+        let Some(duration) = self.duration else {
+            return;
+        };
+        let viewport = self.timeline_viewport_width();
+        let zoom = view::clamp_zoom(zoom, duration, viewport);
+        if (zoom - self.zoom).abs() < f32::EPSILON {
+            return;
+        }
+        if viewport > TIMELINE_END_PAD {
+            let offset = self.timeline_scroll.offset();
+            let scroll = -f32::from(offset.x);
+            let old_axis = self.axis_width(self.zoom);
+            let anchor = anchor_x.unwrap_or_else(|| {
+                let playhead =
+                    clipper_editor::time_to_pixel(self.position, duration, old_axis) - scroll;
+                if (0. ..=viewport).contains(&playhead) {
+                    playhead
+                } else {
+                    viewport / 2.
+                }
+            });
+            let next = view::anchored_scroll(
+                scroll,
+                anchor,
+                old_axis,
+                self.axis_width(zoom),
+                viewport,
+                TIMELINE_END_PAD,
+            );
+            self.timeline_scroll
+                .set_offset(gpui::point(px(-next), offset.y));
+        }
+        self.zoom = zoom;
+        cx.notify();
+    }
+
+    pub(super) fn zoom_by(&mut self, factor: f32, anchor_x: Option<f32>, cx: &mut Context<Self>) {
+        self.set_zoom(self.zoom * factor, anchor_x, cx);
+    }
+
     fn seek(&mut self, position: Duration, cx: &mut Context<Self>) {
         let (Some(player), Some(duration)) =
             (self.player.as_ref().filter(|_| self.ready), self.duration)
@@ -898,6 +994,9 @@ fn position_fraction(x: Pixels, bounds: Bounds<Pixels>) -> f32 {
     }
     (f32::from(x - bounds.origin.x) / width).clamp(0.0, 1.0)
 }
+
+/// Room after the end of the time axis (last ruler label), in pixels.
+pub(super) const TIMELINE_END_PAD: f32 = 48.;
 
 /// Smallest playhead movement worth a redraw, in logical pixels.
 const PLAYHEAD_MIN_STEP_PX: f32 = 0.5;
