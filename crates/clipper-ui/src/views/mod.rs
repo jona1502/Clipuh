@@ -852,13 +852,13 @@ impl ClipperWindow {
                     .track_focus(focus)
                     .flex()
                     .items_center()
-                    .gap_3()
+                    .gap_2p5()
                     .h(px(NAV_ITEM_HEIGHT))
-                    .px_4()
+                    .px_3()
                     .rounded_lg()
                     .border_1()
                     .cursor_pointer()
-                    .text_lg()
+                    .text_sm()
                     .map(|this| {
                         if active {
                             this.bg(t.colors.accent.opacity(ACTIVE_NAV_ALPHA))
@@ -878,7 +878,7 @@ impl ClipperWindow {
                         page.shortcut().join("+")
                     )))
                     .child(
-                        icon(page.icon(), px(20.))
+                        icon(page.icon(), px(16.))
                             .when(!active, |icon| icon.text_color(t.colors.text_secondary)),
                     )
                     .child(div().flex_1().truncate().child(page.label()))
@@ -897,10 +897,10 @@ impl ClipperWindow {
             .h_full()
             .flex()
             .flex_col()
-            .gap(px(28.))
-            .px_4()
-            .pt_6()
-            .pb_8()
+            .gap(px(16.))
+            .px_3()
+            .pt_5()
+            .pb_5()
             // Short windows scroll the sidebar instead of clipping storage.
             .overflow_y_scroll()
             .bg(t.colors.sidebar)
@@ -912,11 +912,11 @@ impl ClipperWindow {
                     .items_center()
                     .gap_2p5()
                     .px_2()
-                    .h(px(40.))
-                    .child(img(brand_logo()).size(px(34.)).flex_none())
+                    .h(px(32.))
+                    .child(img(brand_logo()).size(px(24.)).flex_none())
                     .child(
                         div()
-                            .text_2xl()
+                            .text_lg()
                             .font_weight(FontWeight::BOLD)
                             .child("clipuh"),
                     )
@@ -924,13 +924,13 @@ impl ClipperWindow {
                     .child(
                         div()
                             .flex_none()
-                            .mt(px(6.))
+                            .mt(px(4.))
                             .text_xs()
                             .text_color(t.colors.text_muted)
                             .child(version_label()),
                     ),
             )
-            .child(div().flex().flex_col().gap_2().children(navigation))
+            .child(div().flex().flex_col().gap_1().children(navigation))
             .child(
                 div()
                     .mt_auto()
@@ -1100,10 +1100,10 @@ impl ClipperWindow {
 }
 
 /// Sidebar width at the default density; the capture bar takes the rest.
-const SIDEBAR_WIDTH: f32 = 240.0;
+const SIDEBAR_WIDTH: f32 = 200.0;
 /// Navigation row height and the active row's accent fill (references: tall
 /// rows, a solid but dimmed accent so the label stays readable).
-const NAV_ITEM_HEIGHT: f32 = 52.0;
+const NAV_ITEM_HEIGHT: f32 = 36.0;
 const ACTIVE_NAV_ALPHA: f32 = 0.6;
 
 /// Free space on the recordings volume with a usage bar, laid out like the

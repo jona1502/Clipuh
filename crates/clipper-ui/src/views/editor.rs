@@ -938,12 +938,22 @@ fn file_name(path: &Path) -> String {
 
 /// The Editor page when no clip is open.
 pub(super) fn empty(t: &Theme) -> Div {
-    panel(t).child(empty_state(
-        t,
-        "◫",
-        "No clip open",
-        "Open the Clips page and choose Edit on a saved clip to play, trim and export it.",
-    ))
+    panel(t)
+        .w_full()
+        .max_w(px(440.))
+        .mx_auto()
+        .mt_8()
+        .p_6()
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap_4()
+        .child(empty_state(
+            t,
+            "◫",
+            "No clip open",
+            "Open the Clips page and choose Edit on a saved clip to play, trim and export it.",
+        ))
 }
 
 mod audio;

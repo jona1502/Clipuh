@@ -436,24 +436,6 @@ impl Render for ClipLibrary {
             .flex()
             .flex_col()
             .gap_3()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(
-                        div()
-                            .text_xl()
-                            .text_color(t.colors.text_secondary)
-                            .child("▣"),
-                    )
-                    .child(
-                        div()
-                            .text_2xl()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .child("Library"),
-                    ),
-            )
             .child(toolbar)
             .child(count);
         if let Some(message) = &self.notice {
