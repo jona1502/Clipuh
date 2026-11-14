@@ -5,6 +5,8 @@
 //! B: save, then stop immediately; stop must finish and the save must end.
 //! C: restart, save, stop.
 //! D: stop while several saves are queued.
+//! E: write failure, then recovery. F: manual recording into the same folder.
+//! `out=<folder>` saves into that folder instead of a temp one.
 //!
 //! `cargo run --release -p clipper-recorder --example replay_stress -- fill=12`
 #[cfg(windows)]
@@ -137,7 +139,12 @@ mod stress {
         let fill = Duration::from_secs(fill);
         let base =
             std::env::temp_dir().join(format!("clipper-replay-stress-{}", std::process::id()));
-        let output = base.join("clips");
+        // `out=<folder>` stands in for the Settings clip folder (any path:
+        // spaces, Unicode, another drive).
+        let output = std::env::args()
+            .skip(1)
+            .find_map(|arg| arg.strip_prefix("out=").map(PathBuf::from))
+            .unwrap_or_else(|| base.join("clips"));
         let cache = base.join("cache");
         println!("output={}", output.display());
 
@@ -260,6 +267,34 @@ mod stress {
             "E",
             failed && stopped.is_some() && recovered && stopped_again.is_some(),
             format!("failure reported={failed}, next save ok={recovered}"),
+        ));
+
+        println!("== F: manual recording into the clip folder");
+        handle
+            .send(RecorderCommand::StartRecording {
+                source: source.clone(),
+                options: options(output.clone(), cache.clone(), Duration::from_secs(10)).recording,
+            })
+            .expect("send record");
+        run.drain_for(Duration::from_secs(5));
+        handle
+            .send(RecorderCommand::StopRecording)
+            .expect("send stop");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut recorded = None;
+        while recorded.is_none() && Instant::now() < deadline {
+            if let Some(RecorderEvent::RecordingFinished { path, .. }) =
+                run.next(Duration::from_millis(100))
+            {
+                recorded = Some(path);
+            }
+        }
+        verdicts.push((
+            "F",
+            recorded
+                .as_ref()
+                .is_some_and(|path| path.starts_with(&output) && path.exists()),
+            format!("recording {recorded:?}"),
         ));
 
         let mut names: Vec<_> = run.saved.iter().collect();

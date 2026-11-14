@@ -59,6 +59,8 @@ struct Recording {
     started: Instant,
     final_path: PathBuf,
     partial: PathBuf,
+    /// Source label of each audio track, in encoder order (file metadata).
+    audio_labels: Vec<String>,
     wake: Receiver<()>,
     source_closed: Arc<AtomicBool>,
 }
@@ -801,6 +803,7 @@ impl Worker<'_> {
             started,
             final_path,
             partial,
+            audio_labels,
             ..
         } = recording;
         // Stop frames first, then drain and finalize the encoder.
@@ -827,21 +830,31 @@ impl Worker<'_> {
             finish
         };
         let outcome = match classify_stop(counters.encoded, finish) {
-            StopOutcome::Success => match fs::rename(&partial, &final_path) {
-                Ok(()) => Ok(()),
-                Err(error) => {
-                    // The partial file is complete and playable: keep it.
-                    self.lifecycle.stopped();
-                    self.send(RecorderEvent::RecordingFailed {
+            StopOutcome::Success => {
+                // Best effort: an unnamed file is still a complete recording.
+                if let Err(error) =
+                    clipper_replay::track_names::name_audio_tracks(&partial, &audio_labels)
+                {
+                    log(format_args!(
+                        "recording: audio track names not written: {error}"
+                    ));
+                }
+                match fs::rename(&partial, &final_path) {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        // The partial file is complete and playable: keep it.
+                        self.lifecycle.stopped();
+                        self.send(RecorderEvent::RecordingFailed {
                         message: format!(
                             "the recording is complete but could not be renamed to {} ({error}); it was kept as {}",
                             final_path.display(),
                             partial.display()
                         ),
                     });
-                    return;
+                        return;
+                    }
                 }
-            },
+            }
             StopOutcome::Failure(message) => Err(message),
         };
         self.lifecycle.stopped();
@@ -905,6 +918,7 @@ fn build_recording(
     // when separate), so it must exist before the encoder.
     let plan = AudioPlan::for_session(&options.audio, Some(source));
     let audio_reporter = AudioReporter::new(plan.idle_states());
+    let audio_labels = plan.labels();
     let encoder =
         HardwareEncoder::create_with_audio(mf, &d3d, &config, &partial, plan.encoder_tracks())
             .map_err(|error| encoder_message(&error))?;
@@ -931,6 +945,7 @@ fn build_recording(
         started: Instant::now(),
         final_path,
         partial,
+        audio_labels,
         wake,
         source_closed,
     })

@@ -23,6 +23,7 @@ pub mod mp4;
 pub mod packet;
 pub mod plan;
 pub mod ram;
+pub mod track_names;
 
 pub use error::ReplayError;
 pub use packet::{CodecConfig, EncodedPacket, StreamLayout, TICKS_PER_SECOND, Ticks, TrackInfo};

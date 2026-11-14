@@ -184,6 +184,8 @@ struct Chunk {
 struct Built<'a> {
     plan: &'a TrackPlan,
     codec: &'a CodecConfig,
+    /// Source label from the layout ("Mix", "Discord.exe", "Microphone"…).
+    label: &'a str,
     timescale: u32,
     timing: Timing,
     chunks: Vec<Chunk>,
@@ -376,6 +378,25 @@ fn edit_list(built: &Built<'_>) -> Vec<u8> {
     make_box(b"edts", &elst)
 }
 
+/// Track label as a handler name: no NULs or control characters, at most
+/// 128 bytes (cut on a char boundary); the generic name when empty.
+pub(crate) fn handler_name(label: &str, video: bool) -> String {
+    let mut name: String = label.trim().chars().filter(|c| !c.is_control()).collect();
+    while name.len() > 128 {
+        name.pop();
+    }
+    if name.is_empty() {
+        if video {
+            "VideoHandler"
+        } else {
+            "SoundHandler"
+        }
+        .to_owned()
+    } else {
+        name
+    }
+}
+
 fn trak(track_id: u32, index: usize, built: &Built<'_>) -> Result<Vec<u8>, ReplayError> {
     let movie_duration = convert(built.plan.edit_duration, MOVIE_TIMESCALE);
     let video = built.plan.is_video();
@@ -407,11 +428,11 @@ fn trak(track_id: u32, index: usize, built: &Built<'_>) -> Result<Vec<u8>, Repla
     hdlr.u32(0)
         .bytes(if video { b"vide" } else { b"soun" })
         .zeros(12);
-    hdlr.bytes(if video {
-        b"VideoHandler\0"
-    } else {
-        b"SoundHandler\0"
-    });
+    // The handler name carries the track's source label, which Media
+    // Foundation reports as the stream name (MF_SD_STREAM_NAME): the editor
+    // then shows the real source instead of guessing from stream order.
+    hdlr.bytes(handler_name(built.label, video).as_bytes())
+        .bytes(&[0]);
     let hdlr = full_box(b"hdlr", 0, 0, &hdlr.0);
 
     let media_header = if video {
@@ -428,9 +449,13 @@ fn trak(track_id: u32, index: usize, built: &Built<'_>) -> Result<Vec<u8>, Repla
         &concat(&[&media_header, &dinf, &stbl(track_id, built)?]),
     );
     let mdia = make_box(b"mdia", &concat(&[&mdhd, &hdlr, &minf]));
+    let udta = make_box(
+        b"udta",
+        &make_box(b"name", handler_name(built.label, video).as_bytes()),
+    );
     Ok(make_box(
         b"trak",
-        &concat(&[&tkhd, &edit_list(built), &mdia]),
+        &concat(&[&tkhd, &edit_list(built), &mdia, &udta]),
     ))
 }
 
@@ -521,11 +546,11 @@ pub fn write_mp4<W2: Write>(
         if track.samples.is_empty() {
             return Err(invalid("track without samples"));
         }
-        let codec = &layout
+        let info = layout
             .tracks
             .get(usize::from(track.track))
-            .ok_or_else(|| invalid("plan references unknown track"))?
-            .codec;
+            .ok_or_else(|| invalid("plan references unknown track"))?;
+        let codec = &info.codec;
         let timescale = match (codec, track.is_video()) {
             (CodecConfig::H264 { .. }, true) => VIDEO_TIMESCALE,
             (CodecConfig::Aac { sample_rate, .. }, false) if *sample_rate > 0 => *sample_rate,
@@ -534,6 +559,7 @@ pub fn write_mp4<W2: Write>(
         tracks.push(Built {
             plan: track,
             codec,
+            label: &info.label,
             timescale,
             timing: timing(track, timescale)?,
             chunks: Vec::new(),
@@ -893,6 +919,34 @@ mod tests {
             u64::from_be_bytes(wide[24..32].try_into().unwrap()),
             u64::from(u32::MAX) + 1
         );
+    }
+
+    #[test]
+    fn every_track_carries_its_source_label() {
+        let plan = plan_clip(&layout(2), &simple_gops(2), ms(2000), ms(6000)).unwrap();
+        let file = mux(&plan, 2);
+        let names: Vec<String> = file
+            .windows(4)
+            .enumerate()
+            .filter(|(_, w)| *w == b"name")
+            .map(|(at, _)| {
+                let size = u32::from_be_bytes(file[at - 4..at].try_into().unwrap()) as usize;
+                String::from_utf8(file[at + 4..at - 4 + size].to_vec()).unwrap()
+            })
+            .collect();
+        // One udta/name per trak, in track order, from the layout labels.
+        assert_eq!(names, ["Video", "Audio 0", "Audio 1"]);
+    }
+
+    #[test]
+    fn handler_names_are_sanitized() {
+        assert_eq!(handler_name(" Discord.exe ", false), "Discord.exe");
+        assert_eq!(handler_name("a\0b\nc", false), "abc");
+        assert_eq!(handler_name("", false), "SoundHandler");
+        assert_eq!(handler_name("", true), "VideoHandler");
+        let long = "é".repeat(100);
+        let cut = handler_name(&long, false);
+        assert!(cut.len() <= 128 && cut.chars().all(|c| c == 'é'));
     }
 
     #[test]

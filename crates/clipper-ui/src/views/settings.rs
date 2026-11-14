@@ -1935,4 +1935,32 @@ mod tests {
         assert!(!nested.join(".clipuh-write-test").exists());
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    #[test]
+    fn clip_directory_accepts_spaces_and_unicode() {
+        let dir = std::env::temp_dir().join(format!(
+            "clipuh settings Ünïcode 片段 {}",
+            std::process::id()
+        ));
+        assert!(prepare_clip_directory(&dir).is_ok());
+        assert!(dir.is_dir());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn clip_directory_rejects_files_and_unavailable_drives() {
+        let file = std::env::temp_dir().join(format!("clipuh-not-a-folder-{}", std::process::id()));
+        std::fs::write(&file, b"x").unwrap();
+        let error = prepare_clip_directory(&file).unwrap_err();
+        assert!(error.contains("Cannot"), "{error}");
+        let _ = std::fs::remove_file(&file);
+        // A drive letter with no volume behind it.
+        let missing = ('D'..='Z')
+            .map(|letter| PathBuf::from(format!("{letter}:\\")))
+            .find(|root| !root.exists());
+        if let Some(root) = missing {
+            let error = prepare_clip_directory(&root.join("Clips")).unwrap_err();
+            assert!(error.contains("Cannot create"), "{error}");
+        }
+    }
 }

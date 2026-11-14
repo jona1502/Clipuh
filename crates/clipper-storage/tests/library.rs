@@ -431,3 +431,55 @@ fn replay_saves_are_told_apart_from_recordings_by_file_name() {
     assert!(!clip("Clipper_2026-01-02_03-04-05.mp4").is_replay());
     assert!(!clip("my clip.mp4").is_replay());
 }
+
+#[test]
+fn favoriting_never_reorders_the_grid_outside_the_favorites_tab() {
+    // The Library keeps its scroll position on favorite changes; that is only
+    // right if the shown order cannot move under the user.
+    let clips: Vec<Clip> = (0..60)
+        .map(|i| {
+            test_clip(
+                &format!("c{i:02}"),
+                &format!("Clip {i}"),
+                1_000 + i,
+                1_000 + i,
+                10 + i,
+            )
+        })
+        .collect();
+    let empty = BTreeSet::new();
+    for sort in [
+        LibrarySort::Newest,
+        LibrarySort::Oldest,
+        LibrarySort::NameAsc,
+        LibrarySort::NameDesc,
+        LibrarySort::Duration,
+        LibrarySort::Size,
+    ] {
+        for search in ["", "clip 1"] {
+            let before = query(&clips, search, None, false, &empty, sort);
+            // Near the top, the middle and the bottom, one and several at once.
+            for picked in [&["c00"][..], &["c30"], &["c59"], &["c05", "c31", "c58"]] {
+                let favorites: BTreeSet<String> =
+                    picked.iter().map(|id| (*id).to_owned()).collect();
+                assert_eq!(query(&clips, search, None, false, &favorites, sort), before);
+            }
+        }
+    }
+}
+
+#[test]
+fn unfavoriting_in_the_favorites_tab_only_drops_that_clip() {
+    let clips: Vec<Clip> = (0..10)
+        .map(|i| test_clip(&format!("c{i}"), &format!("Clip {i}"), 100 + i, 100 + i, 1))
+        .collect();
+    let mut favorites: BTreeSet<String> = ["c2", "c4", "c6", "c8"].map(String::from).into();
+    let before = query(&clips, "", None, true, &favorites, LibrarySort::Newest);
+    favorites.remove("c4");
+    let after = query(&clips, "", None, true, &favorites, LibrarySort::Newest);
+    let expected: Vec<usize> = before
+        .into_iter()
+        .filter(|&i| clips[i].id != "c4")
+        .collect();
+    assert_eq!(after, expected);
+}
