@@ -268,8 +268,19 @@ pub struct ClipperWindow {
     editor: Option<Entity<editor::ClipEditor>>,
     /// Custom accent color field on the Settings page.
     accent_input: Entity<crate::components::TextInput>,
-    /// Keyboard focus for the notification toggles on the Settings page.
-    notify_focus: [FocusHandle; 4],
+    /// The open Settings dropdown and its highlighted row.
+    settings_menu: Option<(settings::SettingsMenu, usize)>,
+    /// Scroll state of the Settings card grid; the section list jumps to
+    /// `settings_anchors[i]`, and `settings_section` is the highlighted entry.
+    settings_scroll: gpui::ScrollHandle,
+    settings_anchors: Vec<gpui::ScrollAnchor>,
+    settings_section: usize,
+    /// Whether Windows launches clipuh at sign-in, read from the registry;
+    /// `None` while a read or change is in flight.
+    startup: Option<bool>,
+    startup_error: Option<String>,
+    /// Last clip-folder or open-folder failure on the Settings page.
+    settings_notice: Option<String>,
 }
 
 impl ClipperWindow {
@@ -406,6 +417,11 @@ impl ClipperWindow {
             .collect();
 
         let accent_input = settings::accent_input(&config, window, cx);
+        let settings_scroll = gpui::ScrollHandle::new();
+        let settings_anchors = settings::SECTIONS
+            .iter()
+            .map(|_| gpui::ScrollAnchor::for_handle(settings_scroll.clone()))
+            .collect();
         // System mode follows the OS light/dark setting the moment it changes.
         cx.observe_window_appearance(window, |this, _, cx| {
             crate::theme::apply(&this.config.appearance, cx)
@@ -479,12 +495,13 @@ impl ClipperWindow {
             library,
             editor: None,
             accent_input,
-            // Settings page, after every Capture page control (0-11).
-            notify_focus: std::array::from_fn(|index| {
-                cx.focus_handle()
-                    .tab_index(12 + index as isize)
-                    .tab_stop(true)
-            }),
+            settings_menu: None,
+            settings_scroll,
+            settings_anchors,
+            settings_section: 0,
+            startup: None,
+            startup_error: None,
+            settings_notice: None,
         };
         this.storage_projection_cache.refresh(&this.config);
         this.refresh_storage(cx);
@@ -607,6 +624,11 @@ impl ClipperWindow {
         }
         // An open capture menu belongs to the page being left.
         self.capture_menu = None;
+        self.settings_menu = None;
+        if page == Page::Settings && self.active_page != page {
+            // Picks up changes made outside clipuh (Task Manager, Settings app).
+            self.sync_startup(None, cx);
+        }
         let palette_was_open = self.palette.take().is_some();
         if palette_was_open {
             window.focus(&self.focus);
@@ -792,7 +814,7 @@ impl ClipperWindow {
             )
     }
 
-    fn page_content(&self, window: &Window, cx: &mut Context<Self>) -> Div {
+    fn page_content(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         match self.active_page {
             Page::Dashboard => dashboard::content(self, window, cx),
             Page::Clips => div().h_full().child(self.library.clone()),
@@ -1008,6 +1030,7 @@ impl Render for ClipperWindow {
                 .size_full()
                 .child(editor.clone());
         }
+        let full_height = matches!(self.active_page, Page::Clips | Page::Settings);
         let t = *cx.theme();
         self.snapshot_audio_focus(window);
         let palette = self
@@ -1078,12 +1101,14 @@ impl Render for ClipperWindow {
                             .child(
                                 div()
                                     .w_full()
-                                    .when(self.active_page == Page::Clips, |d| d.h_full())
-                                    .when(
-                                        self.active_page != Page::Clips
-                                            && self.active_page != Page::Editor,
-                                        |d| d.max_w(px(960.)).mx_auto(),
-                                    )
+                                    // Library and Settings scroll inside themselves.
+                                    .when(full_height, |d| d.h_full())
+                                    .when(self.active_page == Page::Settings, |d| {
+                                        d.max_w(px(1440.)).mx_auto()
+                                    })
+                                    .when(!full_height && self.active_page != Page::Editor, |d| {
+                                        d.max_w(px(960.)).mx_auto()
+                                    })
                                     .when(self.active_page == Page::Editor, |d| d.p_3())
                                     .when(self.active_page != Page::Editor, |d| d.px_8().py_6())
                                     .child(self.page_content(window, cx)),
