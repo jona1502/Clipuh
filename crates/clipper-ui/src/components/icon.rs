@@ -21,11 +21,13 @@ pub enum Icon {
     Keyboard,
     Microphone,
     Monitor,
+    More,
     Palette,
     Settings,
     StarFilled,
     Video,
     Volume,
+    VolumeOff,
 }
 
 impl Icon {
@@ -42,11 +44,13 @@ impl Icon {
             Self::Keyboard => "\u{E765}",
             Self::Microphone => "\u{E720}",
             Self::Monitor => "\u{E7F4}",
+            Self::More => "\u{E712}",
             Self::Palette => "\u{E790}",
             Self::Settings => "\u{E713}",
             Self::StarFilled => "\u{E735}",
             Self::Video => "\u{E714}",
             Self::Volume => "\u{E767}",
+            Self::VolumeOff => "\u{E74F}",
         }
     }
 }

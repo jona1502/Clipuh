@@ -429,6 +429,16 @@ pub struct AudioSourceSettings {
     pub enabled: bool,
     #[serde(default = "default_gain")]
     pub gain_percent: u16,
+    /// Contributes silence while keeping its track and its gain setting.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub muted: bool,
+    /// When any source is soloed, only soloed sources are audible.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub solo: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl AudioSourceSettings {
@@ -514,6 +524,8 @@ impl Default for AudioSettings {
             target: None,
             enabled: true,
             gain_percent: 100,
+            muted: false,
+            solo: false,
         };
         Self {
             separate_tracks: true,
@@ -547,6 +559,19 @@ impl AudioSettings {
         find_duplicate(&self.sources, kind, target)
     }
 
+    /// Gain the engine applies to source `id` (0..=MAX): its gain, or 0 when
+    /// it is muted or another enabled source is soloed. Mute wins over solo,
+    /// several soloed sources stay audible together, and the configured
+    /// `gain_percent` is never touched (unmute restores it).
+    pub fn effective_gain_percent(&self, id: u32) -> u16 {
+        let any_solo = self.sources.iter().any(|s| s.enabled && s.solo);
+        self.sources
+            .iter()
+            .find(|s| s.id == id)
+            .filter(|s| !s.muted && (!any_solo || s.solo))
+            .map_or(0, |s| s.gain_percent.min(MAX_AUDIO_GAIN_PERCENT))
+    }
+
     /// Enabled, valid sources in order.
     pub fn recording_options(&self) -> RecordingAudioOptions {
         RecordingAudioOptions {
@@ -558,7 +583,7 @@ impl AudioSettings {
                     Some(RecordingAudioSource {
                         id: s.id,
                         target: s.recording_target()?,
-                        gain_percent: s.gain_percent.min(MAX_AUDIO_GAIN_PERCENT),
+                        gain_percent: self.effective_gain_percent(s.id),
                     })
                 })
                 .collect(),
@@ -596,6 +621,8 @@ impl AudioSettings {
                     target,
                     enabled: enabled.unwrap_or(true),
                     gain_percent: gain.unwrap_or(100),
+                    muted: false,
+                    solo: false,
                 };
             self.sources = vec![
                 row(
@@ -1626,7 +1653,100 @@ mod tests {
             target: target.map(str::to_owned),
             enabled: true,
             gain_percent: 100,
+            muted: false,
+            solo: false,
         }
+    }
+
+    fn mixer(rows: &[(bool, u16, bool, bool)]) -> AudioSettings {
+        AudioSettings {
+            sources: rows
+                .iter()
+                .enumerate()
+                .map(|(i, &(enabled, gain, muted, solo))| AudioSourceSettings {
+                    enabled,
+                    gain_percent: gain,
+                    muted,
+                    solo,
+                    ..source(
+                        i as u32 + 1,
+                        [
+                            AudioSourceType::Desktop,
+                            AudioSourceType::Microphone,
+                            AudioSourceType::Game,
+                        ][i % 3],
+                        None,
+                    )
+                })
+                .collect(),
+            ..AudioSettings::default()
+        }
+    }
+
+    fn effective(audio: &AudioSettings) -> Vec<u16> {
+        audio
+            .sources
+            .iter()
+            .map(|s| audio.effective_gain_percent(s.id))
+            .collect()
+    }
+
+    #[test]
+    fn mute_and_solo_decide_the_effective_gain() {
+        // No solo: gains as set, muted rows silent, gain setting kept.
+        let audio = mixer(&[(true, 80, false, false), (true, 150, true, false)]);
+        assert_eq!(effective(&audio), [80, 0]);
+        assert_eq!(audio.sources[1].gain_percent, 150);
+        // Solo: only soloed rows play; several soloed rows play together.
+        let audio = mixer(&[
+            (true, 80, false, true),
+            (true, 100, false, false),
+            (true, 120, false, true),
+        ]);
+        assert_eq!(effective(&audio), [80, 0, 120]);
+        // Mute beats solo.
+        let audio = mixer(&[(true, 80, true, true), (true, 100, false, false)]);
+        assert_eq!(effective(&audio), [0, 0]);
+        // A solo on a disabled row does not silence the recorded ones.
+        let audio = mixer(&[(false, 80, false, true), (true, 100, false, false)]);
+        assert_eq!(effective(&audio)[1], 100);
+        // Unknown id and out-of-range gain.
+        assert_eq!(audio.effective_gain_percent(99), 0);
+        let audio = mixer(&[(true, 900, false, false)]);
+        assert_eq!(effective(&audio), [MAX_AUDIO_GAIN_PERCENT]);
+    }
+
+    #[test]
+    fn recording_options_carry_the_effective_gain() {
+        let config = AppConfig {
+            audio: mixer(&[(true, 80, false, false), (true, 150, true, false)]),
+            ..AppConfig::default()
+        };
+        let gains: Vec<u16> = config
+            .audio
+            .recording_options()
+            .sources
+            .iter()
+            .map(|s| s.gain_percent)
+            .collect();
+        assert_eq!(gains, [80, 0]);
+    }
+
+    #[test]
+    fn mute_and_solo_persist_and_old_files_default_to_off() {
+        let temp = TestDir::new();
+        let path = temp.path("settings.toml");
+        let config = AppConfig {
+            audio: mixer(&[(true, 80, true, false), (true, 100, false, true)]),
+            ..AppConfig::default()
+        };
+        config.save_to(&path).expect("save");
+        let loaded = AppConfig::load_from(&path).expect("load");
+        assert_eq!(loaded.audio.sources, config.audio.sources);
+        let old = load_toml(
+            "[[audio.sources]]\nid = 1\nkind = \"desktop\"\nenabled = true\ngain_percent = 90\n",
+        );
+        assert!(!old.audio.sources[0].muted && !old.audio.sources[0].solo);
     }
 
     fn load_toml(contents: &str) -> AppConfig {

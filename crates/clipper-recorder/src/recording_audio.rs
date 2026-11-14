@@ -44,7 +44,8 @@ impl AudioSink for PacketEncoder {
 }
 
 /// Meter events go out at most this often (10 Hz).
-const METER_INTERVAL: Duration = Duration::from_millis(100);
+/// Meter refresh: ~30 Hz is smooth once the UI interpolates, and cheap.
+const METER_INTERVAL: Duration = Duration::from_millis(33);
 
 /// Mixer sources resolved against the session's capture source and the
 /// Windows version.
@@ -519,7 +520,8 @@ impl RecordingAudio {
     pub fn levels(&self) -> Vec<SourceLevel> {
         let mut out: Vec<SourceLevel> = Vec::new();
         for (index, track) in self.tracks.iter().enumerate() {
-            let peak = (self.capture.levels(index).peak * track.gain).min(1.0);
+            // Held peak since the last report: no transient or clip is missed.
+            let peak = (self.capture.take_peak(index) * track.gain).min(1.0);
             match out.iter_mut().find(|l| l.source == track.source) {
                 Some(level) => level.peak = level.peak.max(peak),
                 None => out.push(SourceLevel {
@@ -1248,7 +1250,8 @@ mod tests {
         assert!(!levels_changed(&level(0.0), &level(0.0)));
         assert!(!levels_changed(&level(0.4), &level(0.4)));
         assert!(levels_changed(&level(0.4), &level(0.0)));
-        assert!(METER_INTERVAL >= Duration::from_millis(100));
+        // ~30 Hz: smooth meters, bounded event traffic.
+        assert!((Duration::from_millis(16)..=Duration::from_millis(50)).contains(&METER_INTERVAL));
     }
 
     #[test]

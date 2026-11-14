@@ -11,17 +11,18 @@ use clipper_core::recording::{
     AudioSourceState, AudioSourceStatus, MAX_AUDIO_GAIN_PERCENT, MAX_RECORDED_AUDIO_SOURCES,
     RecorderCommand, SourceLevel,
 };
+use clipper_platform::windows::tray;
 use clipper_storage::{AudioSourceSettings, AudioSourceType, MAX_AUDIO_SOURCES};
 use gpui::prelude::*;
 use gpui::{
-    Bounds, Context, Div, FocusHandle, MouseButton, Pixels, SharedString, Window, anchored, canvas,
-    deferred, div, px, relative,
+    AnyElement, App, Bounds, Context, Div, ElementId, FocusHandle, FontWeight, Hsla, MouseButton,
+    Pixels, SharedString, Window, anchored, canvas, deferred, div, fill, point, px, size,
 };
 
 use super::{ClipperWindow, Confirm, Dismiss, SelectNext, SelectPrevious};
 use crate::components::{
-    ButtonVariant, DropdownOption, Icon, Tone, button, dropdown, icon_card, icon_tile, slider,
-    status_dot, step, toggle, tooltip,
+    Activate, ButtonVariant, DropdownOption, Icon, Tone, button, icon, icon_card, icon_tile,
+    slider, status_dot, step, toggle, tooltip,
 };
 use crate::theme::{ActiveTheme, Theme};
 
@@ -29,12 +30,11 @@ use crate::theme::{ActiveTheme, Theme};
 pub(super) const ADD_CONTEXT: &str = "AudioAdd";
 /// Focus-map key of the "Separate tracks" toggle (not a source id).
 const TRACKS_KEY: u32 = u32::MAX;
-/// Meter redraws are limited to 10 Hz.
-const LEVEL_MIN_INTERVAL: Duration = Duration::from_millis(100);
-/// Smaller peak changes are invisible on a 6 px bar.
-const LEVEL_EPSILON: f32 = 0.02;
-/// Peaks at or below this read as silence.
-const LEVEL_SILENCE: f32 = 0.005;
+/// Meter animation step while the mixer is visible and a meter moves
+/// (~30 Hz, the engine's reporting rate; idle when everything is settled).
+const METER_FRAME: Duration = Duration::from_millis(33);
+/// Segments of a level meter (3 dB each on the 60 dB scale).
+const METER_SEGMENTS: usize = 40;
 const IDLE_APP_HINT: &str = "Starts capturing when the app plays audio";
 const NO_LOOPBACK: &str = "Needs Windows 11 or Windows 10 build 20348+";
 
@@ -44,6 +44,8 @@ pub(super) struct RowFocus {
     menu: FocusHandle,
     slider: FocusHandle,
     toggle: FocusHandle,
+    solo: FocusHandle,
+    mute: FocusHandle,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,36 +97,6 @@ fn row_unavailable(
         }
         _ => None,
     }
-}
-
-/// Whether a meter update is worth a redraw: the source set changed, a peak moved by at
-/// least `LEVEL_EPSILON`, and at least `LEVEL_MIN_INTERVAL` passed since the last redraw.
-pub(super) fn levels_need_redraw(
-    shown: &[SourceLevel],
-    next: &[SourceLevel],
-    since_last: Option<Duration>,
-) -> bool {
-    let sources_differ =
-        shown.len() != next.len() || shown.iter().zip(next).any(|(a, b)| a.source != b.source);
-    if sources_differ {
-        return true;
-    }
-    // The engine sends only on change, so a drop to silence may be the last update:
-    // never throttle it away or the meter would stick.
-    if shown
-        .iter()
-        .zip(next)
-        .any(|(a, b)| a.peak > LEVEL_SILENCE && b.peak <= LEVEL_SILENCE)
-    {
-        return true;
-    }
-    if since_last.is_some_and(|d| d < LEVEL_MIN_INTERVAL) {
-        return false;
-    }
-    shown
-        .iter()
-        .zip(next)
-        .any(|(a, b)| (a.peak - b.peak).abs() >= LEVEL_EPSILON)
 }
 
 /// Name and subtitle of a row. `resolved` is the friendly application name or the device name.
@@ -209,6 +181,8 @@ impl ClipperWindow {
                 menu: cx.focus_handle().tab_index(12).tab_stop(true),
                 slider: cx.focus_handle().tab_index(12).tab_stop(true),
                 toggle: cx.focus_handle().tab_index(12).tab_stop(true),
+                solo: cx.focus_handle().tab_index(12).tab_stop(true),
+                mute: cx.focus_handle().tab_index(12).tab_stop(true),
             })
             .clone()
     }
@@ -217,7 +191,10 @@ impl ClipperWindow {
         let mut set = self.audio_focused.borrow_mut();
         set.clear();
         for (id, f) in self.audio_focus.borrow().iter() {
-            for (slot, h) in [&f.menu, &f.slider, &f.toggle].into_iter().enumerate() {
+            for (slot, h) in [&f.menu, &f.slider, &f.toggle, &f.solo, &f.mute]
+                .into_iter()
+                .enumerate()
+            {
                 if h.is_focused(window) {
                     set.insert((*id, slot as u8));
                 }
@@ -225,7 +202,7 @@ impl ClipperWindow {
         }
     }
 
-    /// `slot` is 0 menu, 1 slider, 2 toggle (the `RowFocus` fields).
+    /// `slot` is 0 menu, 1 slider, 2 on/off, 3 solo, 4 mute (`RowFocus` fields).
     fn is_focused(&self, row: u32, slot: u8) -> bool {
         self.audio_focused.borrow().contains(&(row, slot))
     }
@@ -315,11 +292,48 @@ impl ClipperWindow {
         }
         source.gain_percent = gain_percent;
         self.audio_gain_dirty = true;
+        // A muted or solo-silenced source keeps sending 0: the slider edits
+        // the setting, mute and solo decide what is heard.
+        let gain_percent = self.config.audio.effective_gain_percent(id);
         self.send(RecorderCommand::SetAudioGain {
             source: id,
             gain_percent,
         });
         cx.notify();
+    }
+
+    /// Sends every source's effective gain (mute/solo changed). The engine
+    /// ramps each change, so toggles never click; sources a running session
+    /// does not capture are ignored by the recorder.
+    fn audio_push_gains(&mut self) {
+        let gains: Vec<(u32, u16)> = self
+            .config
+            .audio
+            .sources
+            .iter()
+            .filter(|s| s.enabled)
+            .map(|s| (s.id, self.config.audio.effective_gain_percent(s.id)))
+            .collect();
+        for (source, gain_percent) in gains {
+            self.send(RecorderCommand::SetAudioGain {
+                source,
+                gain_percent,
+            });
+        }
+    }
+
+    fn audio_set_flag(
+        &mut self,
+        id: u32,
+        edit: impl FnOnce(&mut AudioSourceSettings),
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(source) = self.config.audio.sources.iter_mut().find(|s| s.id == id) {
+            edit(source);
+            self.persist_config(cx);
+            self.audio_push_gains();
+            cx.notify();
+        }
     }
 
     /// Saves a changed gain once the drag or key press is over.
@@ -343,6 +357,8 @@ impl ClipperWindow {
             source.enabled = on;
             self.audio_notice = None;
             self.persist_config(cx);
+            // A disabled soloed row no longer silences the others.
+            self.audio_push_gains();
         }
     }
 
@@ -354,9 +370,10 @@ impl ClipperWindow {
         }
         self.audio_notice = None;
         self.persist_config(cx);
+        self.audio_push_gains();
     }
 
-    // target dropdown
+    // row menu (⋯): device or application choice, reset gain, remove
 
     /// Dropdown rows, the target each row stands for and the selected row.
     /// `None` for rows without a target choice (Game).
@@ -421,10 +438,35 @@ impl ClipperWindow {
         Some((options, values, selected))
     }
 
+    /// Rows of the ⋯ menu and what each does: the source's device or
+    /// application choices (none for Game), then Reset gain and Remove.
+    fn row_menu_items(&self, id: u32) -> (Vec<DropdownOption>, Vec<RowAction>, usize) {
+        let (mut options, mut actions, selected) = match self.audio_target_options(id) {
+            Some((options, values, selected)) => (
+                options,
+                values.into_iter().map(RowAction::Target).collect(),
+                selected,
+            ),
+            None => (Vec::new(), Vec::new(), 0),
+        };
+        let action = |label: &str| DropdownOption {
+            label: label.to_owned().into(),
+            detail: None,
+            enabled: true,
+            reason: None,
+        };
+        options.push(action("Reset gain to 0 dB"));
+        actions.push(RowAction::ResetGain);
+        options.push(action("Remove source"));
+        actions.push(RowAction::Remove);
+        (options, actions, selected)
+    }
+
     fn audio_menu_toggle(&mut self, id: u32, cx: &mut Context<Self>) {
         if self.audio_menu.is_some_and(|(open, _)| open == id) {
             self.audio_menu = None;
-        } else if let Some((_, _, selected)) = self.audio_target_options(id) {
+        } else if self.audio_source(id).is_some() {
+            let (_, _, selected) = self.row_menu_items(id);
             self.audio_menu = Some((id, selected));
             self.refresh_audio_lists(cx);
         }
@@ -439,14 +481,19 @@ impl ClipperWindow {
 
     fn audio_menu_apply(&mut self, id: u32, index: usize, cx: &mut Context<Self>) {
         self.audio_menu = None;
-        let Some((_, values, _)) = self.audio_target_options(id) else {
-            return;
-        };
-        if let Some(value) = values.get(index).cloned()
-            && let Some(source) = self.config.audio.sources.iter_mut().find(|s| s.id == id)
-        {
-            source.target = value;
-            self.persist_config(cx);
+        let (_, actions, _) = self.row_menu_items(id);
+        match actions.into_iter().nth(index) {
+            Some(RowAction::Target(value)) => {
+                if let Some(source) = self.config.audio.sources.iter_mut().find(|s| s.id == id) {
+                    source.target = value;
+                    self.persist_config(cx);
+                }
+            }
+            Some(RowAction::ResetGain) => {
+                self.audio_set_flag(id, |s| s.gain_percent = 100, cx);
+            }
+            Some(RowAction::Remove) => self.audio_remove(id, cx),
+            None => {}
         }
         cx.notify();
     }
@@ -463,13 +510,74 @@ impl ClipperWindow {
             self.audio_menu_toggle(id, cx);
             return;
         };
-        if let Some((options, _, _)) = self.audio_target_options(open) {
-            let next = step(&options, from, delta);
-            if next != from {
-                self.audio_menu = Some((open, next));
-                cx.notify();
-            }
+        let (options, _, _) = self.row_menu_items(open);
+        let next = step(&options, from, delta);
+        if next != from {
+            self.audio_menu = Some((open, next));
+            cx.notify();
         }
+    }
+
+    // meters
+
+    /// New engine readings (post-gain peaks). Only sets targets; the ticker
+    /// animates and redraws, so readings never cause a redraw on their own.
+    pub(super) fn apply_meter_levels(
+        &mut self,
+        levels: &[SourceLevel],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.meters
+            .retain(|id, _| levels.iter().any(|level| level.source == *id));
+        for level in levels {
+            self.meters.entry(level.source).or_default().set(level.peak);
+        }
+        self.ensure_meter_ticker(window, cx);
+    }
+
+    /// The mixer is on screen: Capture page, window neither hidden nor minimized.
+    fn meters_visible(&self) -> bool {
+        self.active_page == super::Page::Dashboard
+            && self.feedback.main_hwnd.is_none_or(tray::is_shown)
+    }
+
+    /// Runs the ~30 Hz meter animation only while it shows something moving;
+    /// it stops itself when every meter settled or the mixer is hidden.
+    /// Recording never depends on it.
+    fn ensure_meter_ticker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.meter_ticker.is_some()
+            || !self.meters_visible()
+            || self.meters.values().all(crate::meter::Ballistics::settled)
+        {
+            return;
+        }
+        self.meter_ticker = Some(cx.spawn_in(window, async move |this, cx| {
+            let mut last = std::time::Instant::now();
+            loop {
+                cx.background_executor().timer(METER_FRAME).await;
+                let now = std::time::Instant::now();
+                let dt = now - last;
+                last = now;
+                let running = this
+                    .update(cx, |this, cx| {
+                        for meter in this.meters.values_mut() {
+                            meter.advance(dt);
+                        }
+                        cx.notify();
+                        let running = this.meters_visible()
+                            && !this.meters.values().all(crate::meter::Ballistics::settled);
+                        if !running {
+                            this.meter_ticker = None;
+                        }
+                        running
+                    })
+                    .unwrap_or(false);
+                if !running {
+                    break;
+                }
+            }
+        }));
     }
 
     // add popup
@@ -527,6 +635,8 @@ impl ClipperWindow {
             target,
             enabled,
             gain_percent: 100,
+            muted: false,
+            solo: false,
         });
         self.audio_add = None;
         self.persist_config(cx);
@@ -554,13 +664,23 @@ impl ClipperWindow {
 
 // ---- view -----------------------------------------------------------------------------
 
+/// What a ⋯ menu row does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RowAction {
+    /// Use this device or application (`None` = Windows default).
+    Target(Option<String>),
+    ResetGain,
+    Remove,
+}
+
 /// Mixer row layout (reference: tall rows, aligned columns).
 const ROW_HEIGHT: f32 = 64.0;
 const NAME_MIN_WIDTH: f32 = 100.0;
 const NAME_MAX_WIDTH: f32 = 260.0;
-const TARGET_WIDTH: f32 = 180.0;
-const METER_MIN_WIDTH: f32 = 72.0;
-const SLIDER_WIDTH: f32 = 120.0;
+const METER_MIN_WIDTH: f32 = 80.0;
+const GAIN_LABEL_WIDTH: f32 = 72.0;
+const SLIDER_WIDTH: f32 = 160.0;
+const ROW_BUTTON: f32 = 34.0;
 
 fn kind_icon(kind: AudioSourceType) -> Icon {
     match kind {
@@ -611,6 +731,231 @@ fn popup_row(
             let hover = t.colors.surface_hover;
             r.cursor_pointer().hover(move |s| s.bg(hover))
         })
+}
+
+/// Segmented level meter (reference): dark segments light up to the smoothed
+/// level in their dBFS zone colour; the peak-hold segment stays lit, the
+/// last segment marks clipping. One canvas per row, no per-segment elements.
+fn level_meter(t: &Theme, meter: crate::meter::Ballistics) -> impl IntoElement {
+    use crate::meter::{Zone, zone};
+    let (green, yellow, red, off) = (
+        t.colors.success,
+        t.colors.warning,
+        t.colors.danger,
+        t.colors.border,
+    );
+    canvas(
+        |_, _, _| {},
+        move |bounds, _, window, _| {
+            let count = METER_SEGMENTS as f32;
+            let gap = px(2.);
+            let width = (bounds.size.width - gap * (count - 1.)) / count;
+            if width <= px(0.) {
+                return;
+            }
+            let lit = (meter.level * count).ceil() as usize;
+            let peak =
+                (meter.peak > 0.0).then(|| ((meter.peak * count).ceil() as usize).max(1) - 1);
+            for index in 0..METER_SEGMENTS {
+                let on = index < lit
+                    || peak == Some(index)
+                    || (meter.clipped && index + 1 == METER_SEGMENTS);
+                let color = if !on {
+                    off
+                } else {
+                    match zone(index, METER_SEGMENTS) {
+                        Zone::Green => green,
+                        Zone::Yellow => yellow,
+                        Zone::Red => red,
+                    }
+                };
+                let origin = point(
+                    bounds.origin.x + (width + gap) * index as f32,
+                    bounds.origin.y,
+                );
+                window.paint_quad(
+                    fill(Bounds::new(origin, size(width, bounds.size.height)), color)
+                        .corner_radii(px(1.)),
+                );
+            }
+        },
+    )
+    .w_full()
+    .h(px(10.))
+}
+
+/// Square row toggle (On/Off, S, M): tinted when active, Space/Enter work.
+#[allow(clippy::too_many_arguments)]
+fn row_button(
+    t: &Theme,
+    id: impl Into<ElementId>,
+    content: AnyElement,
+    active: bool,
+    tint: Hsla,
+    enabled: bool,
+    focus: &FocusHandle,
+    focused: bool,
+    tip: &'static str,
+    on_press: impl Fn(&mut Window, &mut App) + 'static,
+) -> gpui::Stateful<Div> {
+    let on_press = Rc::new(on_press);
+    let on_key = Rc::clone(&on_press);
+    let hover = t.colors.surface_hover;
+    div()
+        .id(id)
+        .track_focus(focus)
+        .key_context("Toggle")
+        .flex_none()
+        .size(px(ROW_BUTTON))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_md()
+        .border_1()
+        .text_sm()
+        .font_weight(FontWeight::SEMIBOLD)
+        .border_color(if focused {
+            t.colors.focus_ring
+        } else if active {
+            tint
+        } else {
+            t.colors.border
+        })
+        .bg(if active {
+            tint.opacity(0.22)
+        } else {
+            t.colors.surface
+        })
+        .text_color(if active {
+            tint
+        } else {
+            t.colors.text_secondary
+        })
+        .tooltip(tooltip(tip))
+        .child(content)
+        .when(enabled, |this| {
+            this.cursor_pointer()
+                .hover(move |style| style.bg(hover))
+                .on_click(move |_, window, cx| on_press(window, cx))
+                .on_action(move |_: &Activate, window, cx| on_key(window, cx))
+        })
+        .when(!enabled, |this| this.opacity(0.45))
+}
+
+/// The ⋯ button and its menu: device or application choices, Reset gain,
+/// Remove. Keyboard: Enter opens/applies, Up/Down move, Escape closes.
+fn row_menu(
+    t: &Theme,
+    window: &ClipperWindow,
+    id: u32,
+    highlighted: Option<usize>,
+    focus: &FocusHandle,
+    cx: &mut Context<ClipperWindow>,
+) -> AnyElement {
+    let trigger_bounds: Rc<Cell<Bounds<Pixels>>> = Rc::default();
+    let out = Rc::clone(&trigger_bounds);
+    let focused = window.is_focused(id, 0);
+    let trigger = div()
+        .id(("audio-menu", id as usize))
+        .track_focus(focus)
+        .key_context("Dropdown")
+        .relative()
+        .flex_none()
+        .size(px(ROW_BUTTON))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_md()
+        .border_1()
+        .border_color(if focused || highlighted.is_some() {
+            t.colors.focus_ring
+        } else {
+            gpui::transparent_black()
+        })
+        .cursor_pointer()
+        .text_color(t.colors.text_secondary)
+        .hover(|style| style.bg(t.colors.surface_hover))
+        .tooltip(tooltip("More: device, reset gain, remove"))
+        .child(
+            canvas(move |b, _, _| out.set(b), |_, _, _, _| {})
+                .absolute()
+                .size_full(),
+        )
+        .child(icon(Icon::More, px(16.)))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, _, cx| this.audio_menu_toggle(id, cx)),
+        );
+    let popup = highlighted.map(|highlighted| {
+        let (options, actions, selected) = window.row_menu_items(id);
+        let targets = actions
+            .iter()
+            .filter(|a| matches!(a, RowAction::Target(_)))
+            .count();
+        let mut list = div()
+            .id(("audio-menu-list", id as usize))
+            .occlude()
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            .w(px(280.))
+            .p_1()
+            .rounded_lg()
+            .border_1()
+            .border_color(t.colors.border_strong)
+            .bg(t.colors.surface)
+            .shadow_lg()
+            .on_mouse_down_out(cx.listener(move |this, _, window, cx| {
+                // Presses on the trigger toggle it themselves.
+                if !trigger_bounds.get().contains(&window.mouse_position()) {
+                    this.audio_menu_close(cx);
+                }
+            }));
+        if targets > 0 {
+            list = list.child(muted(t, "Device").px_2().pt_1());
+        }
+        for (index, option) in options.into_iter().enumerate() {
+            if index == targets {
+                list = list.child(div().h(px(1.)).my_1().bg(t.colors.border));
+            }
+            let remove = actions[index] == RowAction::Remove;
+            let row = popup_row(
+                t,
+                ("audio-menu-row", id as usize * 64 + index),
+                option.label,
+                None,
+                None,
+            )
+            .when(index == highlighted, |r| r.bg(t.colors.surface_hover))
+            .when(remove, |r| r.text_color(t.colors.danger))
+            .children(
+                (index < targets && index == selected)
+                    .then(|| div().text_color(t.colors.accent).child("✓")),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| this.audio_menu_apply(id, index, cx)));
+            list = list.child(row);
+        }
+        deferred(anchored().snap_to_window_with_margin(px(8.)).child(list))
+    });
+    div()
+        .relative()
+        .flex_none()
+        .on_action(cx.listener(move |this, _: &Confirm, _, cx| this.audio_menu_confirm(id, cx)))
+        .on_action(cx.listener(move |this, _: &SelectNext, _, cx| this.audio_menu_step(id, 1, cx)))
+        .on_action(
+            cx.listener(move |this, _: &SelectPrevious, _, cx| this.audio_menu_step(id, -1, cx)),
+        )
+        .on_action(cx.listener(move |this, _: &Dismiss, _, cx| this.audio_menu_close(cx)))
+        .child(trigger)
+        .children(popup.map(|popup| {
+            div()
+                .absolute()
+                .top(px(ROW_BUTTON + 4.))
+                .right_0()
+                .size_0()
+                .child(popup)
+        }))
+        .into_any_element()
 }
 
 pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
@@ -869,68 +1214,19 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
         {
             text = Some(IDLE_APP_HINT.into());
         }
-        let peak = window
-            .audio_levels
-            .iter()
-            .find(|l| l.source == id)
-            .map_or(0.0, |l| l.peak.clamp(0.0, 1.0));
         let overlap = (source.kind == AudioSourceType::Desktop && source.enabled)
             .then(|| overlap_note(&overlap_names))
             .flatten();
 
-        let target_cell = match window.audio_target_options(id) {
-            Some((options, _, selected)) => {
-                let (a, b, c) = (entity.clone(), entity.clone(), entity.clone());
-                div()
-                    .on_action(
-                        cx.listener(move |this, _: &Confirm, _, cx| {
-                            this.audio_menu_confirm(id, cx)
-                        }),
-                    )
-                    .on_action(cx.listener(move |this, _: &SelectNext, _, cx| {
-                        this.audio_menu_step(id, 1, cx)
-                    }))
-                    .on_action(cx.listener(move |this, _: &SelectPrevious, _, cx| {
-                        this.audio_menu_step(id, -1, cx)
-                    }))
-                    .on_action(
-                        cx.listener(move |this, _: &Dismiss, _, cx| this.audio_menu_close(cx)),
-                    )
-                    .child(dropdown(
-                        &t,
-                        ("audio-target-menu", id as usize),
-                        &options,
-                        selected,
-                        window
-                            .audio_menu
-                            .filter(|(open, _)| *open == id)
-                            .map(|(_, h)| h),
-                        &focus.menu,
-                        window.is_focused(id, 0),
-                        true,
-                        move |_, app| a.update(app, |this, cx| this.audio_menu_toggle(id, cx)),
-                        move |i, _, app| b.update(app, |this, cx| this.audio_menu_apply(id, i, cx)),
-                        move |_, app| c.update(app, |this, cx| this.audio_menu_close(cx)),
-                    ))
-                    .into_any_element()
-            }
-            None => muted(&t, "Follows the capture source").into_any_element(),
-        };
+        let highlighted = window
+            .audio_menu
+            .filter(|(open, _)| *open == id)
+            .map(|(_, h)| h);
+        let menu = row_menu(&t, window, id, highlighted, &focus.menu, cx);
 
-        let status_cell = if meter {
-            div()
-                .w_full()
-                .h(px(8.))
-                .rounded_full()
-                .bg(t.colors.border)
-                .child(
-                    div()
-                        .h_full()
-                        .rounded_full()
-                        .w(relative(peak))
-                        .bg(t.colors.accent),
-                )
-                .into_any_element()
+        // The meter shows what is recorded (post-gain, after mute/solo).
+        let level_cell = if meter {
+            level_meter(&t, window.meters.get(&id).copied().unwrap_or_default()).into_any_element()
         } else {
             let text = text.unwrap_or_default();
             div()
@@ -948,12 +1244,12 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
                 .into_any_element()
         };
 
-        let (e1, e2, e3) = (entity.clone(), entity.clone(), entity.clone());
         let gain = source.gain_percent;
+        let audible = window.config.audio.effective_gain_percent(id) > 0;
+        let e1 = entity.clone();
         let slider_cell = div()
-            .flex()
-            .items_center()
-            .gap_2()
+            .w(px(SLIDER_WIDTH))
+            .flex_none()
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| this.audio_commit_gain(cx)),
@@ -963,7 +1259,7 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
                 cx.listener(|this, _, _, cx| this.audio_commit_gain(cx)),
             )
             .on_key_up(cx.listener(|this, _, _, cx| this.audio_commit_gain(cx)))
-            .child(div().w(px(SLIDER_WIDTH)).child(slider(
+            .child(slider(
                 &t,
                 ("audio-gain", id as usize),
                 gain_to_value(gain),
@@ -971,20 +1267,86 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
                 &focus.slider,
                 window.is_focused(id, 1),
                 move |v, _, app| e1.update(app, |this, cx| this.audio_set_gain(id, v, cx)),
-            )))
-            .child(
-                div()
-                    .w(px(44.))
-                    .flex_none()
-                    .text_sm()
-                    .text_color(t.colors.text_secondary)
-                    .child(format!("{gain} %")),
-            );
+            ));
+        // The number is the gain setting in dB (not a signal level).
+        let gain_cell = div()
+            .id(("audio-gain-db", id as usize))
+            .w(px(GAIN_LABEL_WIDTH))
+            .flex_none()
+            .flex()
+            .justify_end()
+            .text_sm()
+            .text_color(if audible {
+                t.colors.text_secondary
+            } else {
+                t.colors.text_muted
+            })
+            .tooltip(tooltip(format!("Gain {gain} %")))
+            .child(crate::meter::gain_label(gain));
+
+        let (e_on, e_solo, e_mute) = (entity.clone(), entity.clone(), entity.clone());
+        let enabled = source.enabled;
+        let on_button = row_button(
+            &t,
+            ("audio-on", id as usize),
+            icon(
+                if enabled {
+                    Icon::Volume
+                } else {
+                    Icon::VolumeOff
+                },
+                px(16.),
+            )
+            .into_any_element(),
+            enabled,
+            t.colors.accent,
+            enabled || (!at_enabled_max && unavailable.is_none()),
+            &focus.toggle,
+            window.is_focused(id, 2),
+            if enabled {
+                "Recorded. Click to stop recording this source."
+            } else {
+                "Not recorded. Click to record this source."
+            },
+            move |_, app| e_on.update(app, |this, cx| this.audio_toggle(id, !enabled, cx)),
+        );
+        let solo_button = row_button(
+            &t,
+            ("audio-solo", id as usize),
+            "S".into_any_element(),
+            source.solo,
+            t.colors.warning,
+            true,
+            &focus.solo,
+            window.is_focused(id, 3),
+            "Solo: while any source is soloed, only soloed sources are heard",
+            move |_, app| {
+                e_solo.update(app, |this, cx| {
+                    this.audio_set_flag(id, |s| s.solo = !s.solo, cx)
+                })
+            },
+        );
+        let mute_button = row_button(
+            &t,
+            ("audio-mute", id as usize),
+            "M".into_any_element(),
+            source.muted,
+            t.colors.danger,
+            true,
+            &focus.mute,
+            window.is_focused(id, 4),
+            "Mute: record silence for this source, keeping its gain",
+            move |_, app| {
+                e_mute.update(app, |this, cx| {
+                    this.audio_set_flag(id, |s| s.muted = !s.muted, cx)
+                })
+            },
+        );
 
         let full_label = format!("{name} — {subtitle}");
-        // Reference rows: kind tile, name, then fixed-width control columns.
-        // Every text column truncates (full text in a tooltip), so long device
-        // names can never push into the meter, slider or buttons.
+        // Reference rows: kind tile, name, meter, gain, slider, buttons. Every
+        // text column truncates (full text in a tooltip), so long device names
+        // never push into the meter, slider or buttons.
         rows = rows.child(
             div()
                 .id(("audio-row", id as usize))
@@ -1024,38 +1386,13 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
                                 .child(note)
                         })),
                 )
-                .child(
-                    div()
-                        .w(px(TARGET_WIDTH))
-                        .flex_none()
-                        .min_w_0()
-                        .child(target_cell),
-                )
-                .child(div().flex_1().min_w(px(METER_MIN_WIDTH)).child(status_cell))
-                .child(slider_cell.flex_none())
-                .child(div().flex_none().child(toggle(
-                    &t,
-                    ("audio-on", id as usize),
-                    source.enabled,
-                    source.enabled || (!at_enabled_max && unavailable.is_none()),
-                    &focus.toggle,
-                    window.is_focused(id, 2),
-                    move |on, _, app| e2.update(app, |this, cx| this.audio_toggle(id, on, cx)),
-                )))
-                .child(
-                    button(
-                        &t,
-                        ("audio-remove", id as usize),
-                        "×",
-                        ButtonVariant::Ghost,
-                        None,
-                        true,
-                    )
-                    .tooltip(tooltip("Remove source"))
-                    .on_click(move |_, _, app| {
-                        e3.update(app, |this, cx| this.audio_remove(id, cx))
-                    }),
-                ),
+                .child(div().flex_1().min_w(px(METER_MIN_WIDTH)).child(level_cell))
+                .child(gain_cell)
+                .child(slider_cell)
+                .child(on_button)
+                .child(solo_button)
+                .child(mute_button)
+                .child(menu),
         );
     }
     if sources.is_empty() {
@@ -1219,49 +1556,6 @@ mod tests {
             Some("Device not available")
         );
         assert_eq!(row_unavailable(Microphone, None, true, Some(false)), None);
-    }
-
-    #[test]
-    fn level_redraw_throttle() {
-        let l = |source, peak| SourceLevel { source, peak };
-        let ms = |n| Some(Duration::from_millis(n));
-        assert!(!levels_need_redraw(&[], &[], ms(1000)));
-        assert!(levels_need_redraw(&[], &[l(1, 0.0)], ms(1)));
-        assert!(levels_need_redraw(&[l(1, 0.0)], &[l(1, 0.5)], None));
-        assert!(levels_need_redraw(&[l(1, 0.0)], &[l(1, 0.5)], ms(100)));
-        assert!(!levels_need_redraw(&[l(1, 0.0)], &[l(1, 0.5)], ms(99)));
-        assert!(!levels_need_redraw(&[l(1, 0.50)], &[l(1, 0.51)], ms(500)));
-        assert!(levels_need_redraw(&[l(1, 0.5)], &[l(2, 0.5)], ms(0)));
-        // Drop to silence is always drawn, even inside the throttle window.
-        assert!(levels_need_redraw(&[l(1, 0.5)], &[l(1, 0.0)], ms(10)));
-        assert!(levels_need_redraw(&[l(1, 0.01)], &[l(1, 0.0)], ms(10)));
-        assert!(!levels_need_redraw(&[l(1, 0.0)], &[l(1, 0.001)], ms(10)));
-        assert!(!levels_need_redraw(&[l(1, 0.0)], &[l(1, 0.0)], ms(500)));
-    }
-
-    #[test]
-    fn overlap_messages() {
-        assert_eq!(overlap_note(&[]), None);
-        assert_eq!(
-            overlap_note(&["Game.exe".into()]).unwrap(),
-            "Records desktop audio without Game.exe to avoid double audio"
-        );
-        assert!(
-            overlap_note(&["a".into(), "b".into()])
-                .unwrap()
-                .starts_with("Skipped while 2+")
-        );
-    }
-
-    #[test]
-    fn topology_compares_sets() {
-        let st = |source| AudioSourceState {
-            source,
-            status: AudioSourceStatus::Starting,
-        };
-        assert!(!topology_pending(&[1, 2], &[]));
-        assert!(!topology_pending(&[2, 1], &[st(1), st(2)]));
-        assert!(topology_pending(&[1], &[st(1), st(2)]));
     }
 
     #[test]

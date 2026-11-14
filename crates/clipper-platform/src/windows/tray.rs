@@ -322,6 +322,14 @@ pub fn is_foreground_window(hwnd: isize) -> bool {
     unsafe { GetForegroundWindow() == hwnd && IsWindowVisible(hwnd).as_bool() }
 }
 
+/// True when `hwnd` is on screen: visible (not hidden to the tray) and not
+/// minimized. It may still be covered by other windows.
+pub fn is_shown(hwnd: isize) -> bool {
+    let hwnd = HWND(hwnd as *mut core::ffi::c_void);
+    // SAFETY: plain queries; a stale handle just reports not visible.
+    unsafe { IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool() }
+}
+
 /// Hides a top-level window (it keeps running; [`show_window`] brings it back).
 pub fn hide_window(hwnd: isize) {
     let hwnd = HWND(hwnd as *mut core::ffi::c_void);

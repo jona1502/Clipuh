@@ -4,6 +4,7 @@
 mod components;
 mod feedback;
 mod library_worker;
+mod meter;
 mod notification_center;
 mod notifications;
 mod recent_clips;
