@@ -25,6 +25,32 @@ use std::{
     time::SystemTime,
 };
 
+/// Library tabs. Game Clips are instant replay saves; Recordings are manual.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    All,
+    Favorites,
+    GameClips,
+    Recordings,
+}
+
+impl Tab {
+    const ALL: [(Self, &'static str, &'static str); 4] = [
+        (Self::All, "▣", "All Clips"),
+        (Self::Favorites, "☆", "Favorites"),
+        (Self::GameClips, "◈", "Game Clips"),
+        (Self::Recordings, "◉", "Recordings"),
+    ];
+
+    fn includes(self, clip: &Clip) -> bool {
+        match self {
+            Self::All | Self::Favorites => true,
+            Self::GameClips => clip.is_replay(),
+            Self::Recordings => !clip.is_replay(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Menu {
     Source,
@@ -41,7 +67,12 @@ const SORTS: [LibrarySort; 6] = [
 mod presentation;
 const PAGE_SIZE: usize = 24;
 const CONTEXT: &str = "ClipLibrary";
-actions!(clip_library, [Play, Edit, Rename, Delete, SelectAll, Clear]);
+/// Key context of the whole Library page (toolbar included).
+const PAGE_CONTEXT: &str = "ClipLibraryPage";
+actions!(
+    clip_library,
+    [Play, Edit, Rename, Delete, SelectAll, Clear, FocusSearch]
+);
 
 pub(super) fn bind_keys(cx: &mut App) {
     cx.bind_keys([
@@ -51,6 +82,7 @@ pub(super) fn bind_keys(cx: &mut App) {
         KeyBinding::new("f2", Rename, Some(CONTEXT)),
         KeyBinding::new("delete", Delete, Some(CONTEXT)),
         KeyBinding::new("ctrl-a", SelectAll, Some(CONTEXT)),
+        KeyBinding::new("ctrl-f", FocusSearch, Some(PAGE_CONTEXT)),
         KeyBinding::new("escape", Clear, Some(CONTEXT)),
         KeyBinding::new("enter", crate::components::Activate, Some("LibraryButton")),
         KeyBinding::new("space", crate::components::Activate, Some("LibraryButton")),
@@ -83,7 +115,7 @@ pub(super) struct ClipLibrary {
     source: Option<String>,
     menu: Option<(Menu, usize)>,
     context_position: Option<gpui::Point<gpui::Pixels>>,
-    favorites_only: bool,
+    tab: Tab,
     filtered: Vec<usize>,
     page: usize,
     columns: usize,
@@ -182,7 +214,7 @@ impl ClipLibrary {
             source: None,
             menu: None,
             context_position: None,
-            favorites_only: false,
+            tab: Tab::All,
             filtered: vec![],
             page: 0,
             columns: 4,
@@ -332,7 +364,7 @@ impl ClipLibrary {
             (
                 sources
                     .iter()
-                    .map(|s| s.clone().unwrap_or_else(|| "All sources".into()))
+                    .map(|s| s.clone().unwrap_or_else(|| "Filters".into()))
                     .collect(),
                 sources.iter().position(|s| s == &self.source).unwrap_or(0),
                 0,
@@ -341,7 +373,7 @@ impl ClipLibrary {
             (
                 SORTS
                     .iter()
-                    .map(|s| sort_label(*s).trim_end_matches(" ▾").to_owned())
+                    .map(|s| format!("Sort: {}", sort_label(*s)))
                     .collect(),
                 SORTS
                     .iter()
@@ -366,41 +398,43 @@ impl ClipLibrary {
         let toggle = cx.entity().downgrade();
         let select = toggle.clone();
         let dismiss = toggle.clone();
-        div().w(px(150.)).child(dropdown(
-            t,
-            ("library-menu", slot),
-            &options,
-            selected,
-            highlighted,
-            &self.controls[slot],
-            self.controls[slot].is_focused(window),
-            !self.busy && (menu == Menu::Sort || sources.len() > 1),
-            move |_, cx| {
-                toggle
-                    .update(cx, |this, cx| {
-                        this.menu = if this.menu.is_some_and(|(kind, _)| kind == menu) {
-                            None
-                        } else {
-                            Some((menu, selected))
-                        };
-                        cx.notify();
-                    })
-                    .ok();
-            },
-            move |index, window, cx| {
-                select
-                    .update(cx, |this, cx| this.choose_menu(menu, index, window, cx))
-                    .ok();
-            },
-            move |_, cx| {
-                dismiss
-                    .update(cx, |this, cx| {
-                        this.menu = None;
-                        cx.notify();
-                    })
-                    .ok();
-            },
-        ))
+        div()
+            .w(px(if menu == Menu::Sort { 160. } else { 140. }))
+            .child(dropdown(
+                t,
+                ("library-menu", slot),
+                &options,
+                selected,
+                highlighted,
+                &self.controls[slot],
+                self.controls[slot].is_focused(window),
+                !self.busy && (menu == Menu::Sort || sources.len() > 1),
+                move |_, cx| {
+                    toggle
+                        .update(cx, |this, cx| {
+                            this.menu = if this.menu.is_some_and(|(kind, _)| kind == menu) {
+                                None
+                            } else {
+                                Some((menu, selected))
+                            };
+                            cx.notify();
+                        })
+                        .ok();
+                },
+                move |index, window, cx| {
+                    select
+                        .update(cx, |this, cx| this.choose_menu(menu, index, window, cx))
+                        .ok();
+                },
+                move |_, cx| {
+                    dismiss
+                        .update(cx, |this, cx| {
+                            this.menu = None;
+                            cx.notify();
+                        })
+                        .ok();
+                },
+            ))
     }
 
     fn refilter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -410,15 +444,22 @@ impl ClipLibrary {
         cx.notify();
     }
 
-    fn update_filter(&mut self) {
-        self.filtered = library::query(
+    /// Indices of the clips the current tab, search, source and sort show.
+    fn query(&self) -> Vec<usize> {
+        let mut indices = library::query(
             &self.clips,
             &self.query,
             self.source.as_deref(),
-            self.favorites_only,
+            self.tab == Tab::Favorites,
             &self.settings.favorites,
             self.settings.sort,
         );
+        indices.retain(|index| self.tab.includes(&self.clips[*index]));
+        indices
+    }
+
+    fn update_filter(&mut self) {
+        self.filtered = self.query();
         self.page = self
             .page
             .min(self.filtered.len().saturating_sub(1) / PAGE_SIZE);
@@ -511,14 +552,7 @@ impl ClipLibrary {
                     self.images.insert(id, image);
                 }
                 if self.settings.sort == LibrarySort::Duration {
-                    self.filtered = library::query(
-                        &self.clips,
-                        &self.query,
-                        self.source.as_deref(),
-                        self.favorites_only,
-                        &self.settings.favorites,
-                        self.settings.sort,
-                    );
+                    self.filtered = self.query();
                 }
             }
             Event::Error {
@@ -786,11 +820,11 @@ impl ClipLibrary {
 
 fn sort_label(sort: LibrarySort) -> &'static str {
     match sort {
-        LibrarySort::Newest => "Newest ▾",
-        LibrarySort::Oldest => "Oldest ▾",
-        LibrarySort::NameAsc => "Name A–Z ▾",
-        LibrarySort::NameDesc => "Name Z–A ▾",
-        LibrarySort::Duration => "Duration ▾",
-        LibrarySort::Size => "File size ▾",
+        LibrarySort::Newest => "Newest",
+        LibrarySort::Oldest => "Oldest",
+        LibrarySort::NameAsc => "Name A–Z",
+        LibrarySort::NameDesc => "Name Z–A",
+        LibrarySort::Duration => "Duration",
+        LibrarySort::Size => "File size",
     }
 }

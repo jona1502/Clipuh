@@ -413,3 +413,21 @@ fn compound_query_handles_ten_thousand_indexed_clips_without_filesystem_access()
     );
     eprintln!("10,000-entry compound query: {:?}", started.elapsed());
 }
+
+#[test]
+fn replay_saves_are_told_apart_from_recordings_by_file_name() {
+    let clip = |name: &str| Clip {
+        id: name.into(),
+        path: PathBuf::from(r"C:\clips").join(name),
+        name: name.trim_end_matches(".mp4").into(),
+        source: None,
+        duration: None,
+        size_bytes: 0,
+        created: None,
+        modified: UNIX_EPOCH,
+    };
+    assert!(clip("Clipper_Replay_2026-01-02_03-04-05.mp4").is_replay());
+    assert!(clip("Clipper_Replay_2026-01-02_03-04-05_2.mp4").is_replay());
+    assert!(!clip("Clipper_2026-01-02_03-04-05.mp4").is_replay());
+    assert!(!clip("my clip.mp4").is_replay());
+}
