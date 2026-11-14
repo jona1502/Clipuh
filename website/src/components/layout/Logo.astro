@@ -1,0 +1,43 @@
+---
+import { site } from "@/data/site";
+import { withBase } from "@/lib/url";
+
+interface Props {
+  /** Link target; defaults to the site root. */
+  href?: string;
+  class?: string;
+  /** Accessible name; defaults to "<name> home". */
+  label?: string;
+  [attr: string]: unknown;
+}
+
+const { href = withBase(), class: className, label, ...rest } = Astro.props;
+---
+
+<a
+  href={href}
+  class:list={[
+    "text-text inline-flex min-h-11 items-center gap-2.5 rounded-md font-semibold tracking-tight",
+    className,
+  ]}
+  aria-label={label ?? `${site.name} home`}
+  {...rest}
+>
+  <svg
+    class="text-accent size-7 shrink-0"
+    viewBox="0 0 28 28"
+    fill="none"
+    aria-hidden="true"
+  >
+    <rect width="28" height="28" rx="8" fill="currentColor"></rect>
+    <path
+      d="M9 8.5v6.25a5 5 0 0 0 10 0V8.5"
+      stroke="var(--color-accent-foreground)"
+      stroke-width="2.5"
+      stroke-linecap="round"
+    ></path>
+  </svg>
+  <span class="text-lead leading-none" aria-hidden="true">
+    {site.name}
+  </span>
+</a>

@@ -1,0 +1,29 @@
+---
+import Button from "@/components/ui/Button.astro";
+import Container from "@/components/ui/Container.astro";
+import { sections, site } from "@/data/site";
+
+const { download } = site;
+const url = download.available ? download.url : null;
+---
+
+<section id={sections.download} class="pb-section">
+  <Container size="narrow">
+    <div class="border-border bg-surface rounded-xl border p-8 text-center md:p-12">
+      <h2>Download for {download.platform}</h2>
+      {!url && (
+        <p class="border-border bg-surface-raised text-text-secondary text-small mt-4 inline-block rounded-sm border px-3 py-1 font-medium">
+          {download.statusLabel}
+        </p>
+      )}
+      <p class="text-text-secondary mt-4">{download.note}</p>
+      {url && (
+        <div class="mt-8 flex justify-center">
+          <Button href={url} size="lg">
+            Download for {download.platform}
+          </Button>
+        </div>
+      )}
+    </div>
+  </Container>
+</section>

@@ -1,0 +1,27 @@
+---
+import type { HTMLTag } from "astro/types";
+
+interface Props {
+  /** `page` = 1200px, `narrow` = 736px (prose, forms). */
+  size?: "page" | "narrow";
+  /** Rendered element. */
+  as?: HTMLTag;
+  class?: string;
+  [attr: string]: unknown;
+}
+
+const {
+  size = "page",
+  as: Tag = "div",
+  class: className,
+  ...rest
+} = Astro.props;
+const max = size === "narrow" ? "max-w-narrow" : "max-w-page";
+---
+
+<Tag
+  class:list={["mx-auto w-full px-4 md:px-6 lg:px-8", max, className]}
+  {...rest}
+>
+  <slot />
+</Tag>

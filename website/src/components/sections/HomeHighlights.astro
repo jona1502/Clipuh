@@ -1,0 +1,88 @@
+---
+import Container from "@/components/ui/Container.astro";
+import SectionHeading from "@/components/ui/SectionHeading.astro";
+import { sections } from "@/data/site";
+
+// Each claim is verified against the Rust codebase.
+const items = [
+  {
+    title: "Instant replay",
+    text: "Save the last 15 seconds to 5 minutes with a hotkey. Footage is buffered in RAM and spills to SSD when needed.",
+    icon: "M3 12a9 9 0 1 0 3-6.7M3 4v5h5M12 8v4l3 2",
+  },
+  {
+    title: "Separate audio tracks",
+    text: "Desktop audio and microphone can be saved as individual tracks, alongside a mixed track.",
+    icon: "M4 6h16M4 12h10M4 18h13",
+  },
+  {
+    title: "Clip editing",
+    text: "Trim saved clips in the built-in editor. Exports go to a new file; the original stays untouched.",
+    icon: "M6 3v18M18 3v18M6 8h12M6 16h12",
+  },
+  {
+    title: "Hardware encoding",
+    text: "H.264 video encoded on your GPU through NVENC, AMF or Quick Sync, with no software fallback.",
+    icon: "M7 7h10v10H7zM10 3v4M14 3v4M10 17v4M14 17v4M3 10h4M3 14h4M17 10h4M17 14h4",
+  },
+];
+---
+
+<section id={sections.features} class="pb-section">
+  <Container>
+    <SectionHeading
+      eyebrow="Features"
+      title="Built for capturing, not for getting in the way"
+    />
+    <ul class="mt-10 grid gap-x-10 gap-y-8 sm:grid-cols-2">
+      {items.map((item) => (
+        <li class="flex gap-4">
+          <span class="border-border bg-surface text-accent grid size-10 shrink-0 place-items-center rounded-md border">
+            <svg
+              viewBox="0 0 24 24"
+              class="size-5"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.75"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+            >
+              <path d={item.icon} />
+            </svg>
+          </span>
+          <div>
+            <h3 class="text-body font-semibold tracking-normal">
+              {item.title}
+            </h3>
+            <p class="text-small text-text-secondary mt-1">{item.text}</p>
+          </div>
+        </li>
+      ))}
+    </ul>
+  </Container>
+</section>
+
+<section id={sections.showcase} class="pb-section">
+  <Container>
+    <SectionHeading
+      eyebrow="Showcase"
+      title="Screenshots are on the way"
+      description="Real app screenshots and clips will appear here as development progresses."
+    />
+    <!-- Compact, honest placeholder: neutral skeletons, no fake data. -->
+    <ul class="mt-8 grid grid-cols-3 gap-3 sm:gap-4">
+      {["Capture", "Library", "Editor"].map((label) => (
+        <li class="border-border bg-surface rounded-lg border p-3 sm:p-4">
+          <p class="text-caption text-text-secondary">{label}</p>
+          <div class="mt-3 flex flex-col gap-2" aria-hidden="true">
+            <span class="bg-surface-raised block h-12 rounded-md sm:h-20"></span>
+            <span class="bg-surface-raised block h-2 w-2/3 rounded-sm"></span>
+            <span class="bg-surface-raised block h-2 w-1/2 rounded-sm"></span>
+          </div>
+        </li>
+      ))}
+    </ul>
+    <p class="text-small text-text-muted mt-4">Screenshots coming soon.</p>
+  </Container>
+</section>

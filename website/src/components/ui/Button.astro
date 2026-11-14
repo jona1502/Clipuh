@@ -1,0 +1,69 @@
+---
+interface Props {
+  /** Renders an <a> when set, otherwise a <button>. */
+  href?: string;
+  variant?: "primary" | "secondary" | "ghost";
+  /** md = 40px min height, lg = 44px+ (touch target). */
+  size?: "md" | "lg";
+  /**
+   * Disabled with href: plain non-interactive <span> (not a link, not
+   * focusable). Disabled without href: native <button disabled>.
+   */
+  disabled?: boolean;
+  /** Only for <button>. */
+  type?: "button" | "submit" | "reset";
+  class?: string;
+  [attr: string]: unknown;
+}
+
+const {
+  href,
+  variant = "primary",
+  size = "md",
+  disabled = false,
+  type = "button",
+  class: className,
+  ...rest
+} = Astro.props;
+
+const base = {
+  primary: "bg-accent text-accent-foreground",
+  secondary: "bg-surface-raised text-text border border-border",
+  ghost: "bg-transparent text-text-secondary",
+};
+const interactive = {
+  primary: "hover:bg-accent-hover active:scale-[0.98]",
+  secondary:
+    "hover:bg-surface-hover hover:border-border-hover active:scale-[0.98]",
+  ghost: "hover:bg-surface-hover hover:text-text active:scale-[0.98]",
+};
+const sizes = {
+  md: "min-h-10 gap-2 px-4 text-small",
+  lg: "min-h-11 gap-2.5 px-6 text-body",
+};
+const classes = [
+  "inline-flex items-center justify-center rounded-md font-semibold whitespace-nowrap select-none",
+  "transition-[background-color,border-color,color,transform] duration-150 ease-out",
+  base[variant],
+  sizes[size],
+  disabled ? "cursor-not-allowed opacity-50" : interactive[variant],
+  className,
+];
+---
+
+{href && !disabled ? (
+  <a href={href} class:list={classes} {...rest}>
+    <slot name="icon" />
+    <slot />
+  </a>
+) : href ? (
+  <span class:list={classes} {...rest}>
+    <slot name="icon" />
+    <slot />
+  </span>
+) : (
+  <button type={type} disabled={disabled} class:list={classes} {...rest}>
+    <slot name="icon" />
+    <slot />
+  </button>
+)}
