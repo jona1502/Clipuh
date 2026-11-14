@@ -34,7 +34,12 @@ const badgeClass =
 
     <nav aria-label="Primary" class="hidden items-center gap-1 md:flex">
       {links.map((l) => (
-        <a href={l.href} class={linkClass} data-nav-link>
+        <a
+          href={l.href}
+          class={linkClass}
+          data-nav-link
+          data-nav-spans={l.spans?.join(" ")}
+        >
           {l.label}
         </a>
       ))}
@@ -71,7 +76,12 @@ const badgeClass =
     <Container class="py-3">
       <nav aria-label="Primary mobile" class="flex flex-col gap-1">
         {links.map((l) => (
-          <a href={l.href} class={mobileLinkClass} data-nav-link>
+          <a
+            href={l.href}
+            class={mobileLinkClass}
+            data-nav-link
+            data-nav-spans={l.spans?.join(" ")}
+          >
             {l.label}
           </a>
         ))}
@@ -191,20 +201,31 @@ const badgeClass =
   );
   const hashOf = (a: HTMLAnchorElement) =>
     new URL(a.href, location.href).hash.slice(1);
-  const targets = new Map<string, HTMLElement>();
+  // Section ids each link covers: its own target plus optional data-nav-spans.
+  const groups = new Map<string, string[]>();
   for (const a of links) {
     const id = hashOf(a);
-    const el = id ? document.getElementById(id) : null;
-    if (el) targets.set(id, el);
+    if (!id || groups.has(id)) continue;
+    const spans = a.dataset.navSpans?.split(" ").filter(Boolean) ?? [];
+    groups.set(id, [id, ...spans]);
+  }
+  const targets = new Map<string, HTMLElement>();
+  for (const ids of groups.values()) {
+    for (const id of ids) {
+      const el = document.getElementById(id);
+      if (el) targets.set(id, el);
+    }
   }
 
   if (targets.size && "IntersectionObserver" in window) {
     const visible = new Set<string>();
-    const order = [...targets.keys()];
+    const order = [...groups.keys()];
     const apply = () => {
-      // Last visible section in link order wins, so the final section
+      // Last link (in order) with a visible section wins, so the final section
       // (Download) can become active while the one above is still in the band.
-      const active = order.findLast((id) => visible.has(id));
+      const active = order.findLast((id) =>
+        groups.get(id)?.some((s) => visible.has(s)),
+      );
       for (const a of links) {
         if (active && hashOf(a) === active)
           a.setAttribute("aria-current", "location");

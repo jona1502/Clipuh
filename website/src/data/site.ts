@@ -1,3 +1,5 @@
+import { featureIds } from "./features";
+
 /**
  * Site-wide content and metadata. Single source for name, copy, navigation
  * and download availability; components read from here instead of
@@ -17,6 +19,8 @@ export interface NavLink {
   label: string;
   /** In-page anchor (`#id`) until the dedicated route exists. */
   href: string;
+  /** Extra section ids the link covers for the active-link highlight. */
+  spans?: string[];
 }
 
 export const site = {
@@ -32,7 +36,17 @@ export const site = {
    */
   nav: [
     { label: "Features", href: `#${sections.features}` },
-    { label: "Showcase", href: `#${sections.showcase}` },
+    {
+      label: "Showcase",
+      href: `#${sections.showcase}`,
+      spans: [
+        featureIds.replay,
+        featureIds.mixer,
+        featureIds.editor,
+        featureIds.performance,
+        featureIds.more,
+      ],
+    },
     { label: "Download", href: `#${sections.download}` },
   ] satisfies NavLink[],
 
