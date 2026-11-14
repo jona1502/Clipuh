@@ -785,6 +785,7 @@ impl ClipEditor {
                 let _ = sender.send_blocking(ExportMessage::Finished(result));
             });
         if let Err(error) = spawned {
+            clipper_diagnostics::log::error!("editor export could not start: {error}");
             self.export = Export::Failed(format!("Could not start the export: {error}"));
             cx.notify();
             return;
@@ -800,6 +801,7 @@ impl ClipEditor {
                             }
                         }
                         ExportMessage::Finished(Ok(outcome)) => {
+                            clipper_diagnostics::log::info!("editor export completed");
                             this.export = Export::Done(outcome);
                             cx.emit(EditorEvent::Exported);
                         }
@@ -807,6 +809,7 @@ impl ClipEditor {
                             this.export = Export::Idle
                         }
                         ExportMessage::Finished(Err(message)) => {
+                            clipper_diagnostics::log::error!("editor export failed: {message}");
                             this.export = Export::Failed(message)
                         }
                     }

@@ -20,8 +20,8 @@ use clipper_storage::{
 use gpui::prelude::*;
 use gpui::{
     AnyElement, Context, Div, ElementId, Entity, FocusHandle, FontWeight, KeyDownEvent,
-    ModifiersChangedEvent, PathPromptOptions, ScrollAnchor, SharedString, Stateful, Subscription,
-    Window, div, px, relative,
+    ModifiersChangedEvent, PathPromptOptions, SharedString, Stateful, Subscription, Window, div,
+    px, relative,
 };
 
 use super::{
@@ -44,6 +44,8 @@ const REPLAY_DISK_PRESETS_MB: [u32; 6] = [1024, 2048, 4096, 8192, 16384, 32768];
 /// Narrowest a card gets before its row wraps to one column.
 const CARD_MIN_WIDTH: f32 = 380.0;
 /// Below this window width the section list is hidden; the cards still scroll.
+mod hex;
+
 const NAV_MIN_VIEWPORT: f32 = 1040.0;
 /// Free space below this on the chosen clip folder gets a warning.
 const LOW_SPACE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
@@ -58,17 +60,21 @@ const TAB_HOTKEY: isize = 30;
 const TAB_STORAGE: isize = 31;
 const TAB_THEME: isize = 33;
 const TAB_ACCENT_SWATCH: isize = 36;
-pub(super) const TAB_ACCENT_INPUT: isize = 43;
-const TAB_DENSITY: isize = 44;
-const TAB_STARTUP: isize = 47;
-pub(super) const TAB_NOTIFY: isize = 48;
-const TAB_ADVANCED: isize = 52;
+pub(super) const TAB_ACCENT_INPUT: isize = 46;
+const TAB_DENSITY: isize = 47;
+const TAB_STARTUP: isize = 50;
+pub(super) const TAB_NOTIFY: isize = 51;
+const TAB_ADVANCED: isize = 55;
+/// Diagnostics controls (logging toggle, verbosity, open logs, export).
+const TAB_DIAGNOSTICS: isize = 56;
 
 // Tab ranges must not overlap: nav, 7 dropdowns, audio pair, notify toggles.
 const _: () = {
     assert!(TAB_NAV + SECTIONS.len() as isize <= TAB_MENUS);
     assert!(TAB_MENUS + 7 <= TAB_AUDIO);
     assert!(TAB_NOTIFY + 4 <= TAB_ADVANCED);
+    assert!(TAB_ACCENT_SWATCH + ACCENT_PRESETS.len() as isize <= TAB_ACCENT_INPUT);
+    assert!(TAB_ADVANCED < TAB_DIAGNOSTICS);
 };
 
 /// The section list, in page order: (glyph, name, subtitle).
@@ -99,7 +105,7 @@ pub(super) const SECTIONS: [(Icon, &str, &str); 8] = [
     (
         Icon::Settings,
         "Advanced",
-        "Settings file and engine details.",
+        "Settings file, engine details and diagnostics.",
     ),
 ];
 
@@ -682,6 +688,8 @@ pub(super) fn accent_input(
     let input = cx.new(|cx| {
         let mut input = TextInput::new(cx)
             .placeholder(DEFAULT_ACCENT)
+            .allowed_chars(hex::is_hex_input_char)
+            .max_len(hex::MAX_INPUT_CHARS)
             .tab_index(TAB_ACCENT_INPUT);
         input.set_text(config.appearance.accent_color.clone(), cx);
         input
@@ -692,14 +700,15 @@ pub(super) fn accent_input(
         |this, input, event: &TextInputEvent, window, cx| match event {
             TextInputEvent::Dismissed => window.focus(&this.focus),
             TextInputEvent::Changed(_) => input.update(cx, |input, cx| input.set_error(None, cx)),
-            TextInputEvent::Submitted(text) => match parse_hex_color(text) {
-                Some(rgb) => {
-                    let hex = format_hex_color(rgb);
+            // Applied (and saved) only on Enter with a complete colour; an
+            // invalid entry keeps the last valid accent.
+            TextInputEvent::Submitted(text) => match hex::normalize(text) {
+                Ok(hex) => {
                     input.update(cx, |input, cx| input.set_text(hex.clone(), cx));
                     this.set_appearance(|appearance| appearance.accent_color = hex, cx);
                 }
-                None => input.update(cx, |input, cx| {
-                    input.set_error(Some("Use a color like #9B5CF6.".into()), cx)
+                Err(error) => input.update(cx, |input, cx| {
+                    input.set_error(Some(error.message().into()), cx)
                 }),
             },
         },
@@ -865,10 +874,127 @@ impl ClipperWindow {
         cx.notify();
     }
 
-    fn scroll_to_section(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        self.settings_section = index;
-        self.settings_anchors[index].scroll_to(window, cx);
+    /// Detailed (Debug/Trace) logging on or off; applies immediately.
+    fn set_detailed_logging(&mut self, on: bool, cx: &mut Context<Self>) {
+        let now = crate::diagnostics::now_unix();
+        self.config.diagnostics.set_detailed(on, now);
+        crate::diagnostics::apply_log_settings(&self.config.diagnostics);
+        self.persist_config(cx);
+    }
+
+    fn set_detailed_level(
+        &mut self,
+        level: clipper_storage::DetailedLogLevel,
+        cx: &mut Context<Self>,
+    ) {
+        self.config.diagnostics.detailed_level = level;
+        crate::diagnostics::apply_log_settings(&self.config.diagnostics);
+        self.persist_config(cx);
+    }
+
+    /// Asks where to save, then writes the redacted ZIP off the UI thread.
+    /// Success is reported only once the archive is complete.
+    fn export_debug_logs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.diagnostics_exporting {
+            return;
+        }
+        let name = crate::diagnostics::export_file_name(crate::diagnostics::now_unix());
+        let destination =
+            cx.prompt_for_new_path(&crate::diagnostics::export_directory(), Some(&name));
+        let info = crate::diagnostics::system_info(
+            &self.config,
+            self.recording.encoder.as_deref(),
+            self.recording.error.as_deref(),
+        );
+        self.diagnostics_exporting = true;
+        self.diagnostics_notice = None;
         cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let picked = match destination.await {
+                Ok(Ok(Some(path))) => Some(Ok(path)),
+                Ok(Ok(None)) | Err(_) => None,
+                Ok(Err(error)) => Some(Err(format!("Save dialog failed: {error}"))),
+            };
+            let result = match picked {
+                None => None,
+                Some(Err(error)) => Some(Err(error)),
+                Some(Ok(path)) => {
+                    let path = if path
+                        .extension()
+                        .is_some_and(|e| e.eq_ignore_ascii_case("zip"))
+                    {
+                        path
+                    } else {
+                        path.with_extension("zip")
+                    };
+                    let shown = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let outcome = cx
+                        .background_spawn(async move { crate::diagnostics::export(&path, &info) })
+                        .await;
+                    Some(outcome.map(|summary| (shown, summary)))
+                }
+            };
+            this.update(cx, |this, cx| {
+                this.diagnostics_exporting = false;
+                this.diagnostics_notice = result.map(|result| match result {
+                    Ok((name, summary)) => {
+                        clipper_diagnostics::log::info!(
+                            "debug logs exported ({} files, {} KiB)",
+                            summary.files,
+                            summary.bytes / 1024
+                        );
+                        (
+                            false,
+                            format!(
+                                "Saved {name} ({} files). Nothing was uploaded.",
+                                summary.files
+                            ),
+                        )
+                    }
+                    Err(error) => {
+                        clipper_diagnostics::log::error!("debug log export failed: {error}");
+                        (true, format!("Export failed: {error}"))
+                    }
+                });
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Shows only category `index`; the content starts at its top.
+    fn select_section(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= SECTIONS.len() {
+            return;
+        }
+        if self.settings_section != index {
+            self.settings_section = index;
+            self.settings_scroll.set_offset(gpui::Point::default());
+        }
+        cx.notify();
+    }
+
+    /// The card of the selected category (the only one rendered).
+    fn section_card(
+        &self,
+        t: &Theme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        match self.settings_section {
+            0 => self.settings_video_card(t, window, cx),
+            1 => self.settings_audio_card(t, window, cx),
+            2 => self.settings_replay_card(t, window, cx),
+            3 => self.settings_hotkeys_card(t, window, cx),
+            4 => self.settings_storage_card(t, window, cx),
+            5 => self.settings_appearance_card(t, window, cx),
+            6 => self.settings_general_card(t, window, cx),
+            _ => self.settings_advanced_card(t, window, cx),
+        }
     }
 }
 
@@ -1041,14 +1167,13 @@ fn row(t: &Theme, label: impl Into<SharedString>, control: impl IntoElement) -> 
 }
 
 /// A section card with the glyph, title and subtitle header of `SECTIONS[index]`.
-fn card(t: &Theme, index: usize, anchor: &ScrollAnchor) -> Stateful<Div> {
+fn card(t: &Theme, index: usize) -> Stateful<Div> {
     let (glyph, title, subtitle) = SECTIONS[index];
     div()
         .id(("settings-card", index))
         .flex_1()
         .flex_basis(px(0.))
         .min_w(px(CARD_MIN_WIDTH))
-        .anchor_scroll(Some(anchor.clone()))
         .flex()
         .flex_col()
         .gap_3()
@@ -1080,16 +1205,6 @@ fn card(t: &Theme, index: usize, anchor: &ScrollAnchor) -> Stateful<Div> {
         )
 }
 
-/// Two cards side by side; wraps to one column when narrow.
-fn card_row(t: &Theme, left: Stateful<Div>, right: Stateful<Div>) -> Div {
-    div()
-        .flex()
-        .flex_wrap()
-        .gap(t.metrics.gap * 2.)
-        .child(left)
-        .child(right)
-}
-
 // ---------------------------------------------------------------------------
 // Cards
 // ---------------------------------------------------------------------------
@@ -1112,7 +1227,7 @@ impl ClipperWindow {
         };
         let pending = self.capture_pending(CaptureMenu::Resolution)
             || self.capture_pending(CaptureMenu::FrameRate);
-        card(t, 0, &self.settings_anchors[0])
+        card(t, 0)
             .child(row(
                 t,
                 "Resolution",
@@ -1151,7 +1266,7 @@ impl ClipperWindow {
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let sources = &self.config.audio.sources;
-        let mut body = card(t, 1, &self.settings_anchors[1]);
+        let mut body = card(t, 1);
         if sources.is_empty() {
             body = body.child(note(t, "No audio sources. Add them in the mixer."));
         }
@@ -1226,7 +1341,7 @@ impl ClipperWindow {
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|error| error.to_string()),
         };
-        card(t, 2, &self.settings_anchors[2])
+        card(t, 2)
             .child(row(
                 t,
                 "Replay Duration",
@@ -1273,7 +1388,7 @@ impl ClipperWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
-        card(t, 3, &self.settings_anchors[3])
+        card(t, 3)
             .child(row(
                 t,
                 "Save Clip (Replay)",
@@ -1336,7 +1451,7 @@ impl ClipperWindow {
             StorageStatus::Unknown => "Checking…".into(),
             StorageStatus::Unavailable(error) => error.clone(),
         };
-        card(t, 4, &self.settings_anchors[4])
+        card(t, 4)
             .child(row(
                 t,
                 "Clip Location",
@@ -1431,16 +1546,18 @@ impl ClipperWindow {
                     .justify_center()
                     .rounded_md()
                     .border_2()
+                    // A thin outline keeps White on light and Black on dark
+                    // surfaces visible; the selected swatch gets a strong ring.
                     .border_color(if selected {
                         t.colors.text
                     } else {
-                        gpui::transparent_black()
+                        t.colors.border_strong
                     })
                     .bg(gpui::rgb(rgb))
                     .cursor_pointer()
                     .tooltip(tooltip(name))
                     .when(selected, |this| {
-                        this.text_color(gpui::white())
+                        this.text_color(crate::theme::palette::foreground_for(gpui::rgb(rgb)))
                             .font_weight(FontWeight::BOLD)
                             .child("✓")
                     });
@@ -1504,7 +1621,7 @@ impl ClipperWindow {
             )
             .child(label("Density"))
             .child(div().flex().gap_1p5().children(densities));
-        card(t, 5, &self.settings_anchors[5]).child(
+        card(t, 5).child(
             div()
                 .flex()
                 .flex_wrap()
@@ -1577,7 +1694,7 @@ impl ClipperWindow {
             cx,
             |this, on, cx| this.sync_startup(Some(on), cx),
         );
-        card(t, 6, &self.settings_anchors[6])
+        card(t, 6)
             .child(startup)
             .children(self.startup_error.clone().map(|error| error_note(t, error)))
             .child(div().h(px(1.)).bg(t.colors.border))
@@ -1661,7 +1778,7 @@ impl ClipperWindow {
             cx,
             move |this, _, cx| this.open_folder(folder.clone(), cx),
         );
-        card(t, 7, &self.settings_anchors[7])
+        card(t, 7)
             .child(row(
                 t,
                 "Settings File",
@@ -1686,9 +1803,167 @@ impl ClipperWindow {
                 t,
                 "Queue sizes are read from settings.toml at launch.",
             ))
+            .child(div().h(px(1.)).bg(t.colors.border))
+            .child(self.diagnostics_section(t, window, cx))
     }
 
-    fn section_nav(&self, t: &Theme, window: &mut Window, cx: &mut Context<Self>) -> Div {
+    /// Logging level, log folder and the debug-log export.
+    fn diagnostics_section(&self, t: &Theme, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        use clipper_storage::DetailedLogLevel;
+        let diagnostics = &self.config.diagnostics;
+        let level = clipper_diagnostics::current_verbosity();
+        let logging = level.is_some();
+        // Reflects what is in effect (detailed logging expires on its own).
+        let detailed = diagnostics
+            .active_detailed_level(crate::diagnostics::now_unix())
+            .is_some();
+        let toggle = checkbox(
+            t,
+            "settings-detailed-logging",
+            "Detailed logging",
+            Some(
+                "Adds Debug or Trace detail for troubleshooting. Turns itself off after 24 hours.",
+            ),
+            detailed,
+            logging,
+            TAB_DIAGNOSTICS,
+            window,
+            cx,
+            |this, on, cx| this.set_detailed_logging(on, cx),
+        );
+        let levels = [
+            (DetailedLogLevel::Debug, "Debug"),
+            (DetailedLogLevel::Trace, "Trace"),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (choice, label))| {
+            activatable(
+                chip(
+                    t,
+                    ("log-level", index),
+                    label,
+                    diagnostics.detailed_level == choice,
+                    detailed,
+                ),
+                t,
+                TAB_DIAGNOSTICS + 1 + index as isize,
+                window,
+                cx,
+                move |this, _, cx| {
+                    if this
+                        .config
+                        .diagnostics
+                        .active_detailed_level(crate::diagnostics::now_unix())
+                        .is_some()
+                    {
+                        this.set_detailed_level(choice, cx);
+                    }
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+        let folder = crate::diagnostics::log_directory();
+        let shown = folder.display().to_string();
+        let open_logs = activatable(
+            button(
+                t,
+                "settings-open-logs",
+                "Open",
+                ButtonVariant::Ghost,
+                None,
+                true,
+            ),
+            t,
+            TAB_DIAGNOSTICS + 3,
+            window,
+            cx,
+            move |this, _, cx| {
+                // The folder exists once the logger started; create it for
+                // the button even when logging is unavailable.
+                let _ = std::fs::create_dir_all(&folder);
+                this.open_folder(Some(folder.clone()), cx);
+            },
+        );
+        let exporting = self.diagnostics_exporting;
+        let export = activatable(
+            button(
+                t,
+                "settings-export-logs",
+                if exporting {
+                    "Exporting…"
+                } else {
+                    "Export Debug Logs…"
+                },
+                ButtonVariant::Secondary,
+                None,
+                !exporting,
+            ),
+            t,
+            TAB_DIAGNOSTICS + 4,
+            window,
+            cx,
+            |this, window, cx| this.export_debug_logs(window, cx),
+        );
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("Diagnostics"))
+            .child(toggle)
+            .child(row(
+                t,
+                "Detail Level",
+                div()
+                    .flex()
+                    .gap_1p5()
+                    .when(!detailed, |this| this.opacity(0.45))
+                    .children(levels),
+            ))
+            .child(row(
+                t,
+                "Current Level",
+                field(
+                    t,
+                    match level {
+                        Some(level) => level.label().to_owned(),
+                        None => "File logging unavailable".to_owned(),
+                    },
+                ),
+            ))
+            .child(row(
+                t,
+                "Log Folder",
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().flex_1().min_w_0().child(field(t, shown)))
+                    .child(open_logs),
+            ))
+            .child(div().flex().items_center().gap_3().child(export).children(
+                self.diagnostics_notice.clone().map(|(error, message)| {
+                    if error {
+                        error_note(t, message).into_any_element()
+                    } else {
+                        note(t, message).into_any_element()
+                    }
+                }),
+            ))
+            .child(note(
+                t,
+                "Logs stay on this PC and rotate at 5 MB (6 files at most). Default level: Info,                  warnings and errors. Exports redact your user folder and name, contain no clips,                  and are never uploaded.",
+            ))
+    }
+
+    /// Category list; `compact` shows icons only (narrow windows).
+    fn section_nav(
+        &self,
+        t: &Theme,
+        compact: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Div {
         let items = SECTIONS
             .iter()
             .enumerate()
@@ -1717,20 +1992,23 @@ impl ClipperWindow {
                         }
                     })
                     .child(icon(*glyph, px(18.)))
-                    .child(*title);
+                    .when(compact, |this| {
+                        this.justify_center().px_0().tooltip(tooltip(*title))
+                    })
+                    .when(!compact, |this| this.child(*title));
                 activatable(
                     item,
                     t,
                     TAB_NAV + index as isize,
                     window,
                     cx,
-                    move |this, window, cx| this.scroll_to_section(index, window, cx),
+                    move |this, _, cx| this.select_section(index, cx),
                 )
             })
             .collect::<Vec<_>>();
         div()
             .flex_none()
-            .w(px(214.))
+            .w(px(if compact { 64. } else { 214. }))
             .h_full()
             .p_2()
             .flex()
@@ -1803,7 +2081,7 @@ pub(super) fn content(
     cx: &mut Context<ClipperWindow>,
 ) -> Div {
     let t = *cx.theme();
-    let show_nav = win.viewport_size().width >= px(NAV_MIN_VIEWPORT);
+    let compact_nav = win.viewport_size().width < px(NAV_MIN_VIEWPORT);
     let scroll = crate::components::smooth_scroll(
         div().id("settings-scroll"),
         "settings-smooth-scroll",
@@ -1811,6 +2089,8 @@ pub(super) fn content(
         win,
         cx,
     );
+    // Only the selected category is built and laid out: switching shows it
+    // alone, and scrolling does not rebuild the other seven cards.
     let grid = div()
         .flex()
         .flex_col()
@@ -1822,26 +2102,7 @@ pub(super) fn content(
                 .clone()
                 .map(|message| super::dashboard::error_banner(message, cx)),
         )
-        .child(card_row(
-            &t,
-            window.settings_video_card(&t, win, cx),
-            window.settings_audio_card(&t, win, cx),
-        ))
-        .child(card_row(
-            &t,
-            window.settings_replay_card(&t, win, cx),
-            window.settings_hotkeys_card(&t, win, cx),
-        ))
-        .child(card_row(
-            &t,
-            window.settings_storage_card(&t, win, cx),
-            window.settings_appearance_card(&t, win, cx),
-        ))
-        .child(card_row(
-            &t,
-            window.settings_general_card(&t, win, cx),
-            window.settings_advanced_card(&t, win, cx),
-        ));
+        .child(window.section_card(&t, win, cx));
     div()
         .size_full()
         .flex()
@@ -1859,7 +2120,7 @@ pub(super) fn content(
                 .min_h_0()
                 .flex()
                 .gap(t.metrics.gap * 2.)
-                .when(show_nav, |this| this.child(window.section_nav(&t, win, cx)))
+                .child(window.section_nav(&t, compact_nav, win, cx))
                 .child(
                     scroll
                         .flex_1()

@@ -36,11 +36,33 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         App, Application, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, px, size,
     };
 
+    use clipper_diagnostics::log;
+
+    // File logging first, at the default level, so a broken settings file is
+    // logged too. A logging failure never prevents startup.
+    let log_dir = clipper_diagnostics::default_log_dir();
+    let logging = clipper_diagnostics::init(&clipper_diagnostics::LogConfig::new(
+        log_dir,
+        clipper_diagnostics::Verbosity::Info,
+    ));
+    if let Err(error) = &logging {
+        eprintln!("clipuh: file logging unavailable: {error}");
+    }
+    log::info!(
+        "clipuh {} starting (pid {})",
+        env!("CARGO_PKG_VERSION"),
+        std::process::id()
+    );
+
     // Previous startup policy, superseded to preserve explicit audio device selection:
     // A broken or outdated settings file must not prevent startup. The file is
     // left untouched until the user changes a setting.
     // Reject invalid settings instead of silently recording a different endpoint.
-    let config = AppConfig::load()?;
+    let config = AppConfig::load().inspect_err(|error| {
+        log::error!("settings could not be loaded: {error}");
+        clipper_diagnostics::flush();
+    })?;
+    clipper_ui::apply_log_settings(&config.diagnostics);
     let recorder = Recorder::spawn(
         config.performance.command_queue_capacity as usize,
         config.performance.event_queue_capacity as usize,
@@ -67,7 +89,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }) {
             Ok(tray) => Some((tray, tray_rx)),
             Err(error) => {
-                eprintln!("clipuh: tray icon unavailable: {error}");
+                log::warn!("tray icon unavailable: {error}");
                 None
             }
         }
@@ -133,7 +155,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 cx.activate(true);
             }
             Err(error) => {
-                eprintln!("Clipper could not open its window: {error}");
+                log::error!("main window could not be opened: {error}");
                 cx.quit();
             }
         }
@@ -145,6 +167,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     drop(tray);
     drop(hotkey);
     drop(recorder);
+
+    log::info!("clipuh shut down");
+    clipper_diagnostics::shutdown();
 
     if !window_opened.get() {
         return Err(std::io::Error::other("GPUI could not open the main window").into());

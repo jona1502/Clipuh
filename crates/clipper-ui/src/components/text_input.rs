@@ -30,6 +30,7 @@ pub struct TextInput {
     error: Option<SharedString>,
     disabled: bool,
     max_len: usize,
+    allowed: fn(char) -> bool,
     focus: FocusHandle,
     leading_icon: Option<super::RasterIcon>,
 }
@@ -42,10 +43,16 @@ impl Focusable for TextInput {
     }
 }
 
-/// Appends printable `typed` while staying within `max` chars. Returns whether text changed.
-fn push_str(text: &mut String, typed: &str, max: usize) -> bool {
+/// Every printable character (the default filter).
+fn any_char(_: char) -> bool {
+    true
+}
+
+/// Appends printable `typed` chars that pass `allowed` while staying within
+/// `max` chars. Returns whether text changed.
+fn push_str(text: &mut String, typed: &str, max: usize, allowed: fn(char) -> bool) -> bool {
     let mut changed = false;
-    for c in typed.chars().filter(|c| !c.is_control()) {
+    for c in typed.chars().filter(|c| !c.is_control() && allowed(*c)) {
         if text.chars().count() >= max {
             break;
         }
@@ -61,8 +68,8 @@ fn backspace(text: &mut String) -> bool {
 }
 
 /// Pastes only the first line of `clip`, trimmed of the line break.
-fn paste(text: &mut String, clip: &str, max: usize) -> bool {
-    push_str(text, clip.lines().next().unwrap_or(""), max)
+fn paste(text: &mut String, clip: &str, max: usize, allowed: fn(char) -> bool) -> bool {
+    push_str(text, clip.lines().next().unwrap_or(""), max, allowed)
 }
 
 impl TextInput {
@@ -73,6 +80,7 @@ impl TextInput {
             error: None,
             disabled: false,
             max_len: MAX_LEN,
+            allowed: any_char,
             focus: cx.focus_handle().tab_stop(true),
             leading_icon: None,
         }
@@ -85,6 +93,13 @@ impl TextInput {
     }
 
     /// Allows longer file names without changing the default for other fields.
+    /// Only characters passing `allowed` can be typed or pasted (others are
+    /// dropped), e.g. hex digits for a colour field.
+    pub fn allowed_chars(mut self, allowed: fn(char) -> bool) -> Self {
+        self.allowed = allowed;
+        self
+    }
+
     pub fn max_len(mut self, max: usize) -> Self {
         self.max_len = max.clamp(1, 255);
         self
@@ -146,7 +161,7 @@ impl TextInput {
         let m = k.modifiers;
         if m.control && k.key == "v" {
             let clip = cx.read_from_clipboard().and_then(|c| c.text());
-            if clip.is_some_and(|c| paste(&mut self.text, &c, self.max_len)) {
+            if clip.is_some_and(|c| paste(&mut self.text, &c, self.max_len, self.allowed)) {
                 self.changed(cx);
             }
         } else if k.key == "backspace" {
@@ -158,7 +173,7 @@ impl TextInput {
             && !m.platform
             && !m.function
             && let Some(ch) = &k.key_char
-            && push_str(&mut self.text, ch, self.max_len)
+            && push_str(&mut self.text, ch, self.max_len, self.allowed)
         {
             self.changed(cx);
         }
@@ -246,10 +261,10 @@ mod tests {
     #[test]
     fn push_respects_max_and_skips_control() {
         let mut s = String::from("ab");
-        assert!(push_str(&mut s, "cde", 4));
+        assert!(push_str(&mut s, "cde", 4, any_char));
         assert_eq!(s, "abcd");
-        assert!(!push_str(&mut s, "x", 4));
-        assert!(!push_str(&mut s, "\n", 10));
+        assert!(!push_str(&mut s, "x", 4, any_char));
+        assert!(!push_str(&mut s, "\n", 10, any_char));
     }
 
     #[test]
@@ -261,10 +276,22 @@ mod tests {
     }
 
     #[test]
+    fn filter_drops_disallowed_typed_and_pasted_chars() {
+        let hex = |c: char| c == '#' || c.is_ascii_hexdigit();
+        let mut s = String::new();
+        assert!(paste(&mut s, " #9b5Cf6 xyz!", 7, hex));
+        assert_eq!(s, "#9b5Cf6");
+        assert!(!push_str(&mut s, "0", 7, hex), "full at 7 chars");
+        let mut s = String::new();
+        assert!(!push_str(&mut s, "zz", 7, hex));
+        assert!(s.is_empty());
+    }
+
+    #[test]
     fn paste_takes_first_line() {
         let mut s = String::new();
-        assert!(paste(&mut s, "#9B5CF6\nsecond", 64));
+        assert!(paste(&mut s, "#9B5CF6\nsecond", 64, any_char));
         assert_eq!(s, "#9B5CF6");
-        assert!(!paste(&mut s, "", 64));
+        assert!(!paste(&mut s, "", 64, any_char));
     }
 }
