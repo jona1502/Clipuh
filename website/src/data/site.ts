@@ -8,7 +8,8 @@
 export const sections = {
   hero: "top",
   features: "features",
-  showcase: "showcase",
+  /** The interactive demos start with the instant replay section. */
+  showcase: "instant-replay",
   download: "download",
 } as const;
 
