@@ -1,7 +1,7 @@
 //! Audio Mixer card of the Capture page. Device and application enumeration run off the
 //! UI thread; state shown per row comes only from engine events.
 
-use std::{cell::Cell, rc::Rc};
+use std::{cell::Cell, rc::Rc, time::Duration};
 
 use clipper_audio::DeviceFlow;
 use clipper_audio::windows::{
@@ -9,7 +9,7 @@ use clipper_audio::windows::{
 };
 use clipper_core::recording::{
     AudioSourceState, AudioSourceStatus, MAX_AUDIO_GAIN_PERCENT, MAX_RECORDED_AUDIO_SOURCES,
-    RecorderCommand,
+    RecorderCommand, SourceLevel,
 };
 use clipper_storage::{AudioSourceSettings, AudioSourceType, MAX_AUDIO_SOURCES};
 use gpui::prelude::*;
@@ -29,6 +29,13 @@ use crate::theme::{ActiveTheme, Theme};
 pub(super) const ADD_CONTEXT: &str = "AudioAdd";
 /// Focus-map key of the "Separate tracks" toggle (not a source id).
 const TRACKS_KEY: u32 = u32::MAX;
+/// Meter redraws are limited to 10 Hz.
+const LEVEL_MIN_INTERVAL: Duration = Duration::from_millis(100);
+/// Smaller peak changes are invisible on a 6 px bar.
+const LEVEL_EPSILON: f32 = 0.02;
+/// Peaks at or below this read as silence.
+const LEVEL_SILENCE: f32 = 0.005;
+const IDLE_APP_HINT: &str = "Starts capturing when the app plays audio";
 const NO_LOOPBACK: &str = "Needs Windows 11 or Windows 10 build 20348+";
 
 /// Keyboard focus of one mixer row.
@@ -48,9 +55,16 @@ pub(super) enum AddStep {
 // ---- pure helpers -------------------------------------------------------------------
 
 /// Dot tone, text shown instead of a meter, and whether a meter is shown.
-fn row_status(enabled: bool, status: Option<&AudioSourceStatus>) -> (Tone, Option<String>, bool) {
+fn row_status(
+    enabled: bool,
+    status: Option<&AudioSourceStatus>,
+    unavailable: Option<&str>,
+) -> (Tone, Option<String>, bool) {
     if !enabled {
         return (Tone::Neutral, Some("Off".into()), false);
+    }
+    if let Some(reason) = unavailable {
+        return (Tone::Warning, Some(reason.into()), false);
     }
     match status {
         Some(AudioSourceStatus::Capturing { .. }) => (Tone::Success, None, true),
@@ -60,6 +74,57 @@ fn row_status(enabled: bool, status: Option<&AudioSourceStatus>) -> (Tone, Optio
         Some(AudioSourceStatus::Failed(m)) => (Tone::Danger, Some(m.clone()), false),
         None => (Tone::Neutral, Some("Not capturing".into()), false),
     }
+}
+
+/// Why a source cannot be captured on this machine right now, if known.
+/// Whether an application is running is not decided here: the app list only holds apps
+/// currently playing audio, so the engine's per-source status is the authority.
+fn row_unavailable(
+    kind: AudioSourceType,
+    target: Option<&str>,
+    loopback: bool,
+    device_known: Option<bool>,
+) -> Option<&'static str> {
+    match kind {
+        AudioSourceType::Game if !loopback => Some(NO_LOOPBACK),
+        AudioSourceType::Application if !loopback => Some(NO_LOOPBACK),
+        AudioSourceType::Desktop | AudioSourceType::Microphone
+            if target.is_some() && device_known == Some(false) =>
+        {
+            Some("Device not available")
+        }
+        _ => None,
+    }
+}
+
+/// Whether a meter update is worth a redraw: the source set changed, a peak moved by at
+/// least `LEVEL_EPSILON`, and at least `LEVEL_MIN_INTERVAL` passed since the last redraw.
+pub(super) fn levels_need_redraw(
+    shown: &[SourceLevel],
+    next: &[SourceLevel],
+    since_last: Option<Duration>,
+) -> bool {
+    let sources_differ =
+        shown.len() != next.len() || shown.iter().zip(next).any(|(a, b)| a.source != b.source);
+    if sources_differ {
+        return true;
+    }
+    // The engine sends only on change, so a drop to silence may be the last update:
+    // never throttle it away or the meter would stick.
+    if shown
+        .iter()
+        .zip(next)
+        .any(|(a, b)| a.peak > LEVEL_SILENCE && b.peak <= LEVEL_SILENCE)
+    {
+        return true;
+    }
+    if since_last.is_some_and(|d| d < LEVEL_MIN_INTERVAL) {
+        return false;
+    }
+    shown
+        .iter()
+        .zip(next)
+        .any(|(a, b)| (a.peak - b.peak).abs() >= LEVEL_EPSILON)
 }
 
 /// Name and subtitle of a row. `resolved` is the friendly application name or the device name.
@@ -751,6 +816,7 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
     let enabled_ids: Vec<u32> = sources.iter().filter(|s| s.enabled).map(|s| s.id).collect();
     let pending = topology_pending(&enabled_ids, &window.audio_sources);
 
+    let at_enabled_max = enabled_ids.len() >= MAX_RECORDED_AUDIO_SOURCES;
     let mut rows = div().flex().flex_col();
     for (index, source) in sources.iter().enumerate() {
         let id = source.id;
@@ -759,7 +825,33 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
         let (name, subtitle) =
             row_labels(source.kind, source.target.as_deref(), resolved.as_deref());
         let state = window.audio_sources.iter().find(|s| s.source == id);
-        let (tone, text, meter) = row_status(source.enabled, state.map(|s| &s.status));
+        let lists_loaded = window.audio_capabilities.is_some() && !window.audio_loading;
+        let device_known = (lists_loaded
+            && matches!(
+                source.kind,
+                AudioSourceType::Desktop | AudioSourceType::Microphone
+            ))
+        .then(|| {
+            source
+                .target
+                .as_deref()
+                .is_none_or(|t| window.audio_devices.iter().any(|d| d.id == t))
+        });
+        let unavailable = row_unavailable(
+            source.kind,
+            source.target.as_deref(),
+            window.process_loopback(),
+            device_known,
+        );
+        let (tone, mut text, meter) =
+            row_status(source.enabled, state.map(|s| &s.status), unavailable);
+        if source.enabled
+            && state.is_none()
+            && unavailable.is_none()
+            && source.kind == AudioSourceType::Application
+        {
+            text = Some(IDLE_APP_HINT.into());
+        }
         let peak = window
             .audio_levels
             .iter()
@@ -906,7 +998,7 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
                     &t,
                     ("audio-on", id as usize),
                     source.enabled,
-                    true,
+                    source.enabled || (!at_enabled_max && unavailable.is_none()),
                     &focus.toggle,
                     window.is_focused(id, 2),
                     move |on, _, app| e2.update(app, |this, cx| this.audio_toggle(id, on, cx)),
@@ -996,7 +1088,15 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
         .children(pending.then(|| {
             muted(
                 &t,
-                "Source changes apply when replay or recording restarts.",
+                "Applies to the next recording or replay.",
+            )
+        }))
+        .children((at_enabled_max && sources.len() > enabled_ids.len()).then(|| {
+            muted(
+                &t,
+                format!(
+                    "{MAX_RECORDED_AUDIO_SOURCES} sources are on, the maximum. Turn one off to enable another."
+                ),
             )
         }))
         .children(window.audio_notice.as_ref().map(|n| {
@@ -1023,32 +1123,76 @@ mod tests {
     fn status_mapping() {
         use AudioSourceStatus::*;
         assert_eq!(
-            row_status(false, Some(&Capturing { track: None }))
+            row_status(false, Some(&Capturing { track: None }), None)
                 .1
                 .as_deref(),
             Some("Off")
         );
         assert_eq!(
-            row_status(true, None),
+            row_status(true, None, None),
             (Tone::Neutral, Some("Not capturing".into()), false)
         );
         assert_eq!(
-            row_status(true, Some(&Capturing { track: Some(1) })),
+            row_status(true, Some(&Capturing { track: Some(1) }), None),
             (Tone::Success, None, true)
         );
-        assert_eq!(row_status(true, Some(&Starting)).0, Tone::Warning);
+        assert_eq!(row_status(true, Some(&Starting), None).0, Tone::Warning);
         assert_eq!(
-            row_status(true, Some(&Waiting("x".into()))).0,
+            row_status(true, Some(&Waiting("x".into())), None).0,
             Tone::Warning
         );
         assert_eq!(
-            row_status(true, Some(&Skipped("x".into()))).0,
+            row_status(true, Some(&Skipped("x".into())), None).0,
             Tone::Neutral
         );
         assert_eq!(
-            row_status(true, Some(&Failed("x".into()))),
+            row_status(true, Some(&Failed("x".into())), None),
             (Tone::Danger, Some("x".into()), false)
         );
+    }
+
+    #[test]
+    fn unavailable_overrides_status() {
+        let r = row_status(true, Some(&AudioSourceStatus::Starting), Some("nope"));
+        assert_eq!(r, (Tone::Warning, Some("nope".into()), false));
+        assert_eq!(
+            row_status(false, None, Some("nope")).1.as_deref(),
+            Some("Off")
+        );
+    }
+
+    #[test]
+    fn unavailability_reasons() {
+        use AudioSourceType::*;
+        assert_eq!(row_unavailable(Game, None, false, None), Some(NO_LOOPBACK));
+        assert_eq!(row_unavailable(Game, None, true, None), None);
+        assert_eq!(
+            row_unavailable(Application, Some("a.exe"), false, None),
+            Some(NO_LOOPBACK)
+        );
+        assert_eq!(
+            row_unavailable(Microphone, Some("id"), true, Some(false)),
+            Some("Device not available")
+        );
+        assert_eq!(row_unavailable(Microphone, None, true, Some(false)), None);
+    }
+
+    #[test]
+    fn level_redraw_throttle() {
+        let l = |source, peak| SourceLevel { source, peak };
+        let ms = |n| Some(Duration::from_millis(n));
+        assert!(!levels_need_redraw(&[], &[], ms(1000)));
+        assert!(levels_need_redraw(&[], &[l(1, 0.0)], ms(1)));
+        assert!(levels_need_redraw(&[l(1, 0.0)], &[l(1, 0.5)], None));
+        assert!(levels_need_redraw(&[l(1, 0.0)], &[l(1, 0.5)], ms(100)));
+        assert!(!levels_need_redraw(&[l(1, 0.0)], &[l(1, 0.5)], ms(99)));
+        assert!(!levels_need_redraw(&[l(1, 0.50)], &[l(1, 0.51)], ms(500)));
+        assert!(levels_need_redraw(&[l(1, 0.5)], &[l(2, 0.5)], ms(0)));
+        // Drop to silence is always drawn, even inside the throttle window.
+        assert!(levels_need_redraw(&[l(1, 0.5)], &[l(1, 0.0)], ms(10)));
+        assert!(levels_need_redraw(&[l(1, 0.01)], &[l(1, 0.0)], ms(10)));
+        assert!(!levels_need_redraw(&[l(1, 0.0)], &[l(1, 0.001)], ms(10)));
+        assert!(!levels_need_redraw(&[l(1, 0.0)], &[l(1, 0.0)], ms(500)));
     }
 
     #[test]

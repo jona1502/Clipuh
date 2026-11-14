@@ -12,6 +12,8 @@ mod logic;
 #[cfg(windows)]
 mod recording_audio;
 #[cfg(windows)]
+pub use recording_audio::planned_audio_tracks;
+#[cfg(windows)]
 mod replay_session;
 #[cfg(windows)]
 mod windows_worker;

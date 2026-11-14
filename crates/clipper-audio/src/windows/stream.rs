@@ -115,6 +115,11 @@ pub(crate) trait StreamSource: Send {
         false
     }
 
+    /// Spacing of `needs_reopen` polls. Default [`RETRY_POLL`] (1 s).
+    fn poll_interval(&self) -> Duration {
+        RETRY_POLL
+    }
+
     /// Hands the source a duplicate of the thread's stop event, called once
     /// before the first `open`, so a long blocking `open` (process loopback
     /// activation) can be interrupted by stop. Default: ignored.
@@ -363,6 +368,8 @@ enum Exit {
 }
 
 const RETRY_INTERVAL: Duration = Duration::from_secs(1);
+/// Default spacing of `StreamSource::needs_reopen` polls.
+pub(crate) const RETRY_POLL: Duration = Duration::from_secs(1);
 /// A session shorter than this is "short": the next open waits first.
 const MIN_SESSION: Duration = Duration::from_secs(1);
 /// Pause before reopening after a short session (interruptible by stop).
@@ -588,7 +595,7 @@ impl Worker {
                     _ => return Exit::Fault,
                 }
             }
-            if last_poll.elapsed() >= RETRY_INTERVAL {
+            if last_poll.elapsed() >= self.source.poll_interval() {
                 last_poll = Instant::now();
                 if self.source.needs_reopen() {
                     return Exit::Reopen;
