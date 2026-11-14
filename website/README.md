@@ -32,6 +32,8 @@ website/
 ├── src/
 │   ├── components/
 │   │   ├── ui/             Button, Container, SectionHeading
+│   │   ├── feature/        FeatureSection, DemoFrame, BentoCard, StatusBadge, status.ts
+│   │   ├── showcase/       homepage showcase sections (Replay, Mixer, Editor, ...)
 │   │   └── interactive/    React islands (.tsx)
 │   ├── data/               site constants and content data
 │   ├── layouts/            page shells (BaseLayout.astro)
@@ -67,10 +69,10 @@ Planned routes: `/features`, `/showcase`, `/download`, `/changelog`, `/docs`, `/
 - Set `site` in `astro.config.mjs` once the production domain is known
   (enables canonical URLs and later a sitemap).
 
-`IntegrationCheck.tsx` only proves the React integration works and is not used
-on any page; replace it with the first real island. Because it is
-unreferenced, visitors download no JavaScript, but `dist/` still contains an
-unused React client chunk. That is expected until the first island lands.
+Islands live in `src/components/interactive/`: `ReplayDemo`, `MixerDemo`,
+`EditorDemo` (with `editor/`), mounted with `client:visible`. The React runtime
+loads when the first demo scrolls into view (about 66 KB gzip); the rest of the
+page ships no JavaScript.
 
 ## Design system
 
@@ -173,10 +175,14 @@ Zero-JS Astro primitives in `src/components/feature/`; copy comes from
 
 - `FeatureSection`: `id`, `copy`, `reverse?`, `class?`; named slot `demo`.
   Text first on mobile; demo beside text from `lg`. Top divider, `py-section`.
-- `StatusBadge`: `status` ("in-development" | "planned"), `class?`.
-- `DemoFrame`: `label?` (default "Interactive demo"; use e.g. "Interactive demo
-  · not real capture"), `title?`, `minHeight?` (CSS length, default `20rem`,
-  prevents layout shift), default slot.
+- `StatusBadge`: `status` ("in-development" | "planned"), `class?`. Classes come
+  from `feature/status.ts` (`statusBadgeClass`), shared with the React demos.
+  Status rules live in `src/data/features.ts`: "planned" = not implemented in
+  the app; nothing is "released" (no public build).
+- `DemoFrame`: `label?` (default "Interactive demo"; used as "Interactive demo ·
+  nothing is recorded", "... · no audio is captured", "... · sample timeline",
+  "Architecture overview"), `title?`, `minHeight?` (default `20rem`) and
+  `minHeightLg?` (from `lg`), both prevent layout shift, default slot.
 - `BentoCard`: `title`, `description`, `status`, `size?: "wide" | "regular"`;
   non-interactive `<article>`, default slot for extra content.
 - Islands: mount with `client:visible`; use `useReducedMotion()` from

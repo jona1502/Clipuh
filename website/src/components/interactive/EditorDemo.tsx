@@ -10,6 +10,7 @@ import {
   type PointerEvent,
 } from "react";
 import { statusLabel } from "@/data/features";
+import { statusBadgeClass } from "@/components/feature/status";
 import { useReducedMotion } from "./shared/useReducedMotion";
 import { Waveform } from "./editor/Waveform";
 import {
@@ -63,7 +64,7 @@ const pct = (t: number) => `${(t / DURATION) * 100}%`;
 
 function PlannedTag() {
   return (
-    <span className="inline-flex shrink-0 items-center rounded-full border border-border-hover px-1.5 text-caption leading-4 font-semibold whitespace-nowrap text-text-secondary">
+    <span className={statusBadgeClass("planned", "sm")}>
       {statusLabel.planned}
     </span>
   );
@@ -136,9 +137,9 @@ const TrackRow = memo(function TrackRow({
         <button
           type="button"
           aria-pressed={muted}
-          aria-label={`Mute ${track.name}`}
+          aria-label={`Mute ${track.name} (planned)`}
           onClick={() => onMute(track.id)}
-          className="relative z-10 inline-flex size-11 shrink-0 cursor-pointer items-center justify-center self-end rounded-md border border-border-hover bg-surface-raised text-text-secondary hover:bg-surface-hover aria-pressed:border-accent aria-pressed:bg-accent-subtle aria-pressed:text-accent-hover @[30rem]:size-8 @[30rem]:self-auto"
+          className="relative z-10 inline-flex size-11 shrink-0 cursor-pointer items-center justify-center self-end rounded-md border border-border-hover bg-surface-raised text-text-secondary hover:bg-surface-hover aria-pressed:border-accent aria-pressed:bg-accent-subtle aria-pressed:text-text @[30rem]:size-8 @[30rem]:self-auto @[30rem]:pointer-coarse:size-11"
         >
           <SpeakerIcon muted={muted} />
         </button>
@@ -166,7 +167,7 @@ const TrackRow = memo(function TrackRow({
 });
 
 const HANDLE =
-  "absolute z-20 bottom-0 flex w-11 -translate-x-1/2 cursor-ew-resize touch-none items-stretch justify-center @[30rem]:w-6";
+  "absolute z-20 bottom-0 flex w-11 -translate-x-1/2 cursor-ew-resize touch-none items-stretch justify-center @[30rem]:w-6 @[30rem]:pointer-coarse:w-11";
 const HANDLE_BAR = "bg-accent pointer-events-none block w-1.5 rounded-sm";
 
 export default function EditorDemo() {
@@ -188,8 +189,11 @@ export default function EditorDemo() {
   const dragRef = useRef(false);
   const playheadRef = useRef(playhead);
   const trimRef = useRef(trim);
-  playheadRef.current = playhead;
-  trimRef.current = trim;
+  // Mirror state into refs after commit (never write refs during render).
+  useEffect(() => {
+    playheadRef.current = playhead;
+    trimRef.current = trim;
+  }, [playhead, trim]);
 
   const paths = useMemo(
     () => TRACKS.map((t) => wavePath(makeWave(t.seed, t.kind))),
@@ -214,20 +218,17 @@ export default function EditorDemo() {
     setPlayhead(clamp(t, 0, DURATION));
   }, []);
 
-  const changeTrim = useCallback((next: { start: number; end: number }) => {
-    setTrim(next);
+  const setStart = (v: number) => {
+    setTrim((t) => ({ start: clamp(v, 0, t.end - MIN_TRIM), end: t.end }));
     setExportState("idle");
-  }, []);
-  const setStart = (v: number) =>
-    changeTrim({
-      start: clamp(v, 0, trimRef.current.end - MIN_TRIM),
-      end: trimRef.current.end,
-    });
-  const setEnd = (v: number) =>
-    changeTrim({
-      start: trimRef.current.start,
-      end: clamp(v, trimRef.current.start + MIN_TRIM, DURATION),
-    });
+  };
+  const setEnd = (v: number) => {
+    setTrim((t) => ({
+      start: t.start,
+      end: clamp(v, t.start + MIN_TRIM, DURATION),
+    }));
+    setExportState("idle");
+  };
 
   // ---- playhead drag / click-to-seek (ruler + lanes) ---------------------
   const onSurfaceDown = (e: PointerEvent<HTMLDivElement>) => {
@@ -336,6 +337,7 @@ export default function EditorDemo() {
     [],
   );
 
+  const selectedName = TRACKS.find((t) => t.id === selected)?.name ?? "";
   const outside = playhead < trim.start || playhead > trim.end;
   const trimLen = trim.end - trim.start;
   const sceneStyle: CSSProperties = {
@@ -391,6 +393,19 @@ export default function EditorDemo() {
         <p className="font-mono text-small text-text-secondary tabular-nums">
           Trim {formatTime(trim.start)} – {formatTime(trim.end)} (
           {formatSeconds(trimLen)})
+        </p>
+      </div>
+
+      {/* Audio group header + selected-track readout */}
+      <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1.5 text-caption text-text-secondary">
+        <p className="flex flex-wrap items-center gap-x-2 gap-y-1">
+          <span className="font-semibold text-text">Audio tracks</span>
+          <PlannedTag />
+          <span>Per-track mute and waveforms</span>
+        </p>
+        <p role="status" aria-atomic="true">
+          Selected:{" "}
+          <span className="font-semibold text-text">{selectedName}</span>
         </p>
       </div>
 
@@ -488,7 +503,7 @@ export default function EditorDemo() {
                       return (
                         <span
                           key={sec}
-                          className="absolute top-1 font-mono text-caption text-text-muted tabular-nums"
+                          className="absolute top-1 font-mono text-caption text-text-secondary tabular-nums"
                           style={{ left: pct(sec * 10), transform: align }}
                         >
                           {formatTime(sec * 10).slice(0, -2)}
@@ -590,7 +605,7 @@ export default function EditorDemo() {
               aria-valuenow={playhead}
               aria-valuetext={`${formatTime(playhead)} of ${formatTime(DURATION)}`}
               onKeyDown={onPlayheadKey}
-              className={`absolute top-0 z-30 flex w-11 -translate-x-1/2 cursor-ew-resize touch-none items-start justify-center @[30rem]:w-6 ${RULER_H}`}
+              className={`absolute top-0 z-30 flex w-11 -translate-x-1/2 cursor-ew-resize touch-none items-start justify-center @[30rem]:w-6 @[30rem]:pointer-coarse:h-11 @[30rem]:pointer-coarse:w-11 ${RULER_H}`}
               style={{ left: pct(playhead) }}
             >
               <span className="pointer-events-none mt-0.5 block h-3 w-3 rounded-sm bg-text" />
@@ -601,10 +616,7 @@ export default function EditorDemo() {
 
       {/* Honesty note + compact-width note */}
       <div className="flex flex-col gap-1 text-caption text-text-secondary">
-        <p className="flex flex-wrap items-center gap-x-2 gap-y-1">
-          <PlannedTag />
-          <span>Per-track audio editing is planned. Trimming works today.</span>
-        </p>
+        <p>Trimming and export work today; audio-track editing is planned.</p>
         <p className="@[30rem]:hidden">
           +2 planned tracks (Game audio, Discord) are hidden at this width.
         </p>

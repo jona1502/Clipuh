@@ -6,6 +6,8 @@ interface Props {
   title?: string;
   /** CSS length reserved for the demo body (avoids layout shift). */
   minHeight?: string;
+  /** Override from `lg` up (two-column layout); defaults to `minHeight`. */
+  minHeightLg?: string;
   class?: string;
 }
 
@@ -13,6 +15,7 @@ const {
   label = "Interactive demo",
   title,
   minHeight = "20rem",
+  minHeightLg = minHeight,
   class: className,
 } = Astro.props;
 ---
@@ -32,7 +35,10 @@ const {
     </span>
     {title && <span class="text-small text-text-secondary">{title}</span>}
   </figcaption>
-  <div class="relative" style={`min-height:${minHeight}`}>
+  <div
+    class="min-h-(--demo-min) lg:min-h-(--demo-min-lg) relative"
+    style={`--demo-min:${minHeight};--demo-min-lg:${minHeightLg}`}
+  >
     <slot />
   </div>
 </figure>

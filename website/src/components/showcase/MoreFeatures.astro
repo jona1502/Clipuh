@@ -17,7 +17,7 @@ const swatches = [
 ];
 const durations = ["15 s", "30 s", "1 min", "2 min", "5 min"];
 const kbd =
-  "border-border-hover bg-surface-raised text-text-secondary text-small inline-flex min-w-9 items-center justify-center rounded-md border border-b-2 px-2 py-1 font-mono";
+  "border-border-hover bg-surface-raised text-text-secondary text-small inline-flex min-w-8 items-center justify-center rounded-md border border-b-2 px-1.5 py-1 font-mono";
 const chip =
   "border-border text-caption text-text-secondary rounded-full border px-2.5 py-1";
 const chipOn = "bg-accent-subtle text-text border-transparent";
@@ -43,7 +43,7 @@ const pane =
         <BentoCard {...item}>
           <div class="mt-auto pt-3" aria-hidden="true">
             {item.title === "Customizable hotkeys" && (
-              <div class="flex flex-wrap items-center gap-1.5">
+              <div class="flex flex-nowrap items-center gap-1">
                 <kbd class={kbd}>Ctrl</kbd>
                 <span class="text-text-muted">+</span>
                 <kbd class={kbd}>Shift</kbd>
@@ -71,7 +71,7 @@ const pane =
               <ul class="flex flex-wrap gap-2">
                 {swatches.map((s) => (
                   <li
-                    class="size-6 rounded-full border border-white/15"
+                    class="size-6 rounded-full border border-border-hover"
                     style={`background:${s.hex}`}
                     title={s.name}
                   />
@@ -81,7 +81,7 @@ const pane =
             {item.title === "Replay length" && (
               <ul class="flex flex-wrap gap-2">
                 {durations.map((d, i) => (
-                  <li class:list={[chip, i === 1 && chipOn]}>{d}</li>
+                  <li class:list={[chip, i === 2 && chipOn]}>{d}</li>
                 ))}
               </ul>
             )}

@@ -3,7 +3,7 @@ import FeatureSection from "@/components/feature/FeatureSection.astro";
 import DemoFrame from "@/components/feature/DemoFrame.astro";
 import { featureIds, performance } from "@/data/features";
 
-// Main path: stacked on mobile, 2-column grid from sm.
+// Main path: 2-column grid at every width (compact boxes below sm).
 const main = [
   { name: "Game", note: "Your running title" },
   { name: "Windows Graphics Capture", note: "Frames from monitor or window" },
@@ -20,7 +20,8 @@ const steps = [
   "Save by copying encoded data, without re-encoding",
   "Clip",
 ];
-const box = "border-border bg-surface-raised rounded-lg border px-4 py-3";
+const box =
+  "border-border bg-surface-raised rounded-lg border px-3 py-2 sm:px-4 sm:py-3";
 ---
 
 <FeatureSection id={featureIds.performance} copy={performance}>
@@ -31,12 +32,12 @@ const box = "border-border bg-surface-raised rounded-lg border px-4 py-3";
     minHeight="0"
   >
     <div
-      class="flex flex-col gap-6 p-5 sm:p-6"
+      class="flex flex-col gap-4 p-4 sm:gap-6 sm:p-6"
       role="group"
       aria-label="Capture pipeline diagram"
       aria-describedby="pipeline-steps"
     >
-      <ol class="grid gap-3 sm:grid-cols-2" aria-hidden="true">
+      <ol class="grid grid-cols-2 gap-2 sm:gap-3" aria-hidden="true">
         {main.map((s, i) => (
           <li class="relative">
             <div
@@ -56,11 +57,11 @@ const box = "border-border bg-surface-raised rounded-lg border px-4 py-3";
         ))}
       </ol>
 
-      <div class="border-border border-t pt-5" aria-hidden="true">
+      <div class="border-border border-t pt-4 sm:pt-5" aria-hidden="true">
         <p class="text-caption text-text-muted mb-3 font-semibold tracking-widest uppercase">
           Audio branch
         </p>
-        <div class="flex flex-col gap-2 sm:flex-row sm:items-center">
+        <div class="flex flex-col gap-1 sm:flex-row sm:items-center sm:gap-2">
           <div class:list={[box, "sm:flex-1"]}>
             <p class="text-small font-semibold">Desktop + Mic</p>
             <p class="text-caption text-text-muted mt-0.5">Audio sources</p>
