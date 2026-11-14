@@ -3,13 +3,15 @@
 
 mod dropdown;
 mod icon;
+mod raster_icon;
 mod slider;
 mod smooth_scroll;
 mod text_input;
 mod toggle;
 mod tooltip;
-pub use dropdown::{DropdownOption, dropdown, dropdown_ghost, step};
+pub use dropdown::{Decor, DropdownOption, dropdown, dropdown_decorated, dropdown_ghost, step};
 pub use icon::{Icon, icon, icon_tile};
+pub use raster_icon::{RasterIcon, raster_checkbox, raster_icon, raster_icon_hover};
 pub use slider::slider;
 pub use smooth_scroll::smooth_scroll;
 pub use text_input::{TextInput, TextInputEvent};
@@ -162,6 +164,40 @@ pub fn button(
     keys: Option<&[&'static str]>,
     enabled: bool,
 ) -> Stateful<Div> {
+    button_with(t, id, None, label, variant, keys, enabled)
+}
+
+/// Text colour of a [`button`] label for `variant` (for icons drawn in it).
+pub fn button_text_color(t: &Theme, variant: ButtonVariant) -> gpui::Hsla {
+    match variant {
+        ButtonVariant::Primary => t.colors.accent_foreground,
+        ButtonVariant::Secondary => t.colors.text,
+        ButtonVariant::Danger => t.colors.recording_foreground,
+        ButtonVariant::Ghost => t.colors.text_secondary,
+    }
+}
+
+/// [`button`] with `leading` (an icon) before the label.
+pub fn button_with_icon(
+    t: &Theme,
+    id: impl Into<ElementId>,
+    leading: AnyElement,
+    label: impl Into<SharedString>,
+    variant: ButtonVariant,
+    enabled: bool,
+) -> Stateful<Div> {
+    button_with(t, id, Some(leading), label, variant, None, enabled)
+}
+
+fn button_with(
+    t: &Theme,
+    id: impl Into<ElementId>,
+    leading: Option<AnyElement>,
+    label: impl Into<SharedString>,
+    variant: ButtonVariant,
+    keys: Option<&[&'static str]>,
+    enabled: bool,
+) -> Stateful<Div> {
     let (bg, hover, text, border) = match variant {
         ButtonVariant::Primary => (
             t.colors.accent,
@@ -203,6 +239,7 @@ pub fn button(
         .text_xs()
         .font_weight(FontWeight::MEDIUM)
         .text_color(text)
+        .children(leading)
         .child(label.into())
         .children(keys.map(|k| shortcut(t, k)))
         .map(|this| {

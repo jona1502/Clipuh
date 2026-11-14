@@ -31,6 +31,7 @@ pub struct TextInput {
     disabled: bool,
     max_len: usize,
     focus: FocusHandle,
+    leading_icon: Option<super::RasterIcon>,
 }
 
 impl EventEmitter<TextInputEvent> for TextInput {}
@@ -73,7 +74,14 @@ impl TextInput {
             disabled: false,
             max_len: MAX_LEN,
             focus: cx.focus_handle().tab_stop(true),
+            leading_icon: None,
         }
+    }
+
+    /// Draws an approved icon (muted) before the text, e.g. a search glass.
+    pub fn leading_icon(mut self, icon: super::RasterIcon) -> Self {
+        self.leading_icon = Some(icon);
+        self
     }
 
     /// Allows longer file names without changing the default for other fields.
@@ -194,6 +202,14 @@ impl Render for TextInput {
                     .text_color(t.colors.text)
                     .when(self.disabled, |this| this.opacity(0.45))
                     .when(!self.disabled, |this| this.cursor_text())
+                    .when_some(self.leading_icon, |this, icon| {
+                        this.gap_2().child(super::raster_icon(
+                            icon,
+                            px(16.),
+                            t.colors.text_muted,
+                            window,
+                        ))
+                    })
                     .child(shown)
                     .when(focused, |this| {
                         this.child(div().text_color(t.colors.accent).child("|"))
