@@ -344,35 +344,7 @@ impl Render for ClipEditor {
                     .flex_1()
                     .child("Source timeline · select segment · drag edges"),
             )
-            .child(
-                button(
-                    &t,
-                    "editor-zoom-out",
-                    "−",
-                    ButtonVariant::Ghost,
-                    None,
-                    self.zoom > 1.,
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.zoom = (this.zoom / 1.5).max(1.);
-                    cx.notify();
-                })),
-            )
-            .child(muted(&t).child(format!("{:.0}%", self.zoom * 100.)))
-            .child(
-                button(
-                    &t,
-                    "editor-zoom-in",
-                    "+",
-                    ButtonVariant::Ghost,
-                    None,
-                    self.zoom < 8.,
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.zoom = (this.zoom * 1.5).min(8.);
-                    cx.notify();
-                })),
-            );
+            .child(self.zoom_controls(&t, loaded, window, cx));
         let timeline = self.timeline(duration, loaded, window, cx);
         div()
             .id("clip-editor")
@@ -461,21 +433,45 @@ impl ClipEditor {
         let t = *cx.theme();
         let bounds_out = self.timeline.clone();
         let mut ruler = div().relative().h(px(26.)).w_full();
-        for i in 0..=10 {
+        // Before the first layout the viewport is unknown: label the whole
+        // axis at a nominal width instead of leaving the ruler empty.
+        let measured = f32::from(self.timeline_viewport.get().size.width);
+        let (axis, scroll, viewport) = if measured > super::TIMELINE_END_PAD {
+            (
+                self.axis_width(self.zoom),
+                -f32::from(self.timeline_scroll.offset().x),
+                measured,
+            )
+        } else {
+            (1000. * self.zoom, 0., 1000. * self.zoom)
+        };
+        let ticks = clipper_editor::timeline::visible_ticks(
+            duration,
+            axis,
+            scroll,
+            scroll + viewport,
+            RULER_LABEL_GAP,
+        );
+        let step = ticks
+            .get(1)
+            .zip(ticks.first())
+            .map_or(Duration::from_secs(1), |(b, a)| *b - *a);
+        for at in ticks {
             ruler = ruler.child(
                 div()
                     .absolute()
-                    .left(relative(i as f32 / 10.))
+                    .left(relative(fraction(at, duration)))
                     .text_size(px(10.))
                     .text_color(t.colors.text_muted)
-                    .child(ruler_timestamp(duration.mul_f32(i as f32 / 10.), duration)),
+                    .child(ruler_label(at, step)),
             );
         }
+        let video_height = self.track_height(TrackId::Video, HeightLimits::VIDEO);
         let mut video = div()
             .id("editor-video-track")
             .relative()
             .w_full()
-            .h(px(52.))
+            .h(px(video_height))
             .bg(t.colors.media_background)
             .rounded_md()
             .overflow_hidden()
@@ -583,6 +579,8 @@ impl ClipEditor {
             .gap_2()
             .child(ruler)
             .child(video);
+        // Combined/Master is first (see `arrange_audio_tracks`); every row
+        // shares the one time axis above.
         for i in 0..self.audio_tracks {
             tracks = tracks.child(self.audio_waveform(i, duration, cx));
         }
@@ -605,7 +603,19 @@ impl ClipEditor {
             .flex_col()
             .gap_2()
             .pt(px(34.))
-            .child(muted(&t).h(px(52.)).child("Video"));
+            .child(
+                muted(&t)
+                    .relative()
+                    .h(px(video_height))
+                    .child("Video")
+                    .child(self.resize_handle(
+                        &t,
+                        TrackId::Video,
+                        video_height,
+                        HeightLimits::VIDEO,
+                        cx,
+                    )),
+            );
         for i in 0..self.audio_tracks {
             labels = labels.child(self.audio_header(i, window, cx));
         }
@@ -616,29 +626,80 @@ impl ClipEditor {
                 "Reading tracks…"
             }));
         }
-        div()
-            .flex()
-            .gap_2()
+        let viewport_out = self.timeline_viewport.clone();
+        let editor = cx.entity().downgrade();
+        let scroller = div()
+            .relative()
+            .flex_1()
             .min_w_0()
-            .child(labels)
             .child(
                 div()
                     .id("editor-timeline-scroll")
-                    .flex_1()
-                    .min_w_0()
+                    .w_full()
                     .overflow_x_scroll()
+                    .track_scroll(&self.timeline_scroll)
                     .pb_2()
                     .child(
                         div()
                             .w(relative(self.zoom))
                             .flex_shrink_0()
-                            .pr(px(48.))
+                            .pr(px(super::TIMELINE_END_PAD))
                             .child(tracks),
                     ),
             )
+            // Measures the viewport and zooms on Ctrl+wheel before the
+            // scroll area sees the wheel (capture phase), around the pointer.
+            .child(
+                canvas(
+                    move |bounds, _, _| viewport_out.set(bounds),
+                    move |bounds, _, window, _| {
+                        let editor = editor.clone();
+                        window.on_mouse_event(
+                            move |event: &gpui::ScrollWheelEvent, phase, window, cx| {
+                                if phase != gpui::DispatchPhase::Capture
+                                    || !event.modifiers.control
+                                    || !bounds.contains(&event.position)
+                                {
+                                    return;
+                                }
+                                let notches =
+                                    f32::from(event.delta.pixel_delta(window.line_height()).y)
+                                        / f32::from(window.line_height())
+                                        / 3.;
+                                if notches == 0. || !notches.is_finite() {
+                                    return;
+                                }
+                                cx.stop_propagation();
+                                let factor = clipper_editor::timeline::ZOOM_STEP
+                                    .powf(notches.clamp(-3., 3.));
+                                let anchor = f32::from(event.position.x - bounds.origin.x);
+                                editor
+                                    .update(cx, |this, cx| this.zoom_by(factor, Some(anchor), cx))
+                                    .ok();
+                            },
+                        );
+                    },
+                )
+                .absolute()
+                .size_full(),
+            );
+        div()
+            .flex()
+            .gap_2()
+            .min_w_0()
+            .child(labels)
+            .child(scroller)
             .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
                 if event.pressed_button != Some(MouseButton::Left) {
                     this.finish_drag(cx);
+                    return;
+                }
+                if let Some((id, _, _)) = this.resizing {
+                    let limits = match id {
+                        TrackId::Video => HeightLimits::VIDEO,
+                        TrackId::Audio(_) => Self::audio_limits(cx.theme()),
+                    };
+                    this.drag_resize(event.position.y, limits, cx);
                     return;
                 }
                 if this.audio_dragging.is_some() {
@@ -684,6 +745,9 @@ impl ClipEditor {
             )
     }
     pub(super) fn finish_drag(&mut self, cx: &mut Context<Self>) {
+        if self.resizing.take().is_some() {
+            cx.notify();
+        }
         self.finish_audio_drag(cx);
         if self.dragging.take().is_some() {
             if let (Some(edits), Some(trim)) = (&mut self.edits, self.trim) {
@@ -706,7 +770,7 @@ impl ClipEditor {
                     segment.end = segment.end.min(duration);
                 }
             }
-            edits.set_audio_tracks(tracks);
+            edits.set_audio_tracks(clipper_editor::arrange_audio_tracks(tracks));
         }
         self.sync_audio(cx);
         self.trim = self
@@ -753,11 +817,145 @@ impl ClipEditor {
     }
 }
 
-fn ruler_timestamp(at: Duration, duration: Duration) -> String {
-    if duration < Duration::from_secs(10) {
-        format!("{:.1}s", at.as_secs_f64())
+/// Minimum spacing of ruler labels, in pixels.
+const RULER_LABEL_GAP: f32 = 72.;
+
+/// Ruler text for `at` with labels `step` apart: `M:SS`, with tenths or
+/// hundredths when the step is below a second, `H:MM:SS` past an hour.
+fn ruler_label(at: Duration, step: Duration) -> String {
+    let total = at.as_secs();
+    let base = if total >= 3600 {
+        format!("{}:{:02}:{:02}", total / 3600, total / 60 % 60, total % 60)
     } else {
-        format!("{}:{:02}", at.as_secs() / 60, at.as_secs() % 60)
+        format!("{}:{:02}", total / 60, total % 60)
+    };
+    let millis = at.subsec_millis();
+    if step >= Duration::from_secs(1) {
+        base
+    } else if step.as_millis().is_multiple_of(100) {
+        format!("{base}.{}", millis / 100)
+    } else {
+        format!("{base}.{:02}", millis / 10)
+    }
+}
+
+impl ClipEditor {
+    /// Drag strip on the bottom edge of a track header: resizes that row only.
+    pub(super) fn resize_handle(
+        &self,
+        t: &Theme,
+        id: TrackId,
+        height: f32,
+        limits: HeightLimits,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<Div> {
+        let active = self.resizing.is_some_and(|(row, _, _)| row == id);
+        let key = match id {
+            TrackId::Video => 0,
+            TrackId::Audio(stream) => stream as usize + 1,
+        };
+        div()
+            .id(("track-resize", key))
+            .absolute()
+            .left_0()
+            .right_0()
+            .bottom(px(-6.))
+            .h(px(8.))
+            .cursor_row_resize()
+            .flex()
+            .items_center()
+            .child(
+                div()
+                    .w_full()
+                    .h(px(2.))
+                    .rounded_full()
+                    .when(active, |line| line.bg(t.colors.accent)),
+            )
+            .hover(|style| style.bg(t.colors.accent.opacity(0.25)))
+            .tooltip(crate::components::tooltip("Drag to resize this track"))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                    this.resizing = Some((id, event.position.y, limits.clamp(height)));
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+    }
+
+    /// Zoom out, slider, zoom in and Fit, plus the current level.
+    fn zoom_controls(
+        &self,
+        t: &Theme,
+        loaded: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        use clipper_editor::timeline::{MIN_ZOOM, ZOOM_STEP, slider_to_zoom, zoom_to_slider};
+        let max = self.max_zoom();
+        let editor = cx.entity().downgrade();
+        let slider = crate::components::slider(
+            t,
+            "editor-zoom-slider",
+            zoom_to_slider(self.zoom, max),
+            loaded,
+            &self.zoom_focus,
+            self.zoom_focus.is_focused(window),
+            move |value, _, cx| {
+                editor
+                    .update(cx, |this, cx| {
+                        let max = this.max_zoom();
+                        this.set_zoom(slider_to_zoom(value, max), None, cx);
+                    })
+                    .ok();
+            },
+        );
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(
+                button(
+                    t,
+                    "editor-zoom-out",
+                    "−",
+                    ButtonVariant::Ghost,
+                    None,
+                    loaded && self.zoom > MIN_ZOOM,
+                )
+                .tooltip(crate::components::tooltip("Zoom out (Ctrl+wheel)"))
+                .on_click(cx.listener(|this, _, _, cx| this.zoom_by(1. / ZOOM_STEP, None, cx))),
+            )
+            .child(div().w(px(120.)).child(slider))
+            .child(
+                button(
+                    t,
+                    "editor-zoom-in",
+                    "+",
+                    ButtonVariant::Ghost,
+                    None,
+                    loaded && self.zoom < max,
+                )
+                .tooltip(crate::components::tooltip("Zoom in (Ctrl+wheel)"))
+                .on_click(cx.listener(|this, _, _, cx| this.zoom_by(ZOOM_STEP, None, cx))),
+            )
+            .child(
+                muted(t)
+                    .w(px(52.))
+                    .child(format!("{:.0}%", self.zoom * 100.)),
+            )
+            .child(
+                button(
+                    t,
+                    "editor-zoom-fit",
+                    "Fit",
+                    ButtonVariant::Ghost,
+                    None,
+                    loaded && self.zoom > MIN_ZOOM,
+                )
+                .tooltip(crate::components::tooltip("Show the whole clip"))
+                .on_click(cx.listener(|this, _, _, cx| this.set_zoom(MIN_ZOOM, None, cx))),
+            )
     }
 }
 
@@ -768,4 +966,21 @@ pub(super) fn timestamp_row(theme: &Theme, label: &'static str, input: Entity<Te
         .gap_3()
         .child(muted(theme).w(px(42.)).child(label))
         .child(div().flex_1().child(input))
+}
+
+#[cfg(test)]
+mod ruler_tests {
+    use super::*;
+
+    fn ms(v: u64) -> Duration {
+        Duration::from_millis(v)
+    }
+
+    #[test]
+    fn ruler_labels_match_the_tick_step() {
+        assert_eq!(ruler_label(ms(65_000), ms(5_000)), "1:05");
+        assert_eq!(ruler_label(ms(5_500), ms(500)), "0:05.5");
+        assert_eq!(ruler_label(ms(5_250), ms(250)), "0:05.25");
+        assert_eq!(ruler_label(ms(3_725_000), ms(60_000)), "1:02:05");
+    }
 }

@@ -50,6 +50,68 @@ impl AudioTrack {
     }
 }
 
+/// Display name of the recording's combined (master) audio stream.
+pub const COMBINED_LABEL: &str = "Combined/Master";
+/// Name clipuh wrote for that stream before; existing files keep it.
+pub const LEGACY_COMBINED_LABEL: &str = "Mix";
+
+/// The stream that already contains every recorded source mixed together.
+/// Only the recorded stream name decides: unnamed legacy streams stay what
+/// they are, nothing is guessed from stream order.
+pub fn is_combined(track: &AudioTrack) -> bool {
+    let label = track.label.trim();
+    label.eq_ignore_ascii_case(COMBINED_LABEL) || label.eq_ignore_ascii_case(LEGACY_COMBINED_LABEL)
+}
+
+/// Name shown in the editor (headers, inspector, tooltips). The stored label
+/// and the file are never changed.
+pub fn display_label(track: &AudioTrack) -> &str {
+    if is_combined(track) {
+        COMBINED_LABEL
+    } else {
+        &track.label
+    }
+}
+
+/// Discovered tracks in editor order: the combined track first, every other
+/// track in its recorded order. When the combined track and isolated source
+/// tracks both exist, the sources start muted: they contain the same audio
+/// again, and playing both would double every source. Unmuting either side
+/// later mutes the other (see [`EditSession::set_track_mute`]).
+pub fn arrange_audio_tracks(mut tracks: Vec<AudioTrack>) -> Vec<AudioTrack> {
+    // Stable: equal keys keep their relative (recorded) order.
+    tracks.sort_by_key(|track| !is_combined(track));
+    if tracks.len() > 1 && tracks.first().is_some_and(is_combined) {
+        for track in tracks.iter_mut().skip(1) {
+            if !is_combined(track) {
+                track.muted = true;
+            }
+        }
+    }
+    tracks
+}
+
+fn audible(track: &AudioTrack) -> bool {
+    track.enabled && !track.muted
+}
+
+/// After `changed` became audible: silence the other side of the
+/// combined/source split so no source plays twice.
+fn avoid_double_audio(tracks: &mut [AudioTrack], changed: usize) {
+    let Some(track) = tracks.get(changed) else {
+        return;
+    };
+    if !audible(track) || !tracks.iter().any(is_combined) {
+        return;
+    }
+    let combined = is_combined(track);
+    for (index, other) in tracks.iter_mut().enumerate() {
+        if index != changed && is_combined(other) != combined && audible(other) {
+            other.muted = true;
+        }
+    }
+}
+
 /// Solo applies to enabled, unmuted tracks. Mute always wins. Final mixing
 /// saturates the summed signal once, so preview and export share one policy.
 pub fn effective_gain(tracks: &[AudioTrack], stream_index: u32) -> f32 {
@@ -154,8 +216,11 @@ impl EditSession {
             Ok(())
         })
     }
+    /// Unmuting a track mutes the other side of the combined/source split
+    /// (one undo step), so the combined track and the sources it contains are
+    /// never heard together.
     pub fn set_track_mute(&mut self, index: usize, value: bool) -> Result<(), &'static str> {
-        self.update_track(index, |t| {
+        self.update_tracks(index, |t| {
             t.muted = value;
             Ok(())
         })
@@ -166,11 +231,28 @@ impl EditSession {
             Ok(())
         })
     }
+    /// Same double-audio rule as [`Self::set_track_mute`].
     pub fn set_track_enabled(&mut self, index: usize, value: bool) -> Result<(), &'static str> {
-        self.update_track(index, |t| {
+        self.update_tracks(index, |t| {
             t.enabled = value;
             Ok(())
         })
+    }
+    /// Edits track `index`, then applies the combined/source rule to all
+    /// tracks; one checkpoint for the whole change.
+    fn update_tracks(
+        &mut self,
+        index: usize,
+        edit: impl FnOnce(&mut AudioTrack) -> Result<(), &'static str>,
+    ) -> Result<(), &'static str> {
+        let mut candidate = self.state.audio_tracks.clone();
+        edit(candidate.get_mut(index).ok_or("Audio track not found.")?)?;
+        avoid_double_audio(&mut candidate, index);
+        if self.state.audio_tracks != candidate {
+            self.checkpoint();
+            self.state.audio_tracks = candidate;
+        }
+        Ok(())
     }
     pub fn trim_audio(&mut self, start: Duration, end: Duration) -> Result<(), &'static str> {
         let duration = self.source_duration;

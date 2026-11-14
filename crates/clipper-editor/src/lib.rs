@@ -95,7 +95,11 @@ mod tests {
 }
 
 mod audio;
-pub use audio::{AudioTrack, effective_gain};
+pub mod timeline;
+pub use audio::{
+    AudioTrack, COMBINED_LABEL, LEGACY_COMBINED_LABEL, arrange_audio_tracks, display_label,
+    effective_gain, is_combined,
+};
 
 use std::collections::VecDeque;
 use std::time::Duration;
