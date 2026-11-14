@@ -111,7 +111,7 @@ export const performance: FeatureCopy = {
     "clipuh is designed to stay out of the way: native code, encoding on the GPU and bounded memory for the replay buffer. These are design goals, not benchmark claims.",
   status: "in-development",
   points: [
-    "Native Rust application, no browser engine in the capture path",
+    "Native Rust application with a GPUI interface, no browser engine in the capture path",
     "H.264 encoded on the GPU through NVENC, AMF or Quick Sync, with no software fallback",
     "Replay buffer holds encoded frames only, within a configurable RAM budget",
     "Clips are saved by copying encoded data, not by re-encoding",

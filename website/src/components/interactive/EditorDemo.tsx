@@ -54,7 +54,7 @@ const LABEL_SETS = [
   { step: 5, cls: "hidden @[34rem]:block" },
 ] as const;
 
-const ROW_H = "h-[4.5rem] @[30rem]:h-12";
+const ROW_H = "h-[6.5rem] @[30rem]:h-12";
 const RULER_H = "h-11 @[30rem]:h-7";
 const INSET = "right-[22px] left-[22px] @[30rem]:right-2.5 @[30rem]:left-2.5";
 const BELOW_RULER = "top-11 @[30rem]:top-7";
@@ -112,8 +112,8 @@ const TrackRow = memo(function TrackRow({
   onSelect,
   onMute,
 }: RowProps) {
-  // Planned tracks are hidden in compact mode.
-  const display = track.planned ? "hidden @[30rem]:flex" : "flex";
+  // Planned tracks remain visible in compact mode so every source can be tried.
+  const display = "flex";
   return (
     <>
       <div
@@ -149,7 +149,6 @@ const TrackRow = memo(function TrackRow({
         className={[
           "relative border-b border-border",
           ROW_H,
-          track.planned ? "hidden @[30rem]:block" : "",
           selected ? "bg-accent-subtle" : "",
         ].join(" ")}
       >
@@ -618,7 +617,7 @@ export default function EditorDemo() {
       <div className="flex flex-col gap-1 text-caption text-text-secondary">
         <p>Trimming and export work today; audio-track editing is planned.</p>
         <p className="@[30rem]:hidden">
-          +2 planned tracks (Game audio, Discord) are hidden at this width.
+          All four audio tracks are shown. Game audio and Discord are planned.
         </p>
       </div>
 
