@@ -12,8 +12,8 @@
 - [x] Preview worker: media/player.rs and audio_preview.rs; existing engine-clock integration, suppress duplicate engine audio, bounded WASAPI rendering and errors.
 - [x] Export worker: media/exact.rs and focused smoke example; mixed single-stereoAAC output, exact video ranges and audio masks/settings; content/timestamp/source-preservation tests.
 - [x] Run fmt/check/test/clippy, real multitrack decode/preview/export/reopen and replay smoke where available; independent review.
-- [ ] Visual QA through native automation if available; explicitly document unexecuted interactions.
-- [ ] Conventional Commits, push feat/editor-multitrack-audio, Draft PR against main. Never merge.
+- [x] Visual QA through native automation (handoff run): screenshot compared with editor.png; unexecuted interactions documented.
+- [x] Conventional Commits, push feat/editor-multitrack-audio, regular (non-draft) PR against main. Never merge.
 
 ## Decisions and review focus
 - Audio trim/split masks source time without moving other streams; video retained ranges apply to all tracks.

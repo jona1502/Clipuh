@@ -6,6 +6,29 @@ fn row_height(theme: &Theme) -> f32 {
     f32::from(theme.metrics.control_height_small) * 2. + 16.
 }
 
+/// Waveform display floor: quieter peaks draw nothing.
+const WAVEFORM_FLOOR_DB: f32 = -48.;
+
+/// Bar height fraction for a linear peak on a dB scale (-48..0 dBFS), so quiet
+/// game or voice tracks stay readable. Data stays real: silence draws nothing
+/// and louder always draws taller.
+fn display_level(peak: f32) -> f32 {
+    if peak <= 0. || !peak.is_finite() {
+        return 0.;
+    }
+    ((20. * peak.log10() - WAVEFORM_FLOOR_DB) / -WAVEFORM_FLOOR_DB).clamp(0., 1.)
+}
+
+/// Per-track waveform color derived from the user's accent: the first track
+/// uses the accent itself, later tracks step around the hue wheel (purple,
+/// blue, green... with the default accent), so custom accents still apply.
+fn track_color(accent: gpui::Hsla, index: usize) -> gpui::Hsla {
+    gpui::Hsla {
+        h: (accent.h - 0.18 * index as f32).rem_euclid(1.),
+        ..accent
+    }
+}
+
 impl ClipEditor {
     pub(super) fn drag_audio(&mut self, x: Pixels, cx: &mut Context<Self>) {
         let Some((start, pointer, original)) = self.audio_dragging else {
@@ -325,6 +348,7 @@ impl ClipEditor {
         let waveform = self.waveforms.clone();
         let source_ranges = edits.segments().to_vec();
         let draw_track = track.clone();
+        let color = track_color(t.colors.accent, index);
         let mut row = div()
             .id(("audio-waveform", index))
             .relative()
@@ -332,7 +356,7 @@ impl ClipEditor {
             .w_full()
             .rounded_md()
             .overflow_hidden()
-            .bg(t.colors.accent_subtle)
+            .bg(t.colors.surface_raised)
             .border_1()
             .border_color(if selected {
                 t.colors.accent
@@ -381,8 +405,7 @@ impl ClipEditor {
                                             .max(from.min(data.buckets.len())),
                                 )
                                 .map_or(0., |b| b.iter().map(|b| b.peak).fold(0f32, f32::max));
-                            let amplitude =
-                                (peak * if gain > 0. { gain } else { 1. }).clamp(0., 1.);
+                            let amplitude = display_level(peak * if gain > 0. { gain } else { 1. });
                             if amplitude == 0. {
                                 continue;
                             }
@@ -397,7 +420,7 @@ impl ClipEditor {
                             window.paint_quad(gpui::fill(
                                 bar,
                                 if gain > 0. {
-                                    t.colors.accent
+                                    color
                                 } else {
                                     t.colors.text_disabled
                                 },
@@ -494,5 +517,38 @@ impl ClipEditor {
             }));
         }
         div().h(px(row_height)).child(row)
+    }
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+
+    #[test]
+    fn waveform_levels_follow_real_peaks() {
+        assert_eq!(display_level(0.), 0.);
+        assert_eq!(display_level(f32::NAN), 0.);
+        assert_eq!(display_level(1.), 1.);
+        assert_eq!(display_level(2.), 1.);
+        // Below the -48 dB floor nothing is drawn.
+        assert_eq!(display_level(0.003), 0.);
+        let quiet = display_level(0.025);
+        let loud = display_level(0.155);
+        assert!(quiet > 0. && quiet < loud && loud < 1.);
+        assert!((display_level(0.5) - (1. - 6.0206 / 48.)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn track_colors_start_at_accent_and_differ() {
+        let accent = gpui::hsla(0.75, 0.9, 0.65, 1.);
+        assert_eq!(track_color(accent, 0), accent);
+        let colors: Vec<_> = (0..4).map(|i| track_color(accent, i)).collect();
+        for (i, a) in colors.iter().enumerate() {
+            assert!((0. ..1.).contains(&a.h));
+            assert_eq!((a.s, a.l, a.a), (accent.s, accent.l, accent.a));
+            for b in &colors[i + 1..] {
+                assert!((a.h - b.h).abs() > 0.1);
+            }
+        }
     }
 }
