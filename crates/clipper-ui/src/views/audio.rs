@@ -9,20 +9,21 @@ use clipper_audio::windows::{
 };
 use clipper_core::recording::{
     AudioSourceState, AudioSourceStatus, MAX_AUDIO_GAIN_PERCENT, MAX_RECORDED_AUDIO_SOURCES,
-    RecorderCommand, SourceLevel,
+    NoiseGateSettings, RecorderCommand, SourceLevel,
 };
 use clipper_platform::windows::tray;
 use clipper_storage::{AudioSourceSettings, AudioSourceType, MAX_AUDIO_SOURCES};
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, Bounds, Context, Div, ElementId, FocusHandle, FontWeight, Hsla, MouseButton,
-    Pixels, SharedString, Window, anchored, canvas, deferred, div, fill, point, px, size,
+    AnyElement, App, Bounds, Context, Div, ElementId, Entity, FocusHandle, FontWeight, Hsla,
+    MouseButton, Pixels, SharedString, Subscription, Window, anchored, canvas, deferred, div, fill,
+    point, px, size,
 };
 
 use super::{ClipperWindow, Confirm, Dismiss, SelectNext, SelectPrevious};
 use crate::components::{
-    Activate, ButtonVariant, DropdownOption, Icon, Tone, button, icon, icon_card, icon_tile,
-    slider, status_dot, step, toggle, tooltip,
+    Activate, ButtonVariant, DropdownOption, Icon, TextInput, TextInputEvent, Tone, button, icon,
+    icon_card, icon_tile, slider, status_dot, step, toggle, tooltip,
 };
 use crate::theme::{ActiveTheme, Theme};
 
@@ -46,6 +47,42 @@ pub(super) struct RowFocus {
     toggle: FocusHandle,
     solo: FocusHandle,
     mute: FocusHandle,
+    gate: FocusHandle,
+    gate_fields: [FocusHandle; 4],
+    gate_enabled: FocusHandle,
+}
+
+/// Only transient text lives here. The source configuration remains authoritative.
+pub(super) struct GainEdit {
+    source: u32,
+    input: Entity<TextInput>,
+    _events: Subscription,
+    _blur: Subscription,
+}
+
+fn parse_gain_db(text: &str) -> Result<u16, &'static str> {
+    let text = text.trim();
+    let number = text.strip_prefix(['+', '-']).unwrap_or(text);
+    if number.is_empty()
+        || !number.chars().any(|c| c.is_ascii_digit())
+        || number
+            .chars()
+            .any(|c| !c.is_ascii_digit() && c != '.' && c != ',')
+        || number.chars().filter(|c| *c == '.' || *c == ',').count() > 1
+    {
+        return Err("Enter a number from -40 to +6.02 dB (decimal point or comma).");
+    }
+    let db: f64 = text
+        .replace(',', ".")
+        .parse()
+        .map_err(|_| "Invalid gain value.")?;
+    let maximum = 20.0 * (f64::from(MAX_AUDIO_GAIN_PERCENT) / 100.0).log10();
+    if !db.is_finite() || db < -40.0 || db > maximum + 0.000001 {
+        return Err("Gain must be between -40 and +6.02 dB. Use the slider for silence.");
+    }
+    Ok((100.0 * 10_f64.powf(db / 20.0))
+        .round()
+        .clamp(1.0, f64::from(MAX_AUDIO_GAIN_PERCENT)) as u16)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -183,6 +220,11 @@ impl ClipperWindow {
                 toggle: cx.focus_handle().tab_index(12).tab_stop(true),
                 solo: cx.focus_handle().tab_index(12).tab_stop(true),
                 mute: cx.focus_handle().tab_index(12).tab_stop(true),
+                gate: cx.focus_handle().tab_index(12).tab_stop(true),
+                gate_fields: std::array::from_fn(|_| {
+                    cx.focus_handle().tab_index(12).tab_stop(true)
+                }),
+                gate_enabled: cx.focus_handle().tab_index(12).tab_stop(true),
             })
             .clone()
     }
@@ -191,8 +233,10 @@ impl ClipperWindow {
         let mut set = self.audio_focused.borrow_mut();
         set.clear();
         for (id, f) in self.audio_focus.borrow().iter() {
-            for (slot, h) in [&f.menu, &f.slider, &f.toggle, &f.solo, &f.mute]
+            for (slot, h) in [&f.menu, &f.slider, &f.toggle, &f.solo, &f.mute, &f.gate]
                 .into_iter()
+                .chain(f.gate_fields.iter())
+                .chain(std::iter::once(&f.gate_enabled))
                 .enumerate()
             {
                 if h.is_focused(window) {
@@ -282,7 +326,99 @@ impl ClipperWindow {
 
     // gain
 
+    fn audio_edit_gain(&mut self, id: u32, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(source) = self.audio_source(id) else {
+            return;
+        };
+        let text = if source.gain_percent == 0 {
+            String::new()
+        } else {
+            format!(
+                "{:.2}",
+                20.0 * (f64::from(source.gain_percent) / 100.0).log10()
+            )
+        };
+        self.audio_finish_gain_edit(true, cx);
+        let input = cx.new(|cx| TextInput::new(cx).compact().max_len(24).placeholder("−∞"));
+        input.update(cx, |input, cx| {
+            input.set_text(text, cx);
+            input.select_all(cx);
+        });
+        let focus = input.read(cx).focus_handle().clone();
+        let events = cx.subscribe_in(
+            &input,
+            window,
+            |this, _, event: &TextInputEvent, window, cx| match event {
+                TextInputEvent::Changed(_) => {}
+                TextInputEvent::Submitted(_) => {
+                    this.audio_finish_gain_edit(true, cx);
+                    window.focus(&this.focus);
+                }
+                TextInputEvent::Dismissed => {
+                    this.audio_finish_gain_edit(false, cx);
+                    window.focus(&this.focus);
+                }
+            },
+        );
+        let blur = cx.on_blur(&focus, window, |this, _, cx| {
+            this.audio_finish_gain_edit(true, cx)
+        });
+        self.audio_gain_edit = Some(GainEdit {
+            source: id,
+            input,
+            _events: events,
+            _blur: blur,
+        });
+        window.focus(&focus);
+        cx.notify();
+    }
+
+    fn audio_finish_gain_edit(&mut self, commit: bool, cx: &mut Context<Self>) {
+        let Some(edit) = self.audio_gain_edit.take() else {
+            return;
+        };
+        if commit && self.audio_source(edit.source).is_some() {
+            let parsed = parse_gain_db(edit.input.read(cx).text());
+            match parsed {
+                Ok(gain) => {
+                    self.audio_notice = None;
+                    self.audio_set_gain(edit.source, gain_to_value(gain), cx);
+                    self.audio_commit_gain(cx);
+                }
+                Err(message) => self.audio_notice = Some(message.into()),
+            }
+        }
+        cx.notify();
+    }
+
+    fn audio_set_gate(&mut self, id: u32, settings: NoiseGateSettings, cx: &mut Context<Self>) {
+        let Some(source) = self.config.audio.sources.iter_mut().find(|s| s.id == id) else {
+            return;
+        };
+        let settings = settings.sanitized();
+        source.noise_gate = settings;
+        self.send(RecorderCommand::SetAudioNoiseGate {
+            source: id,
+            settings,
+        });
+        self.audio_gate_dirty = true;
+        cx.notify();
+    }
+
+    fn audio_commit_gate(&mut self, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.audio_gate_dirty) {
+            self.persist_config(cx);
+        }
+    }
+
     fn audio_set_gain(&mut self, id: u32, value: f32, cx: &mut Context<Self>) {
+        if self
+            .audio_gain_edit
+            .as_ref()
+            .is_some_and(|edit| edit.source == id)
+        {
+            self.audio_gain_edit = None;
+        }
         let gain_percent = value_to_gain(value);
         let Some(source) = self.config.audio.sources.iter_mut().find(|s| s.id == id) else {
             return;
@@ -363,6 +499,16 @@ impl ClipperWindow {
     }
 
     fn audio_remove(&mut self, id: u32, cx: &mut Context<Self>) {
+        if self
+            .audio_gain_edit
+            .as_ref()
+            .is_some_and(|edit| edit.source == id)
+        {
+            self.audio_gain_edit = None;
+        }
+        if self.audio_gate_open == Some(id) {
+            self.audio_gate_open = None;
+        }
         self.config.audio.sources.retain(|s| s.id != id);
         self.audio_focus.borrow_mut().remove(&id);
         if self.audio_menu.is_some_and(|(open, _)| open == id) {
@@ -637,6 +783,7 @@ impl ClipperWindow {
             gain_percent: 100,
             muted: false,
             solo: false,
+            noise_gate: NoiseGateSettings::default(),
         });
         self.audio_add = None;
         self.persist_config(cx);
@@ -679,7 +826,7 @@ const NAME_MIN_WIDTH: f32 = 100.0;
 const NAME_MAX_WIDTH: f32 = 260.0;
 const METER_MIN_WIDTH: f32 = 80.0;
 const GAIN_LABEL_WIDTH: f32 = 72.0;
-const SLIDER_WIDTH: f32 = 160.0;
+const SLIDER_WIDTH: f32 = 124.0;
 const ROW_BUTTON: f32 = 34.0;
 
 fn kind_icon(kind: AudioSourceType) -> Icon {
@@ -954,6 +1101,119 @@ fn row_menu(
                 .right_0()
                 .size_0()
                 .child(popup)
+        }))
+        .into_any_element()
+}
+
+fn gate_control(
+    t: &Theme,
+    owner: &ClipperWindow,
+    source: &AudioSourceSettings,
+    focus: &RowFocus,
+    cx: &mut Context<ClipperWindow>,
+) -> AnyElement {
+    let id = source.id;
+    let open = owner.audio_gate_open == Some(id);
+    let settings = source.noise_gate;
+    let bounds: Rc<Cell<Bounds<Pixels>>> = Rc::default();
+    let out = bounds.clone();
+    let entity = cx.entity();
+    let trigger = row_button(
+        t,
+        ("audio-gate", id as usize),
+        icon(Icon::Filter, px(16.)).into_any_element(),
+        settings.enabled,
+        t.colors.accent,
+        true,
+        &focus.gate,
+        owner.is_focused(id, 5),
+        "Noise Gate: configure threshold and timing",
+        move |window, app| {
+            entity.update(app, |this, cx| {
+                this.audio_commit_gate(cx);
+                this.audio_gate_open = if open { None } else { Some(id) };
+                window.focus(&this.row_focus(id, cx).gate);
+                cx.notify();
+            })
+        },
+    );
+    let popup = open.then(|| {
+        let enabled_entity = cx.entity();
+        let mut panel = div().id(("audio-gate-panel", id as usize)).occlude().w(px(280.)).p_3().flex().flex_col().gap_3()
+            .rounded_lg().border_1().border_color(t.colors.border_strong).bg(t.colors.surface).shadow_lg()
+            .on_mouse_down_out(cx.listener(move |this, _, window, cx| {
+                if !bounds.get().contains(&window.mouse_position()) {
+                    this.audio_commit_gate(cx);
+                    this.audio_gate_open = None;
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| this.audio_commit_gate(cx)))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _, _, cx| this.audio_commit_gate(cx)))
+            .on_key_up(cx.listener(|this, _, _, cx| this.audio_commit_gate(cx)))
+            .child(div().flex().items_center().justify_between().child(div().text_sm().child("Noise Gate"))
+                .child(toggle(t, ("audio-gate-enabled", id as usize), settings.enabled, true, &focus.gate_enabled, owner.is_focused(id, 10),
+                    move |on, _, app| enabled_entity.update(app, |this, cx| {
+                        if let Some(source) = this.audio_source(id) {
+                            let mut settings = source.noise_gate;
+                            settings.enabled = on;
+                            this.audio_set_gate(id, settings, cx);
+                            this.audio_commit_gate(cx);
+                        }
+                    }))));
+        for (index, label, value, min, max, unit) in [
+            (0, "Threshold", settings.threshold_db, -80.0, 0.0, "dBFS"),
+            (1, "Attack", settings.attack_ms, 1.0, 100.0, "ms"),
+            (2, "Hold", settings.hold_ms, 0.0, 1000.0, "ms"),
+            (3, "Release", settings.release_ms, 5.0, 2000.0, "ms"),
+        ] {
+            let entity = cx.entity();
+            panel = panel.child(div().flex().flex_col().gap_1()
+                .child(div().flex().justify_between().text_xs().child(label).child(format!("{value:.0} {unit}")))
+                .child(slider(t, ("audio-gate-field", id as usize * 4 + index), (value - min) / (max - min), true,
+                    &focus.gate_fields[index], owner.is_focused(id, (6 + index) as u8),
+                    move |value, _, app| entity.update(app, |this, cx| {
+                        if !value.is_finite() { return; }
+                        if let Some(source) = this.audio_source(id) {
+                            let mut settings = source.noise_gate;
+                            let value = (min + value.clamp(0.0, 1.0) * (max - min)).round();
+                            match index {
+                                0 => settings.threshold_db = value,
+                                1 => settings.attack_ms = value,
+                                2 => settings.hold_ms = value,
+                                _ => settings.release_ms = value,
+                            }
+                            this.audio_set_gate(id, settings, cx);
+                        }
+                    }))));
+        }
+        panel = panel.child(muted(t, "Reduces noise between sounds; does not remove noise during speech. Threshold is measured before source gain."));
+        deferred(anchored().snap_to_window_with_margin(px(8.)).child(panel))
+    });
+    div()
+        .relative()
+        .flex_none()
+        .key_context("Dropdown")
+        .on_action(cx.listener(|this, _: &Dismiss, window, cx| {
+            this.audio_commit_gate(cx);
+            this.audio_gate_open = None;
+            window.focus(&this.focus);
+            cx.notify();
+        }))
+        .child(
+            div().relative().child(trigger).child(
+                canvas(move |bounds, _, _| out.set(bounds), |_, _, _, _| {})
+                    .absolute()
+                    .size_full(),
+            ),
+        )
+        .children(popup.map(|panel| {
+            div()
+                .absolute()
+                .top(px(ROW_BUTTON + 4.))
+                .right_0()
+                .size_0()
+                .child(panel)
         }))
         .into_any_element()
 }
@@ -1281,8 +1541,38 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
             } else {
                 t.colors.text_muted
             })
-            .tooltip(tooltip(format!("Gain {gain} %")))
-            .child(crate::meter::gain_label(gain));
+            .h(px(24.))
+            .items_center()
+            .tooltip(tooltip(format!(
+                "Gain {gain} %. Double-click to edit dB; -40 to +6.02 dB, rounded to 1 % steps."
+            )))
+            .when_some(
+                window
+                    .audio_gain_edit
+                    .as_ref()
+                    .filter(|edit| edit.source == id),
+                |this, edit| this.child(div().w_full().child(edit.input.clone())),
+            )
+            .when(
+                window
+                    .audio_gain_edit
+                    .as_ref()
+                    .is_none_or(|edit| edit.source != id),
+                |this| {
+                    this.cursor_text()
+                        .child(crate::meter::gain_label(gain))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                                if event.click_count == 2 {
+                                    this.audio_edit_gain(id, window, cx);
+                                }
+                            }),
+                        )
+                },
+            );
+
+        let gate = gate_control(&t, window, source, &focus, cx);
 
         let (e_on, e_solo, e_mute) = (entity.clone(), entity.clone(), entity.clone());
         let enabled = source.enabled;
@@ -1352,7 +1642,7 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
                 .id(("audio-row", id as usize))
                 .flex()
                 .items_center()
-                .gap_3()
+                .gap_2()
                 .min_h(px(ROW_HEIGHT))
                 .px_3()
                 .py_2()
@@ -1389,6 +1679,7 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
                 .child(div().flex_1().min_w(px(METER_MIN_WIDTH)).child(level_cell))
                 .child(gain_cell)
                 .child(slider_cell)
+                .child(gate)
                 .child(on_button)
                 .child(solo_button)
                 .child(mute_button)
@@ -1563,6 +1854,32 @@ mod tests {
         assert_eq!(value_to_gain(0.5), 100);
         assert_eq!(value_to_gain(1.0), MAX_AUDIO_GAIN_PERCENT);
         assert_eq!(value_to_gain(gain_to_value(137)), 137);
+    }
+
+    #[test]
+    fn typed_gain_validates_and_normalizes_decimal_separators() {
+        assert_eq!(parse_gain_db("0"), Ok(100));
+        assert_eq!(parse_gain_db("+6.0"), Ok(200));
+        assert_eq!(parse_gain_db("-6.5"), parse_gain_db("-6,5"));
+        assert_eq!(parse_gain_db("-12"), Ok(25));
+        assert_eq!(parse_gain_db("-6"), Ok(50));
+        assert_eq!(parse_gain_db("+3"), Ok(141));
+        for invalid in [
+            "", "-", "NaN", "inf", "1e99", "1.2.3", "1,2.3", "7", "-41", "1 dB",
+        ] {
+            assert!(parse_gain_db(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn typed_gain_and_slider_share_supported_percent_steps() {
+        for percent in 1..=MAX_AUDIO_GAIN_PERCENT {
+            let db = 20.0 * (f64::from(percent) / 100.0).log10();
+            let parsed = parse_gain_db(&format!("{db:.6}")).unwrap();
+            assert_eq!(parsed, percent);
+            assert_eq!(value_to_gain(gain_to_value(parsed)), percent);
+            assert_eq!(parse_gain_db(&format!("{db:.2}")), Ok(percent));
+        }
     }
 
     #[test]

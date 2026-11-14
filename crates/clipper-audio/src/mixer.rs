@@ -1,6 +1,8 @@
 //! Bounded timestamp-addressed mixing on the recorder thread, never a capture callback.
 
+use crate::gate::NoiseGate;
 use crate::types::{SAMPLE_RATE, TICKS_PER_SECOND};
+use clipper_core::recording::NoiseGateSettings;
 
 const BLOCK: usize = 480;
 const CAPACITY: usize = SAMPLE_RATE as usize;
@@ -14,6 +16,8 @@ struct Track {
     step: f32,
     received: u64,
     next_position: Option<i64>,
+    gate: NoiseGate,
+    peak: f32,
 }
 
 /// One second of stereo samples per source. Old/oversized packets are dropped,
@@ -77,6 +81,8 @@ impl TimelineMixer {
                     step: 0.0,
                     received: 0,
                     next_position: None,
+                    gate: NoiseGate::default(),
+                    peak: 0.0,
                 })
                 .collect(),
             separate,
@@ -99,6 +105,26 @@ impl TimelineMixer {
         }
     }
 
+    /// Live updates retain the current gain envelope to avoid toggle clicks.
+    pub fn set_noise_gate(&mut self, index: usize, settings: NoiseGateSettings) {
+        if let Some(track) = self.tracks.get_mut(index) {
+            track.gate.configure(settings);
+        }
+    }
+
+    pub fn reset_noise_gate(&mut self, index: usize) {
+        if let Some(track) = self.tracks.get_mut(index) {
+            track.gate.reset();
+        }
+    }
+
+    /// Actual rendered source peak, after gate, gain and per-track limiting.
+    pub fn take_peak(&mut self, index: usize) -> f32 {
+        self.tracks
+            .get_mut(index)
+            .map_or(0.0, |track| std::mem::take(&mut track.peak))
+    }
+
     /// Whether track `index` has delivered at least one sample.
     pub fn has_received(&self, index: usize) -> bool {
         self.tracks
@@ -119,6 +145,9 @@ impl TimelineMixer {
         if target > self.position {
             self.position = target;
             self.skipped_until = target;
+            for track in &mut self.tracks {
+                track.gate.reset();
+            }
         }
     }
 
@@ -197,14 +226,23 @@ impl TimelineMixer {
                     }
                     let slot = (self.position + offset as i64) as usize % CAPACITY;
                     let present = track.positions[slot] == self.position + offset as i64;
+                    let frame = if present {
+                        track.samples[slot]
+                    } else {
+                        [0.0; 2]
+                    };
+                    // One detector per source, before gain/mute/solo. Both
+                    // channels and the mix/isolated outputs share its envelope.
+                    let gate_gain = track.gate.gain(frame[0].abs().max(frame[1].abs()));
                     for channel in 0..2 {
                         let value = if present {
-                            track.samples[slot][channel] * track.gain
+                            frame[channel] * gate_gain * track.gain
                         } else {
                             0.0
                         };
                         self.mixed[offset * 2 + channel] += value;
                         out[offset * 2 + channel] = soft_limit(value);
+                        track.peak = track.peak.max(out[offset * 2 + channel].abs());
                     }
                 }
             }
@@ -232,6 +270,91 @@ impl TimelineMixer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gate_isolated_linked_and_preserves_timestamps() {
+        let mut mixer = TimelineMixer::new(0, vec![1.0, 1.0], true);
+        mixer.set_noise_gate(
+            0,
+            clipper_core::recording::NoiseGateSettings {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        mixer.reset_noise_gate(0);
+        let quiet = [0.001, -0.002].repeat(480);
+        mixer.push(0, 0, 2, &quiet);
+        mixer.push(1, 0, 2, &quiet);
+        let mut blocks = Vec::new();
+        mixer
+            .render_until(100_000, |track, timestamp, samples| {
+                blocks.push((track, timestamp, samples.to_vec()));
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        assert_eq!(blocks.len(), 3);
+        assert!(
+            blocks
+                .iter()
+                .all(|(_, time, samples)| *time == 0 && samples.len() == 960)
+        );
+        assert!(blocks[1].2.iter().all(|sample| *sample == 0.0));
+        assert_eq!(blocks[2].2, quiet);
+        // A right-channel transient opens both channels with one shared ramp.
+        let loud = [0.1, -0.4].repeat(480);
+        mixer.push(0, 100_000, 2, &loud);
+        let blocks = render(&mut mixer, 200_000);
+        for frame in blocks[1].1.chunks_exact(2) {
+            assert!((frame[0] * -4.0 - frame[1]).abs() < 1e-7);
+        }
+        assert_eq!(mixer.late_frames(), 0);
+    }
+
+    /// Opt-in microbenchmark: run with `cargo test -p clipper-audio --release
+    /// dsp_cost -- --ignored --nocapture`. Includes existing mixing work.
+    #[test]
+    #[ignore = "timing benchmark; run optimized and without competing builds"]
+    fn dsp_cost_four_sources_one_minute() {
+        fn run(enabled: bool) -> std::time::Duration {
+            let mut mixer = TimelineMixer::new(0, vec![1.0; 4], true);
+            for index in 0..4 {
+                mixer.set_noise_gate(
+                    index,
+                    NoiseGateSettings {
+                        enabled,
+                        ..Default::default()
+                    },
+                );
+                mixer.reset_noise_gate(index);
+            }
+            let loud = [0.03f32; BLOCK * 2];
+            let quiet = [0.0001f32; BLOCK * 2];
+            let begin = std::time::Instant::now();
+            for block in 0..6000 {
+                let samples = if block % 100 < 50 { &loud } else { &quiet };
+                for index in 0..4 {
+                    mixer.push(index, block * 100_000, 2, std::hint::black_box(samples));
+                }
+                mixer
+                    .render_until((block + 1) * 100_000, |_, _, output| {
+                        std::hint::black_box(output);
+                        Ok::<_, ()>(())
+                    })
+                    .unwrap();
+            }
+            begin.elapsed()
+        }
+        // Warm both instruction paths before measuring each three times.
+        run(false);
+        run(true);
+        let bypass = (0..3).map(|_| run(false)).min().unwrap();
+        let gated = (0..3).map(|_| run(true)).min().unwrap();
+        println!(
+            "four stereo sources, 60 s: bypass={bypass:?} gated={gated:?}; gate delta={:.2} ns/source-frame, {:.4}% of one core",
+            (gated.as_secs_f64() - bypass.as_secs_f64()) * 1e9 / (4.0 * 48000.0 * 60.0),
+            (gated.as_secs_f64() - bypass.as_secs_f64()) / 60.0 * 100.0
+        );
+    }
 
     #[test]
     fn aligns_sources_and_retains_isolated_tracks_without_doubling_the_mix() {

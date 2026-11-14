@@ -3,8 +3,11 @@
 //! Topology is fixed per session: the [`AudioPlan`] (sources resolved against
 //! the capture source and the Windows version) decides the encoder's track
 //! count before the encoder exists. Enabling, disabling, adding or removing
-//! sources therefore applies to the NEXT session; only gain changes are live
-//! ([`RecordingAudio::set_gain`]).
+//! sources therefore applies to the NEXT session; gain and noise gate changes
+//! are live ([`RecordingAudio::set_gain`], [`RecordingAudio::set_noise_gate`]).
+//! Each source passes through its linked stereo gate before ramped gain and
+//! limiting, then feeds both mix and isolated tracks. Thresholds therefore
+//! remain independent of gain, Mute and Solo. Gating changes no timestamps.
 use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant};
 
@@ -19,8 +22,8 @@ use clipper_audio::{
 };
 use clipper_core::recording::{
     AudioSourceState, AudioSourceStatus, AudioSourceTarget, CaptureSource, MAX_AUDIO_GAIN_PERCENT,
-    MAX_RECORDED_AUDIO_SOURCES, RecorderEndpoint, RecorderEvent, RecordingAudioOptions,
-    RecordingAudioSource, SourceKind, SourceLevel,
+    MAX_RECORDED_AUDIO_SOURCES, NoiseGateSettings, RecorderEndpoint, RecorderEvent,
+    RecordingAudioOptions, RecordingAudioSource, SourceKind, SourceLevel,
 };
 use clipper_encoder::backends::media_foundation::HardwareEncoder;
 use clipper_encoder::backends::packet_encoder::PacketEncoder;
@@ -472,6 +475,12 @@ impl RecordingAudio {
             this.tracks.iter().map(|t| t.gain).collect(),
             this.plan.separate,
         );
+        for (index, track) in this.tracks.iter().enumerate() {
+            if let Some(source) = this.plan.sources.iter().find(|s| s.id == track.source) {
+                this.mixer.set_noise_gate(index, source.noise_gate);
+                this.mixer.reset_noise_gate(index);
+            }
+        }
         this.initial_dropped = this.capture.dropped_frames();
         this.changed = false;
         Ok(Some(this))
@@ -490,6 +499,15 @@ impl RecordingAudio {
         let Some(rt) = self.tracks.get_mut(index) else {
             return Ok(());
         };
+        if matches!(
+            &event,
+            AudioEvent::TrackStarted { .. }
+                | AudioEvent::SourceLost { .. }
+                | AudioEvent::DeviceChanged { .. }
+                | AudioEvent::Failed { .. }
+        ) {
+            self.mixer.reset_noise_gate(index);
+        }
         if let Some(live) = transition(rt, self.tolerant, event)?
             && rt.live != live
         {
@@ -517,11 +535,11 @@ impl RecordingAudio {
     }
 
     /// Post-gain peak of every captured source.
-    pub fn levels(&self) -> Vec<SourceLevel> {
+    pub fn levels(&mut self) -> Vec<SourceLevel> {
         let mut out: Vec<SourceLevel> = Vec::new();
         for (index, track) in self.tracks.iter().enumerate() {
             // Held peak since the last report: no transient or clip is missed.
-            let peak = (self.capture.take_peak(index) * track.gain).min(1.0);
+            let peak = self.mixer.take_peak(index);
             match out.iter_mut().find(|l| l.source == track.source) {
                 Some(level) => level.peak = level.peak.max(peak),
                 None => out.push(SourceLevel {
@@ -546,6 +564,14 @@ impl RecordingAudio {
             }
         }
         found
+    }
+
+    pub fn set_noise_gate(&mut self, source: u32, settings: NoiseGateSettings) {
+        for (index, track) in self.tracks.iter().enumerate() {
+            if track.source == source {
+                self.mixer.set_noise_gate(index, settings);
+            }
+        }
     }
 
     pub fn origin(&self) -> i64 {
@@ -744,6 +770,14 @@ pub struct AudioTest {
 }
 
 impl AudioTest {
+    pub fn set_gain(&mut self, source: u32, gain_percent: u16) {
+        self.audio.set_gain(source, gain_percent);
+    }
+
+    pub fn set_noise_gate(&mut self, source: u32, settings: NoiseGateSettings) {
+        self.audio.set_noise_gate(source, settings);
+    }
+
     pub fn start(
         options: &RecordingAudioOptions,
         directory: &std::path::Path,
@@ -863,6 +897,7 @@ mod tests {
             id,
             target,
             gain_percent: 100,
+            noise_gate: NoiseGateSettings::default(),
         }
     }
 

@@ -250,6 +250,7 @@ mod tests {
                         id: 1,
                         target: clipper_core::recording::AudioSourceTarget::Microphone(None),
                         gain_percent: 100,
+                        noise_gate: Default::default(),
                     }],
                     separate_tracks: false,
                 },

@@ -719,6 +719,7 @@ dependencies = [
 name = "clipper-audio"
 version = "0.1.0"
 dependencies = [
+ "clipper-core",
  "rtrb",
  "windows",
  "windows-core",
@@ -738,6 +739,7 @@ name = "clipper-core"
 version = "0.1.0"
 dependencies = [
  "async-channel 2.5.0",
+ "serde",
 ]
 
 [[package]]
