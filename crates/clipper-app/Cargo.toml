@@ -6,6 +6,7 @@ rust-version.workspace = true
 publish.workspace = true
 [dependencies]
 clipper-ui.workspace = true
+clipper-diagnostics.workspace = true
 clipper-storage.workspace = true
 clipper-core.workspace = true
 clipper-recorder.workspace = true

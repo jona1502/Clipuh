@@ -6,6 +6,7 @@ pub mod hotkey;
 pub mod notify;
 pub mod shell;
 pub mod startup;
+pub mod system_info;
 pub mod tray;
 pub mod watch;
 

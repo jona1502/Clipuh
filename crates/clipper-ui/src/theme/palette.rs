@@ -55,7 +55,10 @@ impl Palette {
             Brightness::Dark => Base::DARK,
             Brightness::Light => Base::LIGHT,
         };
-        let accent_rgb = rgb(accent);
+        // The stored accent stays as chosen; only its on-screen presentation
+        // is nudged when it would disappear against the surfaces (white on
+        // the light theme, black on the dark theme).
+        let accent_rgb = presentable_accent(rgb(accent), &base);
         // Hover moves toward the text color: lighter on dark, darker on light.
         let toward = match brightness {
             Brightness::Dark => rgb(0xffffff),
@@ -193,8 +196,37 @@ pub(crate) fn contrast(a: Rgba, b: Rgba) -> f32 {
     (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
 }
 
+/// Minimum contrast of the accent against the background and surfaces, so
+/// accent borders, focus rings and active states stay visible (WCAG 1.4.11
+/// non-text contrast).
+pub(crate) const MIN_ACCENT_CONTRAST: f32 = 3.0;
+
+/// `accent`, or the closest mix toward the theme's text colour that keeps
+/// [`MIN_ACCENT_CONTRAST`] against the background and card surfaces.
+fn presentable_accent(accent: Rgba, base: &Base) -> Rgba {
+    let backdrops = [
+        rgb(base.background),
+        rgb(base.surface),
+        rgb(base.surface_raised),
+    ];
+    let worst = |color: Rgba| {
+        backdrops
+            .iter()
+            .map(|backdrop| contrast(color, *backdrop))
+            .fold(f32::MAX, f32::min)
+    };
+    if worst(accent) >= MIN_ACCENT_CONTRAST {
+        return accent;
+    }
+    let toward = rgb(base.text);
+    (1..=20)
+        .map(|step| mix(accent, toward, step as f32 * 0.05))
+        .find(|candidate| worst(*candidate) >= MIN_ACCENT_CONTRAST)
+        .unwrap_or(toward)
+}
+
 /// White or near-black text on an accent fill, whichever reads better.
-fn foreground_for(accent: Rgba) -> Rgba {
+pub(crate) fn foreground_for(accent: Rgba) -> Rgba {
     let (white, ink) = (rgb(0xffffff), rgb(0x111118));
     if contrast(accent, white) >= contrast(accent, ink) {
         white
@@ -253,6 +285,40 @@ mod tests {
             let ratio = contrast(opaque(p.accent_foreground), opaque(p.accent));
             assert!(ratio >= 3.0, "{accent:06x}: {ratio:.2}");
         }
+    }
+
+    #[test]
+    fn every_preset_stays_visible_and_readable_in_both_themes() {
+        for (name, hex) in clipper_storage::config::ACCENT_PRESETS {
+            let accent = clipper_storage::config::parse_hex_color(hex).unwrap();
+            for brightness in [Brightness::Dark, Brightness::Light] {
+                let p = Palette::new(brightness, accent);
+                for backdrop in [p.background, p.surface, p.surface_raised] {
+                    let ratio = contrast(opaque(p.accent), opaque(backdrop));
+                    // Hsla round-trips can shave a hair off the ratio.
+                    assert!(
+                        ratio >= MIN_ACCENT_CONTRAST - 0.05,
+                        "{name} {brightness:?}: accent {ratio:.2}"
+                    );
+                }
+                let ratio = contrast(opaque(p.accent_foreground), opaque(p.accent));
+                assert!(ratio >= 4.5, "{name} {brightness:?}: foreground {ratio:.2}");
+            }
+        }
+    }
+
+    #[test]
+    fn monochrome_accents_keep_their_colour_where_it_is_visible() {
+        // White on the dark theme and black on the light theme are shown as
+        // chosen; only the invisible combinations are adjusted.
+        let white_dark = opaque(Palette::new(Brightness::Dark, 0xffffff).accent);
+        assert!(white_dark.r > 0.99 && white_dark.g > 0.99 && white_dark.b > 0.99);
+        let black_light = opaque(Palette::new(Brightness::Light, 0x000000).accent);
+        assert!(black_light.r < 0.01 && black_light.g < 0.01 && black_light.b < 0.01);
+        let white_light = opaque(Palette::new(Brightness::Light, 0xffffff).accent);
+        assert!(white_light.r < 0.8, "white is darkened on the light theme");
+        let black_dark = opaque(Palette::new(Brightness::Dark, 0x000000).accent);
+        assert!(black_dark.r > 0.3, "black is lightened on the dark theme");
     }
 
     #[test]

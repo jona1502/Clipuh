@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 mod components;
+mod diagnostics;
 mod feedback;
 mod library_worker;
 mod notification_center;
@@ -12,5 +13,6 @@ mod storage_status;
 mod theme;
 mod views;
 
+pub use diagnostics::apply_log_settings;
 pub use theme::apply as apply_theme;
 pub use views::{ClipperWindow, bind_keys};

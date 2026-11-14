@@ -59,6 +59,7 @@ pub struct AppConfig {
     pub app: AppSettings,
     pub appearance: AppearanceSettings,
     pub library: LibrarySettings,
+    pub diagnostics: DiagnosticsSettings,
 }
 
 impl AppConfig {
@@ -827,8 +828,10 @@ pub enum Theme {
 
 /// Default accent color, `#RRGGBB`.
 pub const DEFAULT_ACCENT: &str = "#9B5CF6";
-/// Accent presets offered in Settings, in display order.
-pub const ACCENT_PRESETS: [(&str, &str); 7] = [
+/// Accent presets offered in Settings, in display order. White, Black and
+/// Gray are minimal monochrome accents; the theme derives a visible
+/// presentation where one would vanish against the surface.
+pub const ACCENT_PRESETS: [(&str, &str); 10] = [
     ("Purple", "#9B5CF6"),
     ("Blue", "#3B82F6"),
     ("Cyan", "#06B6D4"),
@@ -836,6 +839,9 @@ pub const ACCENT_PRESETS: [(&str, &str); 7] = [
     ("Orange", "#F97316"),
     ("Pink", "#EC4899"),
     ("Red", "#EF4444"),
+    ("White", "#FFFFFF"),
+    ("Black", "#000000"),
+    ("Gray", "#8E8E93"),
 ];
 
 /// `[appearance]` section.
@@ -1106,6 +1112,50 @@ impl TempFileGuard {
 impl Drop for TempFileGuard {
     fn drop(&mut self) {
         self.remove();
+    }
+}
+
+/// How long detailed (Debug/Trace) logging stays on before it switches
+/// itself back to the default level, so it is never left on by accident.
+pub const DETAILED_LOGGING_HOURS: u64 = 24;
+
+/// Log level of detailed logging.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DetailedLogLevel {
+    #[default]
+    Debug,
+    Trace,
+}
+
+/// `[diagnostics]` section. Older files without it get the defaults (Info
+/// logging).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DiagnosticsSettings {
+    /// Debug/Trace logging instead of the default Info level.
+    pub detailed_logging: bool,
+    #[serde(deserialize_with = "lenient_default")]
+    pub detailed_level: DetailedLogLevel,
+    /// Unix seconds when detailed logging was switched on.
+    pub detailed_since: Option<u64>,
+}
+
+impl DiagnosticsSettings {
+    /// Detailed level in effect at `now` (Unix seconds), or `None` for the
+    /// default level. Expires [`DETAILED_LOGGING_HOURS`] after it was
+    /// enabled; a missing or future start time counts as expired.
+    pub fn active_detailed_level(&self, now: u64) -> Option<DetailedLogLevel> {
+        let since = self.detailed_since?;
+        let active =
+            self.detailed_logging && since <= now && now - since < DETAILED_LOGGING_HOURS * 3600;
+        active.then_some(self.detailed_level)
+    }
+
+    /// Turns detailed logging on (restarting the expiry) or off.
+    pub fn set_detailed(&mut self, on: bool, now: u64) {
+        self.detailed_logging = on;
+        self.detailed_since = on.then_some(now);
     }
 }
 

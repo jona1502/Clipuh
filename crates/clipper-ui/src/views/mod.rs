@@ -49,6 +49,12 @@ async fn update_view<R>(
     }
 }
 
+/// `v` + the package version this binary was built from (Cargo metadata,
+/// shared by every crate of the workspace).
+fn version_label() -> &'static str {
+    concat!("v", env!("CARGO_PKG_VERSION"))
+}
+
 /// clipuh logo shown in the sidebar header; brand purple, independent of the user accent.
 fn brand_logo() -> std::sync::Arc<gpui::Image> {
     static LOGO: std::sync::OnceLock<std::sync::Arc<gpui::Image>> = std::sync::OnceLock::new();
@@ -298,10 +304,9 @@ pub struct ClipperWindow {
     accent_input: Entity<crate::components::TextInput>,
     /// The open Settings dropdown and its highlighted row.
     settings_menu: Option<(settings::SettingsMenu, usize)>,
-    /// Scroll state of the Settings card grid; the section list jumps to
-    /// `settings_anchors[i]`, and `settings_section` is the highlighted entry.
+    /// Scroll state of the Settings content; `settings_section` is the
+    /// selected category, the only one rendered. Kept while navigating away.
     settings_scroll: gpui::ScrollHandle,
-    settings_anchors: Vec<gpui::ScrollAnchor>,
     settings_section: usize,
     /// Whether Windows launches clipuh at sign-in, read from the registry;
     /// `None` while a read or change is in flight.
@@ -309,6 +314,10 @@ pub struct ClipperWindow {
     startup_error: Option<String>,
     /// Last clip-folder or open-folder failure on the Settings page.
     settings_notice: Option<String>,
+    /// Result of the last debug-log action: `(is_error, message)`.
+    diagnostics_notice: Option<(bool, String)>,
+    /// A debug-log export is running (the button is disabled meanwhile).
+    diagnostics_exporting: bool,
 }
 
 impl ClipperWindow {
@@ -324,6 +333,7 @@ impl ClipperWindow {
         let events = handle.events();
         let task = cx.spawn_in(window, async move |this, cx| {
             while let Ok(event) = events.recv().await {
+                crate::diagnostics::log_event(&event);
                 let toast = match &event {
                     RecorderEvent::ReplaySaving => Some(Toast::Saving),
                     RecorderEvent::ReplaySaved { path, duration } => Some(Toast::Saved {
@@ -479,10 +489,6 @@ impl ClipperWindow {
 
         let accent_input = settings::accent_input(&config, window, cx);
         let settings_scroll = gpui::ScrollHandle::new();
-        let settings_anchors = settings::SECTIONS
-            .iter()
-            .map(|_| gpui::ScrollAnchor::for_handle(settings_scroll.clone()))
-            .collect();
         // System mode follows the OS light/dark setting the moment it changes.
         cx.observe_window_appearance(window, |this, _, cx| {
             crate::theme::apply(&this.config.appearance, cx)
@@ -594,11 +600,12 @@ impl ClipperWindow {
             accent_input,
             settings_menu: None,
             settings_scroll,
-            settings_anchors,
             settings_section: 0,
             startup: None,
             startup_error: None,
             settings_notice: None,
+            diagnostics_notice: None,
+            diagnostics_exporting: false,
         };
         this.storage_projection_cache.refresh(&this.config);
         this.refresh_storage(cx);
@@ -625,6 +632,7 @@ impl ClipperWindow {
                 })
                 .await;
             if let Err(message) = result {
+                clipper_diagnostics::log::error!("settings could not be saved: {message}");
                 this.update(cx, |this, cx| {
                     this.library.update(cx, |library, cx| {
                         library.show_error(
@@ -907,6 +915,15 @@ impl ClipperWindow {
                             .text_2xl()
                             .font_weight(FontWeight::BOLD)
                             .child("clipuh"),
+                    )
+                    // Package version of this build (workspace version).
+                    .child(
+                        div()
+                            .flex_none()
+                            .mt(px(6.))
+                            .text_xs()
+                            .text_color(t.colors.text_muted)
+                            .child(version_label()),
                     ),
             )
             .child(div().flex().flex_col().gap_2().children(navigation))
@@ -1256,6 +1273,22 @@ impl Render for ClipperWindow {
 #[cfg(test)]
 mod tests {
     use super::Page;
+
+    #[test]
+    fn version_label_matches_the_package_version() {
+        assert_eq!(
+            super::version_label(),
+            format!("v{}", env!("CARGO_PKG_VERSION"))
+        );
+        // The app binary reports the same workspace version.
+        let workspace = include_str!("../../../../Cargo.toml");
+        let declared = workspace
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("version = \""))
+            .and_then(|rest| rest.strip_suffix('"'))
+            .expect("workspace version");
+        assert_eq!(declared, env!("CARGO_PKG_VERSION"));
+    }
 
     #[test]
     fn page_offset_wraps_in_both_directions() {

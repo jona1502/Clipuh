@@ -6,7 +6,7 @@
 //! and refreshes the windows; nothing polls.
 
 mod density;
-mod palette;
+pub(crate) mod palette;
 
 pub use density::Metrics;
 pub use palette::{Brightness, Palette};
