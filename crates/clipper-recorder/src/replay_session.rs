@@ -14,9 +14,9 @@ use std::time::{Duration, Instant};
 
 use clipper_capture::windows::{CaptureSession, CapturedFrame};
 use clipper_core::pipeline::{FramePacer, RateMeter};
-use clipper_core::recording::{CaptureSource, ReplayOptions, ReplayStatus};
+use clipper_core::recording::{CaptureSource, RecorderEndpoint, ReplayOptions, ReplayStatus};
 use clipper_encoder::backends::media_foundation::{EncoderConfig, MediaFoundation, SubmitOutcome};
-use clipper_encoder::backends::packet_encoder::{PacketEncoder, default_label};
+use clipper_encoder::backends::packet_encoder::PacketEncoder;
 use clipper_platform::windows::D3DContext;
 use clipper_replay::EncodedPacket;
 use clipper_replay::disk::DiskConfig;
@@ -31,7 +31,7 @@ use crate::logic::{
     Counters, SlotTimeline, fit_output_size, replay_failure_text, replay_status, replay_warning,
     valid_replay_duration,
 };
-use crate::recording_audio::RecordingAudio;
+use crate::recording_audio::{AudioPlan, AudioReporter, RecordingAudio};
 use crate::windows_worker::{encoder_message, round_up_even, signal_handler};
 
 /// Longest wait for a capture/audio wake. Short on purpose: on a static scene
@@ -86,6 +86,7 @@ pub struct ReplaySession {
     capture: CaptureSession,
     encoder: PacketEncoder,
     audio: Option<RecordingAudio>,
+    audio_reporter: AudioReporter,
     buffer: Option<ReplayBuffer>,
     last_frame: Option<LastFrame>,
     d3d: D3DContext,
@@ -137,14 +138,18 @@ impl ReplaySession {
             bitrate_mbps: recording.bitrate_mbps,
             profile: recording.profile,
         };
-        let encoder =
-            PacketEncoder::create_with_labels(mf, &d3d, &config, &audio_labels(recording))
-                .map_err(|error| replay_failure_text(&encoder_message(&error)))?;
+        // The plan fixes the packet topology (mix + isolated tracks) for the
+        // whole session: sources that start late or vanish render silence in
+        // their track instead of changing the layout of buffered footage.
+        let plan = AudioPlan::for_session(&recording.audio, Some(source));
+        let audio_reporter = AudioReporter::new(plan.idle_states());
+        let encoder = PacketEncoder::create_with_labels(mf, &d3d, &config, &plan.labels())
+            .map_err(|error| replay_failure_text(&encoder_message(&error)))?;
         let encoder_name = encoder.name().to_owned();
 
         // Initialize expensive GPU/codec resources before audio starts,
         // otherwise hardware encoder discovery can overflow the audio rings.
-        let mut audio = RecordingAudio::start(&recording.audio, wake_tx)
+        let mut audio = RecordingAudio::start(plan, wake_tx)
             .map_err(|message| replay_failure_text(&message))?;
         if let Some(audio) = &mut audio {
             audio.set_tolerant(true);
@@ -160,6 +165,7 @@ impl ReplaySession {
             capture,
             encoder,
             audio,
+            audio_reporter,
             buffer: None,
             last_frame: None,
             d3d,
@@ -201,6 +207,23 @@ impl ReplaySession {
             buffer.set_duration(duration);
         }
         true
+    }
+
+    /// Live gain of one source; ignored when the session does not capture it.
+    pub fn set_audio_gain(&mut self, source: u32, gain_percent: u16) {
+        if let Some(audio) = &mut self.audio {
+            audio.set_gain(source, gain_percent);
+        }
+    }
+
+    /// Source statuses and levels for the UI.
+    pub fn report_audio(&mut self, endpoint: &RecorderEndpoint) {
+        self.audio_reporter.report(endpoint, self.audio.as_mut());
+    }
+
+    /// Clears the UI's audio meters and statuses once the session is over.
+    pub fn finish_audio_report(&self, endpoint: &RecorderEndpoint) {
+        AudioReporter::finish(endpoint);
     }
 
     pub fn source_closed(&self) -> bool {
@@ -522,73 +545,5 @@ impl ReplaySession {
         }
         last.content = content;
         Ok(())
-    }
-}
-
-/// Audio track labels: track 0 is the mix, then desktop and microphone when
-/// they are recorded separately (same track count as manual recordings).
-pub fn audio_labels(options: &clipper_core::recording::RecordingOptions) -> Vec<String> {
-    let audio = &options.audio;
-    if !audio.desktop && !audio.microphone {
-        return Vec::new();
-    }
-    let separate = if audio.separate_tracks {
-        usize::from(audio.desktop) + usize::from(audio.microphone)
-    } else {
-        0
-    };
-    let mut labels = vec![default_label(0)];
-    if audio.separate_tracks {
-        if audio.desktop {
-            labels.push(default_label(1));
-        }
-        if audio.microphone {
-            labels.push(default_label(2));
-        }
-    }
-    debug_assert_eq!(labels.len(), 1 + separate);
-    labels
-}
-
-#[cfg(test)]
-mod tests {
-    use clipper_core::recording::{QualityProfile, RecordingAudioOptions, RecordingOptions};
-
-    use super::*;
-
-    fn options(desktop: bool, microphone: bool, separate: bool) -> RecordingOptions {
-        RecordingOptions {
-            audio: RecordingAudioOptions {
-                desktop,
-                microphone,
-                separate_tracks: separate,
-                ..Default::default()
-            },
-            width: 1920,
-            height: 1080,
-            fps: 60,
-            bitrate_mbps: 16,
-            profile: QualityProfile::Balanced,
-            output_directory: "out".into(),
-        }
-    }
-
-    #[test]
-    fn labels_follow_the_manual_recording_track_count() {
-        assert!(audio_labels(&options(false, false, true)).is_empty());
-        assert_eq!(audio_labels(&options(true, false, false)), ["Mix"]);
-        assert_eq!(audio_labels(&options(true, true, false)), ["Mix"]);
-        assert_eq!(
-            audio_labels(&options(true, true, true)),
-            ["Mix", "Desktop", "Microphone"]
-        );
-        assert_eq!(
-            audio_labels(&options(false, true, true)),
-            ["Mix", "Microphone"]
-        );
-        assert_eq!(
-            audio_labels(&options(true, false, true)),
-            ["Mix", "Desktop"]
-        );
     }
 }

@@ -26,7 +26,7 @@ pub(super) fn create_enumerator() -> Result<IMMDeviceEnumerator, AudioError> {
 }
 
 /// Takes ownership of a CoTaskMem-allocated wide string.
-fn take_pwstr(text: PWSTR) -> String {
+pub(super) fn take_pwstr(text: PWSTR) -> String {
     if text.is_null() {
         return String::new();
     }
