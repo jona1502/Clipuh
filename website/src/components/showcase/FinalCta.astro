@@ -1,0 +1,61 @@
+---
+import Button from "@/components/ui/Button.astro";
+import Container from "@/components/ui/Container.astro";
+import { featureIds, finalCta } from "@/data/features";
+import { sections, site } from "@/data/site";
+
+const { download } = site;
+const url = download.available ? download.url : null;
+---
+
+<section
+  id={featureIds.cta}
+  aria-labelledby={`${featureIds.cta}-title`}
+  class="border-border/60 pt-section pb-section border-t"
+>
+  <Container>
+    <div class="cta-panel border-border relative isolate overflow-hidden rounded-xl border px-6 py-12 text-center md:px-12 md:py-16">
+      {!url && (
+        <p class="text-caption text-text-secondary border-border bg-surface/60 inline-flex items-center gap-2 rounded-full border px-3 py-1 font-semibold">
+          <span class="bg-warning size-1.5 rounded-full" aria-hidden="true" />
+          {download.platform} · {download.statusLabel}
+        </p>
+      )}
+      <h2 id={`${featureIds.cta}-title`} class="mx-auto mt-5 max-w-2xl">
+        {finalCta.title}
+      </h2>
+      <p class="text-lead text-text-secondary mx-auto mt-4 max-w-xl">
+        {finalCta.description}
+      </p>
+      <div class="mt-8 flex flex-col items-center justify-center gap-3 sm:flex-row">
+        {url && (
+          <Button href={url} size="lg">
+            Download for {download.platform}
+          </Button>
+        )}
+        <Button
+          href={`#${featureIds.intro}`}
+          variant={url ? "secondary" : "primary"}
+          size="lg"
+        >
+          Explore features
+        </Button>
+        <Button href={`#${sections.hero}`} variant="ghost" size="lg">
+          Back to top
+        </Button>
+      </div>
+    </div>
+  </Container>
+</section>
+
+<style>
+  .cta-panel {
+    background:
+      radial-gradient(
+        42rem 18rem at 50% 0%,
+        color-mix(in srgb, var(--color-accent) 16%, transparent),
+        transparent 70%
+      ),
+      var(--color-surface);
+  }
+</style>
