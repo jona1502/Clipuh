@@ -456,6 +456,19 @@ impl ClipLibrary {
         cx.notify();
     }
 
+    /// A favorite was added or removed. Unlike `refilter` (new query, tab or
+    /// sort) this keeps the scroll position: in most tabs the visible clips do
+    /// not change at all, and in Favorites only the unfavorited cards drop out
+    /// while the scroll handle clamps to the shorter grid.
+    fn favorites_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let before = std::mem::take(&mut self.filtered);
+        self.update_filter();
+        if self.filtered != before {
+            self.previews(window, cx);
+        }
+        cx.notify();
+    }
+
     /// Indices of the clips the current tab, search, source and sort show.
     fn query(&self) -> Vec<usize> {
         let mut indices = library::query(
@@ -648,7 +661,7 @@ impl ClipLibrary {
             }
         }
         self.changed_settings(cx);
-        self.refilter(window, cx);
+        self.favorites_changed(window, cx);
     }
     fn open(&mut self, edit: bool, cx: &mut Context<Self>) {
         if self.busy {

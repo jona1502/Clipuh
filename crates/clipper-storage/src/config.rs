@@ -1544,6 +1544,25 @@ mod tests {
     }
 
     #[test]
+    fn chosen_clip_folder_survives_a_restart_and_drives_every_output() {
+        let temp = TestDir::new();
+        let path = temp.path("settings.toml");
+        let folder = temp.path("My Clips Ünïcode 片段");
+        let mut config = AppConfig::default();
+        config.recording.output_directory = Some(folder.clone());
+        config.save_to(&path).expect("save config");
+
+        let loaded = AppConfig::load_from(&path).expect("load after restart");
+        assert_eq!(loaded.recording.output_directory, Some(folder.clone()));
+        // One setting: manual recordings and replay clips use the same folder.
+        assert_eq!(loaded.recording_options().unwrap().output_directory, folder);
+        assert_eq!(
+            loaded.replay_options().unwrap().recording.output_directory,
+            folder
+        );
+    }
+
+    #[test]
     fn saving_identical_settings_does_not_replace_the_existing_file() {
         let temp = TestDir::new();
         let path = temp.path("settings.toml");

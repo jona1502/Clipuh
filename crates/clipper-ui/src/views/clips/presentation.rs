@@ -183,7 +183,7 @@ impl ClipLibrary {
             self.settings.favorites.insert(id.to_owned());
         }
         self.changed_settings(cx);
-        self.refilter(window, cx);
+        self.favorites_changed(window, cx);
     }
 
     fn tabs(&self, t: &Theme, cx: &mut Context<Self>) -> Div {
