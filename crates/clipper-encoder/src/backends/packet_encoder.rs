@@ -98,6 +98,10 @@ struct Converter {
     output_views: Vec<ID3D11VideoProcessorOutputView>,
     input: (u32, u32),
     output: (u32, u32),
+    /// Content size of the frame currently held in `staging`; `None` until
+    /// the first frame was staged. The staging texture doubles as the repeat
+    /// source for static scenes, so no extra copy of the last frame exists.
+    staged: Option<(u32, u32)>,
     // Keep alive for the processor's lifetime.
     _enumerator: ID3D11VideoProcessorEnumerator,
     _video_device: ID3D11VideoDevice,
@@ -292,19 +296,18 @@ impl Converter {
             output_views,
             input,
             output,
+            staged: None,
             _enumerator: enumerator,
             _video_device: video_device,
         })
     }
 
-    /// Copies the content area of `texture` into the staging texture and
-    /// converts/scales it into output view `slot`. Content keeps its place in
-    /// the top-left corner; the rest of the NV12 frame is background black.
-    fn convert(
-        &self,
+    /// GPU-copies the content area of `texture` into the staging texture,
+    /// where it stays as the input of every following [`Self::blit`].
+    fn stage(
+        &mut self,
         texture: &ID3D11Texture2D,
         content_size: (u32, u32),
-        slot: usize,
     ) -> Result<(), EncoderError> {
         let content = (
             content_size.0.clamp(1, self.input.0),
@@ -318,6 +321,31 @@ impl Converter {
             bottom: content.1,
             back: 1,
         };
+        // SAFETY: both textures live on this device; the box lies inside the
+        // staging texture and (by contract) inside the source. The immediate
+        // context is multithread protected and orders this copy after every
+        // earlier blit that still reads the staging texture.
+        unsafe {
+            self.d3d.context().CopySubresourceRegion(
+                &self.staging,
+                0,
+                0,
+                0,
+                0,
+                texture,
+                0,
+                Some(&region),
+            );
+        }
+        self.staged = Some(content);
+        Ok(())
+    }
+
+    /// Converts/scales the staged frame into output view `slot`. Content
+    /// keeps its place in the top-left corner; the rest of the NV12 frame is
+    /// background black.
+    fn blit(&self, slot: usize) -> Result<(), EncoderError> {
+        let content = self.staged.ok_or_else(no_pointer)?;
         let scale = |value: u32, from: u32, to: u32| -> i32 {
             let scaled = (u64::from(value) * u64::from(to)).div_ceil(u64::from(from));
             let even = (scaled + 1) & !1;
@@ -349,21 +377,10 @@ impl Converter {
             pInputSurfaceRight: ManuallyDrop::new(None),
             ppFutureSurfacesRight: std::ptr::null_mut(),
         };
-        // SAFETY: both textures live on this device; the box lies inside the
-        // staging texture and (by contract) inside the source. The immediate
+        // SAFETY: valid processor and views on this device. The immediate
         // context is multithread protected. The stream's input surface was
         // cloned above and is released exactly once below.
         let result = unsafe {
-            self.d3d.context().CopySubresourceRegion(
-                &self.staging,
-                0,
-                0,
-                0,
-                0,
-                texture,
-                0,
-                Some(&region),
-            );
             self.video_context.VideoProcessorSetStreamSourceRect(
                 &self.processor,
                 0,
@@ -1317,11 +1334,49 @@ impl PacketEncoder {
     /// for the hardware encoder. `sample_time`/`duration` are 100 ns ticks on
     /// the session timeline. Never blocks: returns `Dropped` when the NV12
     /// pool is exhausted or the encoder has no input credit and two frames
-    /// are already waiting.
+    /// are already waiting. A dropped frame is not staged.
     pub fn submit(
         &mut self,
         texture: &ID3D11Texture2D,
         content_size: (u32, u32),
+        sample_time: i64,
+        duration: i64,
+    ) -> Result<SubmitOutcome, EncoderError> {
+        self.queue(Some((texture, content_size)), sample_time, duration)
+    }
+
+    /// Queues the most recently staged frame again (static scene fill)
+    /// without another copy of the source. Same outcomes as
+    /// [`Self::submit`]; an error when nothing was staged yet.
+    pub fn submit_repeat(
+        &mut self,
+        sample_time: i64,
+        duration: i64,
+    ) -> Result<SubmitOutcome, EncoderError> {
+        if !self.has_frame() {
+            return Err(EncoderError::UnsupportedFormat("no frame to repeat".into()));
+        }
+        self.queue(None, sample_time, duration)
+    }
+
+    /// GPU-copies `texture` into the staging texture without encoding it, so
+    /// [`Self::submit_repeat`] can start from it.
+    pub fn stage(
+        &mut self,
+        texture: &ID3D11Texture2D,
+        content_size: (u32, u32),
+    ) -> Result<(), EncoderError> {
+        self.video.converter.stage(texture, content_size)
+    }
+
+    /// `true` once a frame was staged (submitted or [`Self::stage`]d).
+    pub fn has_frame(&self) -> bool {
+        self.video.converter.staged.is_some()
+    }
+
+    fn queue(
+        &mut self,
+        source: Option<(&ID3D11Texture2D, (u32, u32))>,
         sample_time: i64,
         duration: i64,
     ) -> Result<SubmitOutcome, EncoderError> {
@@ -1334,7 +1389,14 @@ impl PacketEncoder {
         let Some(slot) = popped else {
             return Ok(SubmitOutcome::Dropped);
         };
-        if let Err(error) = self.video.converter.convert(texture, content_size, slot.id) {
+        let converter = &mut self.video.converter;
+        let converted = match source {
+            Some((texture, content_size)) => converter
+                .stage(texture, content_size)
+                .and_then(|()| converter.blit(slot.id)),
+            None => converter.blit(slot.id),
+        };
+        if let Err(error) = converted {
             self.video.pool.shared.lock().push(slot);
             return Err(error);
         }

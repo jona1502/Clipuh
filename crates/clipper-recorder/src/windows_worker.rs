@@ -392,7 +392,11 @@ impl Worker<'_> {
     fn stop_replay(&mut self, error: Option<String>, report: bool) {
         let session = self.replay.take();
         if let Some(session) = &session {
-            eprintln!("replay stopped: {:?}", session.diagnostics());
+            eprintln!(
+                "replay stopped: {:?}, capture delivered {} frames",
+                session.diagnostics(),
+                session.capture_delivered()
+            );
         }
         let had_session = session.is_some();
         if let Some(session) = &session {
@@ -765,6 +769,8 @@ fn build_recording(
         signal_handler(wake_tx.clone(), Arc::clone(&source_closed)),
     )
     .map_err(|error| error.to_string())?;
+    // Optional (Windows 11 24H2+); older builds keep the WGC default.
+    let _ = session.set_target_fps(options.fps);
 
     let (width, height) = session.size();
     let (output_width, output_height) =
