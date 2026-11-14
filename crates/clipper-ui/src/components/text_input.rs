@@ -29,6 +29,7 @@ pub struct TextInput {
     placeholder: SharedString,
     error: Option<SharedString>,
     disabled: bool,
+    max_len: usize,
     focus: FocusHandle,
 }
 
@@ -70,8 +71,15 @@ impl TextInput {
             placeholder: SharedString::default(),
             error: None,
             disabled: false,
+            max_len: MAX_LEN,
             focus: cx.focus_handle().tab_stop(true),
         }
+    }
+
+    /// Allows longer file names without changing the default for other fields.
+    pub fn max_len(mut self, max: usize) -> Self {
+        self.max_len = max.clamp(1, 255);
+        self
     }
 
     pub fn placeholder(mut self, text: impl Into<SharedString>) -> Self {
@@ -94,7 +102,7 @@ impl TextInput {
     /// Programmatic update; does not emit `Changed`. Clears any error, since
     /// the caller supplies a known value.
     pub fn set_text(&mut self, text: String, cx: &mut Context<Self>) {
-        self.text = text.chars().take(MAX_LEN).collect();
+        self.text = text.chars().take(self.max_len).collect();
         self.error = None;
         cx.notify();
     }
@@ -130,7 +138,7 @@ impl TextInput {
         let m = k.modifiers;
         if m.control && k.key == "v" {
             let clip = cx.read_from_clipboard().and_then(|c| c.text());
-            if clip.is_some_and(|c| paste(&mut self.text, &c, MAX_LEN)) {
+            if clip.is_some_and(|c| paste(&mut self.text, &c, self.max_len)) {
                 self.changed(cx);
             }
         } else if k.key == "backspace" {
@@ -142,7 +150,7 @@ impl TextInput {
             && !m.platform
             && !m.function
             && let Some(ch) = &k.key_char
-            && push_str(&mut self.text, ch, MAX_LEN)
+            && push_str(&mut self.text, ch, self.max_len)
         {
             self.changed(cx);
         }

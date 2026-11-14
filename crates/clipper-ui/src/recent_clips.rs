@@ -1,14 +1,10 @@
-//! Newest saved clips for the Capture page: a blocking scan (run it off the
-//! UI thread) plus the pure formatting helpers the card uses.
-
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-use clipper_media::{thumbnail::thumbnail, trim::probe};
+//! Recent Clips presents the same indexed metadata and previews as the Library.
+//! The previous scan + probe + thumbnail path is now owned by LibraryWorker.
 use gpui::RenderImage;
-
-const THUMBNAIL_WIDTH: u32 = 160;
+use std::sync::Arc;
+#[cfg(test)]
+use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Default)]
 pub(crate) enum RecentClips {
@@ -17,60 +13,9 @@ pub(crate) enum RecentClips {
     Ready(Vec<RecentClip>),
     Unavailable(String),
 }
-
 pub(crate) struct RecentClip {
-    pub path: PathBuf,
-    pub name: String,
-    pub duration: Option<Duration>,
-    pub size_bytes: u64,
-    pub modified: SystemTime,
+    pub clip: clipper_storage::library::Clip,
     pub thumbnail: Option<Arc<RenderImage>>,
-}
-
-/// Newest `limit` `*.mp4` (never `*.partial.mp4`) in `dir`. Only those are
-/// probed and thumbnailed. A missing directory is an empty list.
-pub(crate) fn load(dir: &Path, limit: usize) -> RecentClips {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return RecentClips::Ready(vec![]),
-        Err(e) => return RecentClips::Unavailable(format!("Clips folder unavailable: {e}")),
-    };
-    let mut found: Vec<(PathBuf, u64, SystemTime)> = entries
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let path = entry.path();
-            let name = path.file_name()?.to_str()?.to_ascii_lowercase();
-            if !name.ends_with(".mp4") || name.ends_with(".partial.mp4") {
-                return None;
-            }
-            let meta = entry.metadata().ok().filter(|m| m.is_file())?;
-            Some((path, meta.len(), meta.modified().ok()?))
-        })
-        .collect();
-    found.sort_by_key(|entry| std::cmp::Reverse(entry.2));
-    found.truncate(limit);
-    RecentClips::Ready(
-        found
-            .into_iter()
-            .map(|(path, size_bytes, modified)| RecentClip {
-                name: path
-                    .file_stem()
-                    .map_or_else(String::new, |s| s.to_string_lossy().into_owned()),
-                duration: probe(&path).ok().map(|info| info.duration),
-                thumbnail: thumbnail(&path, THUMBNAIL_WIDTH)
-                    .ok()
-                    .and_then(render_image),
-                path,
-                size_bytes,
-                modified,
-            })
-            .collect(),
-    )
-}
-
-fn render_image(t: clipper_media::thumbnail::Thumbnail) -> Option<Arc<RenderImage>> {
-    let buffer = image::RgbaImage::from_raw(t.width, t.height, t.bgra)?;
-    Some(Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])))
 }
 
 /// "just now", "2 min ago", "3 h ago", "yesterday", "4 days ago", else `YYYY-MM-DD` (UTC).
@@ -119,8 +64,6 @@ pub(crate) fn size_label(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs::File;
-
     #[test]
     fn relative_time_buckets() {
         let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
@@ -139,37 +82,5 @@ mod tests {
         assert_eq!(size_label(226_000_000), "226 MB");
         assert_eq!(size_label(1_234_000_000), "1.2 GB");
         assert_eq!(size_label(500), "1 KB");
-    }
-
-    #[test]
-    fn load_orders_limits_and_skips_partials() {
-        let dir = std::env::temp_dir().join(format!("clipper-recent-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let base = SystemTime::now() - Duration::from_secs(10_000);
-        for (name, age) in [
-            ("a.mp4", 1),
-            ("b.mp4", 4),
-            ("c.mp4", 3),
-            ("d.mp4", 2),
-            ("new.partial.mp4", 9),
-            ("n.txt", 8),
-        ] {
-            let f = File::create(dir.join(name)).unwrap();
-            f.set_modified(base + Duration::from_secs(age * 100))
-                .unwrap();
-        }
-        let RecentClips::Ready(clips) = load(&dir, 3) else {
-            panic!("not ready")
-        };
-        let names: Vec<_> = clips.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, ["b", "c", "d"]);
-        assert!(
-            clips
-                .iter()
-                .all(|c| c.duration.is_none() && c.thumbnail.is_none())
-        );
-        assert!(matches!(load(&dir.join("missing"), 3), RecentClips::Ready(v) if v.is_empty()));
-        let _ = std::fs::remove_dir_all(dir);
     }
 }

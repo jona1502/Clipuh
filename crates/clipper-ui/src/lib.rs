@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 mod components;
+mod library_worker;
 mod notifications;
 mod recent_clips;
 mod state;

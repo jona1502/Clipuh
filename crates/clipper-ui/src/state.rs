@@ -257,6 +257,7 @@ pub struct SavedClip {
     pub duration: Duration,
 }
 
+#[cfg(test)]
 impl SavedClip {
     pub fn name(&self) -> String {
         self.path

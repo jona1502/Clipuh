@@ -5,6 +5,7 @@ pub mod disk;
 pub mod hotkey;
 pub mod notify;
 pub mod shell;
+pub mod watch;
 
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Win32::Foundation::HMODULE;
