@@ -690,6 +690,7 @@ dependencies = [
  "clipper-recorder",
  "clipper-storage",
  "clipper-ui",
+ "embed-resource",
  "gpui",
 ]
 

@@ -15,7 +15,7 @@ use clipper_storage::AppConfig;
 use gpui::prelude::*;
 use gpui::{
     App, Context, Div, Entity, FocusHandle, FontWeight, KeyBinding, KeyDownEvent, NoAction, Render,
-    Task, Window, actions, div, px,
+    Task, Window, actions, div, img, px,
 };
 
 use crate::components::{kbd, list_item, shortcut};
@@ -23,6 +23,18 @@ use crate::notifications::{Notifier, Toast};
 use crate::state::{Phase, RecordingState, StorageProjectionCache, StorageProjectionRun};
 use crate::storage_status::{self, StorageStatus};
 use crate::theme::{ActiveTheme, Theme};
+
+/// clipuh logo shown in the sidebar header; brand purple, independent of the user accent.
+fn brand_logo() -> std::sync::Arc<gpui::Image> {
+    static LOGO: std::sync::OnceLock<std::sync::Arc<gpui::Image>> = std::sync::OnceLock::new();
+    LOGO.get_or_init(|| {
+        std::sync::Arc::new(gpui::Image::from_bytes(
+            gpui::ImageFormat::Png,
+            include_bytes!("../../../../assets/branding/clipuh-icon-64.png").to_vec(),
+        ))
+    })
+    .clone()
+}
 
 actions!(
     clipper,
@@ -701,19 +713,7 @@ impl ClipperWindow {
                     .gap_2()
                     .px_2()
                     .h(px(28.))
-                    .child(
-                        div()
-                            .size(px(22.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_md()
-                            .bg(t.colors.accent)
-                            .text_xs()
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(t.colors.accent_foreground)
-                            .child("c"),
-                    )
+                    .child(img(brand_logo()).size(px(22.)).flex_none())
                     .child(
                         div()
                             .text_base()
