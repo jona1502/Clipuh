@@ -6,6 +6,7 @@ use clipper_core::recording::{
 };
 use directories::{BaseDirs, ProjectDirs, UserDirs};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -57,6 +58,7 @@ pub struct AppConfig {
     pub notifications: NotificationSettings,
     pub app: AppSettings,
     pub appearance: AppearanceSettings,
+    pub library: LibrarySettings,
 }
 
 impl AppConfig {
@@ -745,6 +747,35 @@ impl Default for NotificationSettings {
             notify_on_failure: true,
         }
     }
+}
+
+/// Saved display and sorting preferences for the clip library.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LibrarySettings {
+    pub view: LibraryView,
+    pub sort: LibrarySort,
+    pub favorites: BTreeSet<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LibraryView {
+    #[default]
+    Grid,
+    List,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LibrarySort {
+    #[default]
+    Newest,
+    Oldest,
+    NameAsc,
+    NameDesc,
+    Duration,
+    Size,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
