@@ -358,7 +358,15 @@ impl ClipLibrary {
         }
     }
 
-    fn menu_control(&self, t: &Theme, menu: Menu, window: &Window, cx: &mut Context<Self>) -> Div {
+    /// `narrow`: the tight one-row toolbar uses shorter dropdowns.
+    fn menu_control(
+        &self,
+        t: &Theme,
+        menu: Menu,
+        narrow: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Div {
         let sources = self.sources();
         let (labels, selected, slot): (Vec<String>, usize, usize) = if menu == Menu::Source {
             (
@@ -411,7 +419,12 @@ impl ClipLibrary {
             ..Default::default()
         };
         div()
-            .w(px(if menu == Menu::Sort { 160. } else { 140. }))
+            .w(px(match (menu == Menu::Sort, narrow) {
+                (true, false) => 160.,
+                (true, true) => 140.,
+                (false, false) => 140.,
+                (false, true) => 120.,
+            }))
             .child(crate::components::dropdown_decorated(
                 t,
                 ("library-menu", slot),
