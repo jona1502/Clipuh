@@ -311,6 +311,8 @@ pub fn switch(t: &Theme, on: bool) -> Div {
 }
 
 /// Label, large value and one line of context.
+// shortcut: no caller since the Phase 3 dashboard; drop the allow when a page uses it.
+#[allow(dead_code)]
 pub fn stat_tile(
     t: &Theme,
     label: impl Into<SharedString>,

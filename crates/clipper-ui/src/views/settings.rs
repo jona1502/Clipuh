@@ -414,8 +414,8 @@ pub(super) fn accent_input(
     cx: &mut Context<ClipperWindow>,
 ) -> Entity<TextInput> {
     let input = cx.new(|cx| {
-        // After the shell and capture controls (0-10) and notification toggles (11-14).
-        let mut input = TextInput::new(cx).placeholder(DEFAULT_ACCENT).tab_index(15);
+        // After the shell, the Capture page (0-11) and the notification toggles (12-15).
+        let mut input = TextInput::new(cx).placeholder(DEFAULT_ACCENT).tab_index(16);
         input.set_text(config.appearance.accent_color.clone(), cx);
         input
     });
@@ -815,7 +815,6 @@ pub(super) fn content(
                 ),
             ],
         ))
-        .child(super::audio::content(window, cx))
         .child(appearance_group(window, &t, cx));
 
     let recordings = match config.recording_options() {

@@ -3,7 +3,10 @@ mod capture_bar;
 mod clips;
 mod dashboard;
 mod editor;
+mod recent_card;
 mod settings;
+mod source_card;
+mod storage_card;
 
 use clipper_core::hotkey::Hotkey;
 use clipper_core::recording::{RecorderCommand, RecorderEvent, RecorderHandle};
@@ -225,6 +228,13 @@ pub struct ClipperWindow {
     replay_focus: FocusHandle,
     /// Free space on the recordings volume, shown in the sidebar.
     storage: StorageStatus,
+    /// Highlighted row while the Capture page's source menu is open.
+    source_menu: Option<usize>,
+    source_focus: FocusHandle,
+    /// Latest clips in the recordings folder for the Capture page.
+    recent_clips: crate::recent_clips::RecentClips,
+    /// Bumped per refresh so only the newest scan's result is applied.
+    recent_clips_generation: u64,
     /// The clip open in the Editor page; its player only runs while that page is shown.
     editor: Option<Entity<editor::ClipEditor>>,
     /// Custom accent color field on the Settings page.
@@ -243,7 +253,7 @@ impl ClipperWindow {
         cx: &mut Context<Self>,
     ) -> Self {
         let events = handle.events();
-        let task = cx.spawn(async move |this, cx| {
+        let task = cx.spawn_in(window, async move |this, cx| {
             while let Ok(event) = events.recv().await {
                 let toast = match &event {
                     RecorderEvent::ReplaySaving => Some(Toast::Saving),
@@ -262,7 +272,7 @@ impl ClipperWindow {
                     event,
                     RecorderEvent::ReplaySaved { .. } | RecorderEvent::RecordingFinished { .. }
                 );
-                let updated = this.update(cx, |this, cx| {
+                let updated = this.update_in(cx, |this, window, cx| {
                     this.storage_projection_run.apply_event(&event);
                     match &event {
                         RecorderEvent::AudioLevels {
@@ -289,8 +299,14 @@ impl ClipperWindow {
                     }
                     this.recording.apply(event);
                     this.refresh_active_video();
+                    // Rows of an open source menu are list indexes; a new list or
+                    // a started session makes them meaningless.
+                    if sources_listed || !this.recording.settings_enabled() {
+                        this.source_menu = None;
+                    }
                     if wrote_file {
                         this.refresh_storage(cx);
+                        this.refresh_recent_clips(window, cx);
                     }
                     if sources_listed {
                         this.maybe_autostart_replay();
@@ -373,23 +389,30 @@ impl ClipperWindow {
             capture_menu: None,
             // Indexed by `CaptureMenu` order. Tab follows the screen: the capture
             // bar (resolution 4, fps 5, replay length 6, hotkey 7, replay switch 8)
-            // after the sidebar (0-3), then the Capture page's quality and bitrate.
-            capture_focus: [4, 5, 9, 10, 6]
+            // after the sidebar (0-3), then the Capture page: source 9, quality 10,
+            // bitrate 11. Settings controls follow from 12.
+            capture_focus: [4, 5, 10, 11, 6]
                 .map(|index| cx.focus_handle().tab_index(index).tab_stop(true)),
             replay_focus: cx.focus_handle().tab_index(8).tab_stop(true),
             active_video: None,
             storage: StorageStatus::Unknown,
+            source_menu: None,
+            // First control of the Capture page, after the capture bar (4-8).
+            source_focus: cx.focus_handle().tab_index(9).tab_stop(true),
+            recent_clips: Default::default(),
+            recent_clips_generation: 0,
             editor: None,
             accent_input,
-            // After the shell and capture controls (0-10).
+            // Settings page, after every Capture page control (0-11).
             notify_focus: std::array::from_fn(|index| {
                 cx.focus_handle()
-                    .tab_index(11 + index as isize)
+                    .tab_index(12 + index as isize)
                     .tab_stop(true)
             }),
         };
         this.storage_projection_cache.refresh(&this.config);
         this.refresh_storage(cx);
+        this.refresh_recent_clips(window, cx);
         this.send(RecorderCommand::RefreshSources);
         this.refresh_audio_devices(cx);
         this.register_hotkey(cx);
