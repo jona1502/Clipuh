@@ -46,10 +46,11 @@ const REPLAY_MEMORY_PRESETS_MB: [u32; 5] = [32, 64, 128, 256, 512];
 const REPLAY_DISK_PRESETS_MB: [u32; 6] = [1024, 2048, 4096, 8192, 16384, 32768];
 /// Narrowest a card gets before its row wraps to one column.
 const CARD_MIN_WIDTH: f32 = 380.0;
-/// Below this window width the section list is hidden; the cards still scroll.
 mod hex;
 
-const NAV_MIN_VIEWPORT: f32 = 1040.0;
+/// Settings category rows nested under Settings in the app sidebar.
+const CATEGORY_ROW_HEIGHT: f32 = 34.0;
+const CATEGORY_INDENT: f32 = 30.0;
 /// Free space below this on the chosen clip folder gets a warning.
 const LOW_SPACE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
@@ -1966,69 +1967,61 @@ impl ClipperWindow {
             ))
     }
 
-    /// Category list; `compact` shows icons only (narrow windows).
-    fn section_nav(
+    /// Settings categories nested under Settings in the app sidebar. Picking
+    /// one opens Settings (if needed) and shows only that category.
+    pub(super) fn settings_categories(
         &self,
         t: &Theme,
-        compact: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Div {
+        let on_settings = self.active_page == super::Page::Settings;
         let items = SECTIONS
             .iter()
             .enumerate()
             .map(|(index, (glyph, title, _))| {
-                let active = self.settings_section == index;
+                // The selected category is marked only while Settings shows it;
+                // the page row above carries the full accent fill.
+                let active = on_settings && self.settings_section == index;
                 let item = div()
                     .id(("settings-nav", index))
                     .flex()
                     .items_center()
-                    .gap_3()
-                    .h(px(48.))
-                    .px_3()
-                    .rounded_lg()
+                    .gap_2p5()
+                    .h(px(CATEGORY_ROW_HEIGHT))
+                    .pl(px(CATEGORY_INDENT))
+                    .pr_2()
+                    .rounded_md()
                     .border_1()
                     .border_color(gpui::transparent_black())
-                    .text_base()
+                    .text_sm()
                     .cursor_pointer()
                     .map(|this| {
                         if active {
-                            // Same active treatment as the app sidebar.
-                            this.bg(t.colors.accent.opacity(super::ACTIVE_NAV_ALPHA))
-                                .text_color(t.colors.accent_foreground)
+                            this.bg(t.colors.accent_subtle)
+                                .text_color(t.colors.accent)
+                                .font_weight(FontWeight::MEDIUM)
                         } else {
                             this.text_color(t.colors.text_secondary)
                                 .hover(|style| style.bg(t.colors.surface_hover))
                         }
                     })
-                    .child(icon(*glyph, px(18.)))
-                    .when(compact, |this| {
-                        this.justify_center().px_0().tooltip(tooltip(*title))
-                    })
-                    .when(!compact, |this| this.child(*title));
+                    .child(icon(*glyph, px(15.)))
+                    .child(div().flex_1().truncate().child(*title));
                 activatable(
                     item,
                     t,
                     TAB_NAV + index as isize,
                     window,
                     cx,
-                    move |this, _, cx| this.select_section(index, cx),
+                    move |this, window, cx| {
+                        this.navigate(super::Page::Settings, window, cx);
+                        this.select_section(index, cx);
+                    },
                 )
             })
             .collect::<Vec<_>>();
-        div()
-            .flex_none()
-            .w(px(if compact { 64. } else { 214. }))
-            .h_full()
-            .p_2()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .rounded_lg()
-            .border_1()
-            .border_color(t.colors.border)
-            .bg(t.colors.surface)
-            .children(items)
+        div().pt_1().flex().flex_col().gap_0p5().children(items)
     }
 }
 
@@ -2091,7 +2084,6 @@ pub(super) fn content(
     cx: &mut Context<ClipperWindow>,
 ) -> Div {
     let t = *cx.theme();
-    let compact_nav = win.viewport_size().width < px(NAV_MIN_VIEWPORT);
     let scroll = crate::components::smooth_scroll(
         div().id("settings-scroll"),
         "settings-smooth-scroll",
@@ -2113,21 +2105,15 @@ pub(super) fn content(
                 .map(|message| super::dashboard::error_banner(message, cx)),
         )
         .child(window.section_card(&t, win, cx));
+    // No page title (the sidebar names the page); categories live in the
+    // app sidebar, so the selected one uses the full width.
     div().size_full().flex().flex_col().gap_4().child(
-        div()
+        scroll
             .flex_1()
             .min_h_0()
-            .flex()
-            .gap(t.metrics.gap * 2.)
-            .child(window.section_nav(&t, compact_nav, win, cx))
-            .child(
-                scroll
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .overflow_y_scroll()
-                    .child(grid.pb_4()),
-            ),
+            .w_full()
+            .overflow_y_scroll()
+            .child(grid.pb_4()),
     )
 }
 
