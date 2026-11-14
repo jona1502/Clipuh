@@ -14,12 +14,12 @@ use clipper_platform::windows::shell;
 use gpui::prelude::*;
 use gpui::{
     Bounds, Context, Div, FocusHandle, FontWeight, MouseButton, ObjectFit, Pixels, RenderImage,
-    SharedString, Task, Window, actions, canvas, div, img, px, relative, rgb, rgba,
+    SharedString, Task, Window, actions, canvas, div, img, px, relative,
 };
 
 use crate::components::{ButtonVariant, button, empty_state, kbd, panel, shortcut};
 use crate::state::format_elapsed;
-use crate::theme;
+use crate::theme::{ActiveTheme, Theme};
 
 actions!(clip_editor, [TogglePlayback, SetIn, SetOut]);
 
@@ -418,8 +418,8 @@ fn fraction(at: Duration, duration: Duration) -> f32 {
     }
 }
 
-fn muted() -> Div {
-    div().text_xs().text_color(rgb(theme::TEXT_TERTIARY))
+fn muted(t: &Theme) -> Div {
+    div().text_xs().text_color(t.colors.text_muted)
 }
 
 fn file_name(path: &Path) -> String {
@@ -429,8 +429,9 @@ fn file_name(path: &Path) -> String {
 }
 
 /// The Editor page when no clip is open.
-pub(super) fn empty() -> Div {
-    panel().child(empty_state(
+pub(super) fn empty(t: &Theme) -> Div {
+    panel(t).child(empty_state(
+        t,
         "◫",
         "No clip open",
         "Open the Clips page and choose Edit on a saved clip to play, trim and export it.",
@@ -439,6 +440,7 @@ pub(super) fn empty() -> Div {
 
 impl Render for ClipEditor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = *cx.theme();
         let loaded = self.ready;
         let duration = self.duration.unwrap_or_default();
         let exporting = matches!(self.export, Export::Running { .. });
@@ -458,6 +460,7 @@ impl Render for ClipEditor {
             )
             .child(
                 button(
+                    &t,
                     "editor-export",
                     "Export Selection",
                     ButtonVariant::Primary,
@@ -476,7 +479,7 @@ impl Render for ClipEditor {
             .h(px(PREVIEW_HEIGHT))
             .rounded_lg()
             .overflow_hidden()
-            .bg(rgb(0x000000))
+            .bg(t.colors.media_background)
             .flex()
             .items_center()
             .justify_center()
@@ -490,7 +493,7 @@ impl Render for ClipEditor {
                         .max_w(px(420.))
                         .text_sm()
                         .text_center()
-                        .text_color(rgb(theme::DANGER))
+                        .text_color(t.colors.danger)
                         .child(error.clone()),
                 ),
                 (None, Some(frame)) => this.child(
@@ -498,7 +501,7 @@ impl Render for ClipEditor {
                         .size_full()
                         .object_fit(ObjectFit::Contain),
                 ),
-                (None, None) => this.child(muted().child("Loading clip…")),
+                (None, None) => this.child(muted(&t).child("Loading clip…")),
             });
 
         let play_label = if self.playing { "Pause" } else { "Play" };
@@ -508,6 +511,7 @@ impl Render for ClipEditor {
             .gap_3()
             .child(
                 button(
+                    &t,
                     "editor-play",
                     play_label,
                     ButtonVariant::Secondary,
@@ -521,7 +525,7 @@ impl Render for ClipEditor {
             .child(
                 div()
                     .text_sm()
-                    .text_color(rgb(theme::TEXT_SECONDARY))
+                    .text_color(t.colors.text_secondary)
                     .child(format!(
                         "{} / {}",
                         format_elapsed(self.position),
@@ -541,7 +545,7 @@ impl Render for ClipEditor {
                 .flex()
                 .items_baseline()
                 .gap_2()
-                .child(muted().child(label))
+                .child(muted(&t).child(label))
                 .child(div().text_sm().child(text))
         };
         let trim_row = div()
@@ -560,6 +564,7 @@ impl Render for ClipEditor {
                     .gap_2()
                     .child(
                         button(
+                            &t,
                             "editor-in",
                             "Set In",
                             ButtonVariant::Secondary,
@@ -572,6 +577,7 @@ impl Render for ClipEditor {
                     )
                     .child(
                         button(
+                            &t,
                             "editor-out",
                             "Set Out",
                             ButtonVariant::Secondary,
@@ -585,6 +591,7 @@ impl Render for ClipEditor {
                     .child({
                         let enabled = loaded && !trim.is_full(duration);
                         button(
+                            &t,
                             "editor-reset",
                             "Reset Trim",
                             ButtonVariant::Ghost,
@@ -613,7 +620,7 @@ impl Render for ClipEditor {
             .gap_4()
             .child(header)
             .child(
-                panel()
+                panel(&t)
                     .p_3()
                     .flex()
                     .flex_col()
@@ -622,7 +629,7 @@ impl Render for ClipEditor {
                     .child(controls),
             )
             .child(
-                panel()
+                panel(&t)
                     .p_3()
                     .flex()
                     .flex_col()
@@ -634,7 +641,7 @@ impl Render for ClipEditor {
                 div()
                     .px_1()
                     .text_xs()
-                    .text_color(rgb(theme::WARNING))
+                    .text_color(t.colors.warning)
                     .child(notice)
             }))
             .children(self.export_status(cx))
@@ -643,6 +650,7 @@ impl Render for ClipEditor {
 
 impl ClipEditor {
     fn timeline(&self, duration: Duration, loaded: bool, cx: &mut Context<Self>) -> Div {
+        let t = *cx.theme();
         let trim = self.trim.unwrap_or(Trim::full(duration));
         let (start, end) = (fraction(trim.start, duration), fraction(trim.end, duration));
         let head = fraction(self.position, duration);
@@ -654,13 +662,13 @@ impl ClipEditor {
                 .bottom_0()
                 .left(relative(at))
                 .w(px(2.))
-                .bg(rgb(theme::ACCENT))
+                .bg(t.colors.accent)
                 .child(
                     div()
                         .absolute()
                         .bottom(px(-16.))
                         .text_size(px(10.))
-                        .text_color(rgb(theme::TEXT_TERTIARY))
+                        .text_color(t.colors.text_muted)
                         .child(label),
                 )
         };
@@ -671,9 +679,9 @@ impl ClipEditor {
             .h(px(36.))
             .mb_4()
             .rounded_md()
-            .bg(rgb(theme::SURFACE_RAISED))
+            .bg(t.colors.surface_raised)
             .border_1()
-            .border_color(rgb(theme::BORDER))
+            .border_color(t.colors.border)
             .child(
                 canvas(move |bounds, _, _| bounds_out.set(bounds), |_, _, _, _| {})
                     .absolute()
@@ -686,7 +694,7 @@ impl ClipEditor {
                     .bottom_0()
                     .left(relative(start))
                     .w(relative(end - start))
-                    .bg(rgba(theme::ACCENT_SUBTLE)),
+                    .bg(t.colors.accent_subtle),
             )
             .child(marker(start, "IN"))
             .child(marker(end, "OUT"))
@@ -698,7 +706,7 @@ impl ClipEditor {
                     .left(relative(head))
                     .w(px(2.))
                     .rounded_full()
-                    .bg(rgb(theme::TEXT)),
+                    .bg(t.colors.text),
             )
             .when(loaded, |this| {
                 this.cursor_pointer()
@@ -726,9 +734,9 @@ impl ClipEditor {
             .flex()
             .items_start()
             .gap_3()
-            .child(muted().pt_2().child(format_elapsed(self.position)))
+            .child(muted(&t).pt_2().child(format_elapsed(self.position)))
             .child(track)
-            .child(muted().pt_2().child(if loaded {
+            .child(muted(&t).pt_2().child(if loaded {
                 format_elapsed(duration)
             } else {
                 "--:--".into()
@@ -736,25 +744,26 @@ impl ClipEditor {
     }
 
     fn export_status(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let t = *cx.theme();
         let line = div()
             .flex()
             .items_center()
             .gap_3()
             .px_1()
             .text_xs()
-            .text_color(rgb(theme::TEXT_SECONDARY));
+            .text_color(t.colors.text_secondary);
         match &self.export {
             Export::Idle => Some(
-                line.child(muted().child(
+                line.child(muted(&t).child(
                     "Exports a new MP4 next to the original. The original stays unchanged.",
                 ))
                 .child(div().flex_1())
-                .child(shortcut(&["Space"]))
-                .child(muted().child("Play"))
-                .child(kbd("I"))
-                .child(muted().child("In"))
-                .child(kbd("O"))
-                .child(muted().child("Out")),
+                .child(shortcut(&t, &["Space"]))
+                .child(muted(&t).child("Play"))
+                .child(kbd(&t, "I"))
+                .child(muted(&t).child("In"))
+                .child(kbd(&t, "O"))
+                .child(muted(&t).child("Out")),
             ),
             Export::Running { progress, .. } => Some(
                 line.child(format!("Exporting… {:.0}%", progress * 100.0))
@@ -763,17 +772,18 @@ impl ClipEditor {
                             .flex_1()
                             .h(px(4.))
                             .rounded_full()
-                            .bg(rgb(theme::SURFACE_RAISED))
+                            .bg(t.colors.surface_raised)
                             .child(
                                 div()
                                     .h_full()
                                     .w(relative(progress.clamp(0.0, 1.0)))
                                     .rounded_full()
-                                    .bg(rgb(theme::ACCENT)),
+                                    .bg(t.colors.accent),
                             ),
                     )
                     .child(
                         button(
+                            &t,
                             "editor-export-cancel",
                             "Cancel",
                             ButtonVariant::Ghost,
@@ -792,7 +802,7 @@ impl ClipEditor {
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .text_color(rgb(theme::SUCCESS))
+                            .text_color(t.colors.success)
                             .child(format!(
                                 "Exported {} ({}){}",
                                 file_name(&outcome.path),
@@ -811,6 +821,7 @@ impl ClipEditor {
                     )
                     .child(
                         button(
+                            &t,
                             "editor-export-open",
                             "Open",
                             ButtonVariant::Secondary,
@@ -823,6 +834,7 @@ impl ClipEditor {
                     )
                     .child(
                         button(
+                            &t,
                             "editor-export-folder",
                             "Open Folder",
                             ButtonVariant::Ghost,
@@ -839,7 +851,7 @@ impl ClipEditor {
                 line.child(
                     div()
                         .flex_1()
-                        .text_color(rgb(theme::DANGER))
+                        .text_color(t.colors.danger)
                         .child(format!("Export failed: {message}")),
                 ),
             ),

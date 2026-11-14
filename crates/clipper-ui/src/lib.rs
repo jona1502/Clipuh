@@ -7,4 +7,5 @@ mod state;
 mod theme;
 mod views;
 
+pub use theme::apply as apply_theme;
 pub use views::{ClipperWindow, bind_keys};

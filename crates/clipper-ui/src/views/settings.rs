@@ -2,22 +2,24 @@ use clipper_core::hotkey::{Hotkey, HotkeyError, Key, Modifiers};
 use clipper_core::recording::{QualityProfile, REPLAY_DURATIONS_SECONDS, RecorderCommand};
 use clipper_platform::windows::hotkey::RegisterError;
 use clipper_storage::{
-    NOTIFICATION_DURATION_SECONDS, NotificationSettings,
-    config::{EncoderPreference, ReplayMode, Theme, VideoCodec},
-    config_path, default_replay_cache_directory,
+    ACCENT_PRESETS, AppearanceSettings, DEFAULT_ACCENT, NOTIFICATION_DURATION_SECONDS,
+    NotificationSettings, Theme as ThemeMode, UiDensity,
+    config::{EncoderPreference, ReplayMode, VideoCodec},
+    config_path, default_replay_cache_directory, format_hex_color, parse_hex_color,
 };
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, Context, Div, FocusHandle, KeyDownEvent, ModifiersChangedEvent, SharedString,
-    Subscription, Window, div, px, rgb, rgba,
+    AnyElement, Context, Div, Entity, FocusHandle, KeyDownEvent, ModifiersChangedEvent,
+    SharedString, Subscription, Window, div, px,
 };
 
 use super::{ClipperWindow, HOTKEY_CONTEXT};
 use crate::components::{
-    ButtonVariant, button, chip, kbd, panel, property_row, section_header, switch, value_text,
+    ButtonVariant, TextInput, TextInputEvent, button, chip, kbd, panel, property_row,
+    section_header, switch, toggle as toggle_control, tooltip, value_text,
 };
 use crate::state::ReplayPhase;
-use crate::theme;
+use crate::theme::{ActiveTheme, Theme};
 
 /// RAM budgets offered for the replay buffer, in MiB.
 const REPLAY_MEMORY_PRESETS_MB: [u32; 5] = [32, 64, 128, 256, 512];
@@ -74,12 +76,12 @@ fn core_modifiers(modifiers: gpui::Modifiers) -> Modifiers {
     }
 }
 
-fn keycaps(text: &str) -> Div {
+fn keycaps(t: &Theme, text: &str) -> Div {
     div()
         .flex()
         .items_center()
         .gap_1()
-        .children(text.split('+').map(|key| kbd(key.to_owned())))
+        .children(text.split('+').map(|key| kbd(t, key.to_owned())))
 }
 
 fn modifier_names(modifiers: Modifiers) -> String {
@@ -246,17 +248,14 @@ impl ClipperWindow {
     }
 
     fn hotkey_control(&self, cx: &mut Context<Self>) -> AnyElement {
-        let error = |text: String| {
-            div()
-                .text_xs()
-                .text_color(rgb(theme::RECORDING))
-                .child(text)
-        };
+        let t = *cx.theme();
+        let error = |text: String| div().text_xs().text_color(t.colors.danger).child(text);
         let column = || div().flex().flex_col().items_end().gap_1();
         let row = || div().flex().items_center().gap_3();
 
         let Some(recorder) = &self.hotkey_recorder else {
             let change = button(
+                &t,
                 "hotkey-change",
                 "Change",
                 ButtonVariant::Secondary,
@@ -265,7 +264,11 @@ impl ClipperWindow {
             )
             .on_click(cx.listener(|this, _, window, cx| this.begin_hotkey_recording(window, cx)));
             return column()
-                .child(row().child(keycaps(&self.hotkey.to_string())).child(change))
+                .child(
+                    row()
+                        .child(keycaps(&t, &self.hotkey.to_string()))
+                        .child(change),
+                )
                 .children(self.hotkey_error.clone().map(error))
                 .into_any_element();
         };
@@ -273,14 +276,15 @@ impl ClipperWindow {
         let prompt = if recorder.held.is_empty() {
             div()
                 .text_sm()
-                .text_color(rgb(theme::TEXT_TERTIARY))
+                .text_color(t.colors.text_muted)
                 .child("Press your shortcut…")
         } else {
-            keycaps(&modifier_names(recorder.held))
-                .child(div().text_color(rgb(theme::TEXT_TERTIARY)).child("+ …"))
+            keycaps(&t, &modifier_names(recorder.held))
+                .child(div().text_color(t.colors.text_muted).child("+ …"))
         };
         let enabled = !recorder.pending;
         let reset = button(
+            &t,
             "hotkey-reset",
             "Reset to Default",
             ButtonVariant::Ghost,
@@ -293,6 +297,7 @@ impl ClipperWindow {
             }))
         });
         let cancel = button(
+            &t,
             "hotkey-cancel",
             "Cancel",
             ButtonVariant::Secondary,
@@ -323,8 +328,8 @@ impl ClipperWindow {
             .gap_1()
             .rounded_md()
             .border_1()
-            .border_color(rgba(theme::FOCUS_RING))
-            .bg(rgb(theme::SURFACE_RAISED))
+            .border_color(t.colors.focus_ring)
+            .bg(t.colors.surface_raised)
             .child(prompt);
         column()
             .child(row().child(capture).child(reset).child(cancel))
@@ -333,65 +338,237 @@ impl ClipperWindow {
     }
 }
 
-/// Clickable switch; when `enabled` is false it is dimmed and inert.
+/// Toggle for one notification setting: click, or Tab to it and press
+/// Space/Enter. Dimmed and inert when `enabled` is false.
+#[allow(clippy::too_many_arguments)]
 fn notification_switch(
+    t: &Theme,
     id: &'static str,
     on: bool,
     enabled: bool,
+    focus: &FocusHandle,
+    window: &Window,
     field: fn(&mut NotificationSettings) -> &mut bool,
     cx: &mut Context<ClipperWindow>,
 ) -> AnyElement {
-    div()
-        .id(id)
-        .when(!enabled, |this| this.opacity(0.45))
-        .when(enabled, |this| {
-            this.cursor_pointer()
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    let value = field(&mut this.config.notifications);
-                    *value = !*value;
-                    this.persist_config(cx);
-                }))
+    let this = cx.entity().downgrade();
+    toggle_control(
+        t,
+        id,
+        on,
+        enabled,
+        focus,
+        focus.is_focused(window),
+        move |value, _, cx| {
+            this.update(cx, |this, cx| {
+                *field(&mut this.config.notifications) = value;
+                this.persist_config(cx);
+            })
+            .ok();
+        },
+    )
+    .into_any_element()
+}
+
+/// The custom accent field; submitting a valid `#RRGGBB` applies it.
+pub(super) fn accent_input(
+    config: &clipper_storage::AppConfig,
+    window: &mut Window,
+    cx: &mut Context<ClipperWindow>,
+) -> Entity<TextInput> {
+    let input = cx.new(|cx| {
+        // After the sidebar (0-3), capture menus (4-7) and notification toggles (8-11).
+        let mut input = TextInput::new(cx).placeholder(DEFAULT_ACCENT).tab_index(12);
+        input.set_text(config.appearance.accent_color.clone(), cx);
+        input
+    });
+    cx.subscribe_in(
+        &input,
+        window,
+        |this, input, event: &TextInputEvent, window, cx| match event {
+            TextInputEvent::Dismissed => window.focus(&this.focus),
+            TextInputEvent::Changed(_) => input.update(cx, |input, cx| input.set_error(None, cx)),
+            TextInputEvent::Submitted(text) => match parse_hex_color(text) {
+                Some(rgb) => {
+                    let hex = format_hex_color(rgb);
+                    input.update(cx, |input, cx| input.set_text(hex.clone(), cx));
+                    this.set_appearance(|appearance| appearance.accent_color = hex, cx);
+                }
+                None => input.update(cx, |input, cx| {
+                    input.set_error(Some("Use a color like #9B5CF6.".into()), cx)
+                }),
+            },
+        },
+    )
+    .detach();
+    input
+}
+
+impl ClipperWindow {
+    /// Applies an appearance change to every window at once, then saves it.
+    fn set_appearance(
+        &mut self,
+        edit: impl FnOnce(&mut AppearanceSettings),
+        cx: &mut Context<Self>,
+    ) {
+        let before = self.config.appearance.clone();
+        edit(&mut self.config.appearance);
+        if self.config.appearance == before {
+            return;
+        }
+        crate::theme::apply(&self.config.appearance, cx);
+        self.persist_config(cx);
+    }
+}
+
+/// Theme mode, accent and density controls.
+fn appearance_group(window: &ClipperWindow, t: &Theme, cx: &mut Context<ClipperWindow>) -> Div {
+    let appearance = &window.config.appearance;
+    let modes = [
+        (ThemeMode::Dark, "Dark"),
+        (ThemeMode::Light, "Light"),
+        (ThemeMode::System, "System"),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, (mode, label))| {
+        chip(
+            t,
+            ("theme-mode", index),
+            label,
+            appearance.mode == mode,
+            true,
+        )
+        .on_click(cx.listener(move |this, _, _, cx| this.set_appearance(|a| a.mode = mode, cx)))
+    })
+    .collect::<Vec<_>>();
+    let densities = [
+        (UiDensity::Compact, "Compact"),
+        (UiDensity::Default, "Default"),
+        (UiDensity::Relaxed, "Relaxed"),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, (density, label))| {
+        chip(
+            t,
+            ("density", index),
+            label,
+            appearance.density == density,
+            true,
+        )
+        .on_click(
+            cx.listener(move |this, _, _, cx| this.set_appearance(|a| a.density = density, cx)),
+        )
+    })
+    .collect::<Vec<_>>();
+    let current = parse_hex_color(&appearance.accent_color);
+    let swatches = ACCENT_PRESETS
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, (name, hex))| {
+            let rgb = parse_hex_color(hex)?;
+            let selected = current == Some(rgb);
+            Some(
+                div()
+                    .id(("accent", index))
+                    .size(px(22.))
+                    .p(px(3.))
+                    .rounded_full()
+                    .border_2()
+                    .border_color(if selected {
+                        t.colors.text
+                    } else {
+                        gpui::transparent_black()
+                    })
+                    .cursor_pointer()
+                    .tooltip(tooltip(name))
+                    .child(div().size_full().rounded_full().bg(gpui::rgb(rgb)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let hex = format_hex_color(rgb);
+                        this.accent_input
+                            .update(cx, |input, cx| input.set_text(hex.clone(), cx));
+                        this.set_appearance(|a| a.accent_color = hex, cx);
+                    })),
+            )
         })
-        .child(switch(on))
-        .into_any_element()
+        .collect::<Vec<_>>();
+    let row = |items: Vec<gpui::Stateful<Div>>| {
+        div()
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .children(items)
+            .into_any_element()
+    };
+    group(
+        t,
+        "Appearance",
+        vec![
+            (
+                "Theme",
+                Some("System follows the Windows light/dark setting."),
+                row(modes),
+            ),
+            ("Accent color", None, row(swatches)),
+            (
+                "Custom accent",
+                Some("A hex color such as #9B5CF6. Press Enter to apply."),
+                div()
+                    .w(px(140.))
+                    .child(window.accent_input.clone())
+                    .into_any_element(),
+            ),
+            (
+                "Density",
+                Some("Spacing and control size across the app."),
+                row(densities),
+            ),
+        ],
+    )
 }
 
 type Row = (&'static str, Option<&'static str>, AnyElement);
 
 /// One group: header plus a single panel of rows; the first row has no divider.
-fn group(title: &'static str, rows: Vec<Row>) -> Div {
-    let mut body = panel();
+fn group(t: &Theme, title: &'static str, rows: Vec<Row>) -> Div {
+    let mut body = panel(t);
     for (i, (label, description, value)) in rows.into_iter().enumerate() {
         let description = description.map(SharedString::from);
-        body = body.child(property_row(label, description, value, i == 0));
+        body = body.child(property_row(t, label, description, value, i == 0));
     }
     div()
         .flex()
         .flex_col()
         .gap_2()
-        .child(section_header(title, None))
+        .child(section_header(t, title, None))
         .child(body)
 }
 
-fn text(value: impl Into<SharedString>) -> AnyElement {
-    value_text(value).into_any_element()
+fn text(t: &Theme, value: impl Into<SharedString>) -> AnyElement {
+    value_text(t, value).into_any_element()
 }
 
-fn path_text(path: String) -> AnyElement {
+fn path_text(t: &Theme, path: String) -> AnyElement {
     div()
         .max_w(px(420.))
         .overflow_hidden()
         .text_ellipsis()
         .whitespace_nowrap()
-        .child(value_text(path))
+        .child(value_text(t, path))
         .into_any_element()
 }
 
-fn toggle(on: bool) -> AnyElement {
-    switch(on).into_any_element()
+fn toggle(t: &Theme, on: bool) -> AnyElement {
+    switch(t, on).into_any_element()
 }
 
-pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
+pub(super) fn content(
+    window: &ClipperWindow,
+    win: &Window,
+    cx: &mut Context<ClipperWindow>,
+) -> Div {
+    let t = *cx.theme();
     let config = &window.config;
     let video = &config.video;
     let replay = &config.replay;
@@ -410,17 +587,13 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
     let mode = match replay.mode {
         ReplayMode::Hybrid => "Hybrid",
     };
-    let theme_name = match app.theme {
-        Theme::Dark => "Dark",
-        Theme::Light => "Light",
-        Theme::System => "System",
-    };
 
     let durations = [2u32, 3, 4, 5, 6, 8, 10]
         .into_iter()
         .filter(|seconds| NOTIFICATION_DURATION_SECONDS.contains(seconds))
         .map(|seconds| {
             chip(
+                &t,
                 ("notify-duration", seconds as usize),
                 format!("{seconds} s"),
                 notifications.duration_seconds == seconds,
@@ -445,6 +618,7 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
         .into_iter()
         .map(|seconds| {
             chip(
+                &t,
                 ("replay-duration", seconds as usize),
                 duration_label(seconds),
                 replay.duration_seconds == seconds,
@@ -469,6 +643,7 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
         .into_iter()
         .map(|megabytes| {
             chip(
+                &t,
                 ("replay-memory", megabytes as usize),
                 size_label(megabytes),
                 replay.memory_limit_megabytes == megabytes,
@@ -484,6 +659,7 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
         .into_iter()
         .map(|megabytes| {
             chip(
+                &t,
                 ("replay-disk", megabytes as usize),
                 size_label(megabytes),
                 replay.disk_limit_megabytes == megabytes,
@@ -505,13 +681,13 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
         .id("replay-enabled")
         .cursor_pointer()
         .on_click(cx.listener(|this, _, _, cx| this.toggle_replay(cx)))
-        .child(switch(replay_on))
+        .child(switch(&t, replay_on))
         .into_any_element();
     let cache_directory = match &replay.cache_directory {
-        Some(path) => path_text(path.display().to_string()),
+        Some(path) => path_text(&t, path.display().to_string()),
         None => match default_replay_cache_directory() {
-            Ok(path) => path_text(path.display().to_string()),
-            Err(error) => text(error.to_string()),
+            Ok(path) => path_text(&t, path.display().to_string()),
+            Err(error) => text(&t, error.to_string()),
         },
     };
 
@@ -520,25 +696,39 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
         .flex_col()
         .gap_6()
         .child(group(
+            &t,
             "Hotkeys",
             vec![("Save Instant Replay", None, window.hotkey_control(cx))],
         ))
         .child(group(
+            &t,
             "Notifications",
             vec![
                 (
                     "Show clip notifications",
                     None,
-                    notification_switch("notify-enabled", notify_on, true, |n| &mut n.enabled, cx),
+                    notification_switch(
+                        &t,
+                        "notify-enabled",
+                        notify_on,
+                        true,
+                        &window.notify_focus[0],
+                        win,
+                        |n| &mut n.enabled,
+                        cx,
+                    ),
                 ),
                 ("Notification duration", None, duration_chips),
                 (
                     "Play notification sound",
                     None,
                     notification_switch(
+                        &t,
                         "notify-sound",
                         notifications.sound,
                         notify_on,
+                        &window.notify_focus[1],
+                        win,
                         |n| &mut n.sound,
                         cx,
                     ),
@@ -547,9 +737,12 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
                     "Open Clip action",
                     None,
                     notification_switch(
+                        &t,
                         "notify-open",
                         notifications.open_clip_action,
                         notify_on,
+                        &window.notify_focus[2],
+                        win,
                         |n| &mut n.open_clip_action,
                         cx,
                     ),
@@ -558,9 +751,12 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
                     "Notify on failure",
                     None,
                     notification_switch(
+                        &t,
                         "notify-failure",
                         notifications.notify_on_failure,
                         notify_on,
+                        &window.notify_focus[3],
+                        win,
                         |n| &mut n.notify_on_failure,
                         cx,
                     ),
@@ -568,29 +764,31 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
             ],
         ))
         .child(group(
+            &t,
             "Video",
             vec![
                 (
                     "Resolution",
                     Some("Resolution, frame rate and quality change on the Dashboard."),
-                    text(format!("{}×{}", video.width, video.height)),
+                    text(&t, format!("{}×{}", video.width, video.height)),
                 ),
-                ("Frame rate", None, text(format!("{} fps", video.fps))),
+                ("Frame rate", None, text(&t, format!("{} fps", video.fps))),
                 (
                     "Quality",
                     None,
-                    text(QualityProfile::from(config.recording.quality).label()),
+                    text(&t, QualityProfile::from(config.recording.quality).label()),
                 ),
-                ("Codec", None, text(codec)),
-                ("Encoder", None, text(encoder)),
+                ("Codec", None, text(&t, codec)),
+                ("Encoder", None, text(&t, encoder)),
                 (
                     "Base bitrate",
                     Some("The quality preset adjusts the encoded target used by estimates."),
-                    text(format!("{} Mbps", video.bitrate_mbps)),
+                    text(&t, format!("{} Mbps", video.bitrate_mbps)),
                 ),
             ],
         ))
         .child(group(
+            &t,
             "Replay",
             vec![
                 (
@@ -598,7 +796,7 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
                     Some("Starts automatically with Clipper. Needs a source on the Dashboard."),
                     replay_toggle,
                 ),
-                ("Mode", None, text(mode)),
+                ("Mode", None, text(&t, mode)),
                 (
                     "Duration",
                     Some("Applies immediately, even while replay is running."),
@@ -621,17 +819,19 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
                 ),
             ],
         ))
-        .child(super::audio::content(window, cx));
+        .child(super::audio::content(window, cx))
+        .child(appearance_group(window, &t, cx));
 
     let recordings = match config.recording_options() {
-        Ok(options) => path_text(options.output_directory.display().to_string()),
-        Err(error) => text(error.to_string()),
+        Ok(options) => path_text(&t, options.output_directory.display().to_string()),
+        Err(error) => text(&t, error.to_string()),
     };
     let settings_file = match config_path() {
-        Ok(path) => path_text(path.display().to_string()),
-        Err(_) => text("Unavailable"),
+        Ok(path) => path_text(&t, path.display().to_string()),
+        Err(_) => text(&t, "Unavailable"),
     };
     root = root.child(group(
+        &t,
         "Storage",
         vec![
             ("Recordings folder", None, recordings),
@@ -640,36 +840,41 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
     ));
 
     root.child(group(
+        &t,
         "App",
         vec![
-            ("Theme", None, text(theme_name)),
             (
                 "Automatic game detection",
                 None,
-                toggle(app.automatic_detection),
+                toggle(&t, app.automatic_detection),
             ),
-            ("Manual game selection", None, toggle(app.manual_detection)),
-            ("Start on login", None, toggle(app.start_on_login)),
-            ("Tray icon", None, toggle(app.tray_icon)),
-            ("Minimize to tray", None, toggle(app.minimize_to_tray)),
+            (
+                "Manual game selection",
+                None,
+                toggle(&t, app.manual_detection),
+            ),
+            ("Start on login", None, toggle(&t, app.start_on_login)),
+            ("Tray icon", None, toggle(&t, app.tray_icon)),
+            ("Minimize to tray", None, toggle(&t, app.minimize_to_tray)),
         ],
     ))
     .child(group(
+        &t,
         "Performance",
         vec![
             (
                 "Command queue capacity",
                 Some("UI to worker commands."),
-                text(perf.command_queue_capacity.to_string()),
+                text(&t, perf.command_queue_capacity.to_string()),
             ),
             (
                 "Event queue capacity",
                 Some("Worker to UI events."),
-                text(perf.event_queue_capacity.to_string()),
+                text(&t, perf.event_queue_capacity.to_string()),
             ),
         ],
     ))
-    .child(div().text_xs().text_color(rgb(theme::TEXT_TERTIARY)).child(
+    .child(div().text_xs().text_color(t.colors.text_muted).child(
         "Other settings are read from settings.toml; editing them in the app is coming later.",
     ))
 }

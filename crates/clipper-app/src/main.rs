@@ -63,6 +63,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.bind_keys([KeyBinding::new("ctrl-q", Quit, None)]);
         clipper_ui::bind_keys(cx);
+        // Every window reads the theme global from its first frame on.
+        clipper_ui::apply_theme(&config.appearance, cx);
         // Quit with the main window: a visible toast is also a window and must
         // not keep the process (and the global hotkey) alive on its own.
         let main_window = Rc::new(Cell::new(None));
