@@ -5,7 +5,10 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError, sync_channel};
+use std::sync::mpsc::{
+    self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, sync_channel,
+};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use clipper_capture::windows::{CaptureSession, CaptureSignal, list_sources};
@@ -22,7 +25,6 @@ use clipper_replay::error::ReplayError;
 use clipper_replay::export::{ExportJob, ExportPrepare, Exporter, SavedClip};
 use windows::Win32::System::SystemInformation::GetLocalTime;
 
-use crate::emit;
 use crate::logic::{
     ClipNames, Counters, Lifecycle, StopOutcome, classify_stop, fit_output_size, partial_path,
     replay_failure_text, replay_file_name, sweep_stale_partials, unique_file_name,
@@ -30,6 +32,7 @@ use crate::logic::{
 };
 use crate::recording_audio::{AudioPlan, AudioReporter, AudioTest, RecordingAudio};
 use crate::replay_session::{ReplaySession, WAKE_WAIT};
+use crate::{emit, log};
 
 const MAX_WAIT: Duration = Duration::from_millis(250);
 const STATS_WINDOW: Duration = Duration::from_secs(1);
@@ -145,6 +148,11 @@ struct Worker<'a> {
     /// Spawned on the first save and kept across replay sessions, so
     /// stopping the replay never cancels a running export.
     exporter: Option<Exporter>,
+    /// Hands export results to the UI. Declared after `exporter`, whose queued
+    /// jobs hold its senders, so it is dropped (joined) after it.
+    completions: Option<Completions>,
+    /// Id of the next save request, for the logs.
+    next_save: u64,
     /// Clip names of queued and running exports.
     clip_names: ClipNames,
     /// Folder of the running replay's clips.
@@ -177,6 +185,8 @@ pub fn run(endpoint: &RecorderEndpoint) {
         replay: None,
         audio_test: None,
         exporter: None,
+        completions: None,
+        next_save: 1,
         clip_names: ClipNames::default(),
         replay_output: PathBuf::new(),
         shutting_down: Arc::new(AtomicBool::new(false)),
@@ -219,10 +229,69 @@ pub fn run(endpoint: &RecorderEndpoint) {
     // draining events meanwhile). Afterwards completion events must not block
     // on a full UI queue and the exporter fails whatever is still queued.
     if let Some(exporter) = &worker.exporter {
-        exporter.finish_queued(SHUTDOWN_EXPORT_WAIT);
+        let pending = exporter.in_flight();
+        if pending > 0 {
+            log(format_args!(
+                "shutdown: waiting for {pending} clip export(s)"
+            ));
+            if exporter.finish_queued(SHUTDOWN_EXPORT_WAIT) {
+                log(format_args!("shutdown: clip exports drained"));
+            } else {
+                log(format_args!(
+                    "shutdown: {} clip export(s) unfinished after {SHUTDOWN_EXPORT_WAIT:?}; queued ones fail",
+                    exporter.in_flight()
+                ));
+            }
+        }
     }
     worker.shutting_down.store(true, Ordering::Release);
+    // Exporter first: its queued jobs own completion senders.
     drop(worker.exporter.take());
+    drop(worker.completions.take());
+}
+
+/// Delivers export results to the UI on its own thread. The export thread only
+/// queues them here, so a slow or stalled UI never holds up the export thread
+/// and the saves queued behind it. At most one pending event per accepted job.
+struct Completions {
+    sender: Option<Sender<RecorderEvent>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Completions {
+    fn spawn(
+        events: async_channel::Sender<RecorderEvent>,
+        shutting_down: Arc<AtomicBool>,
+    ) -> std::io::Result<Self> {
+        let (sender, receiver) = mpsc::channel::<RecorderEvent>();
+        let thread = std::thread::Builder::new()
+            .name("clipper-replay-events".into())
+            .spawn(move || {
+                while let Ok(event) = receiver.recv() {
+                    send_without_hanging(&events, event, &shutting_down);
+                }
+            })?;
+        Ok(Self {
+            sender: Some(sender),
+            thread: Some(thread),
+        })
+    }
+
+    fn sender(&self) -> Option<Sender<RecorderEvent>> {
+        self.sender.clone()
+    }
+}
+
+impl Drop for Completions {
+    fn drop(&mut self) {
+        // The thread ends once every sender clone is gone (the exporter that
+        // holds the jobs is dropped first) and gives up on a full queue once
+        // `shutting_down` is set.
+        drop(self.sender.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 impl Worker<'_> {
@@ -374,12 +443,11 @@ impl Worker<'_> {
     /// Removes stale `Clipper_Replay_*.mp4.partial` files of crashed runs in
     /// the clip folder, once per replay start, on the export thread.
     fn sweep_stale_partials(&mut self) {
-        let exporter = match &self.exporter {
-            Some(exporter) => exporter,
-            None => match Exporter::spawn(EXPORT_QUEUE) {
-                Ok(exporter) => self.exporter.insert(exporter),
-                Err(_) => return,
-            },
+        if self.ensure_exporter().is_err() {
+            return;
+        }
+        let Some(exporter) = &self.exporter else {
+            return;
         };
         let directory = self.replay_output.clone();
         let _ = exporter.try_run(Box::new(move || {
@@ -391,18 +459,24 @@ impl Worker<'_> {
     /// and reports it. Running exports are not touched.
     fn stop_replay(&mut self, error: Option<String>, report: bool) {
         let session = self.replay.take();
-        if let Some(session) = &session {
-            eprintln!(
-                "replay stopped: {:?}, capture delivered {} frames",
-                session.diagnostics(),
-                session.capture_delivered()
-            );
-        }
         let had_session = session.is_some();
-        if let Some(session) = &session {
+        if let Some(session) = session {
+            let exports = self.exporter.as_ref().map_or(0, Exporter::in_flight);
+            log(format_args!(
+                "replay stop: {}; {exports} clip export(s) in flight continue",
+                error.as_deref().unwrap_or("requested")
+            ));
+            let started = Instant::now();
+            let diagnostics = session.diagnostics();
+            let delivered = session.capture_delivered();
             session.finish_audio_report(self.endpoint);
+            // Releases capture, encoder, audio, buffer and device, in that order.
+            drop(session);
+            log(format_args!(
+                "replay stop: capture and encoder released in {:?}; {diagnostics:?}, capture delivered {delivered} frames",
+                started.elapsed()
+            ));
         }
-        drop(session);
         if report || (had_session && error.is_some()) {
             self.send(RecorderEvent::ReplayStopped { error });
         }
@@ -456,43 +530,58 @@ impl Worker<'_> {
     /// `automatic`: save triggered by a fatal replay error; failures are
     /// silent when there is nothing to save yet.
     fn queue_save(&mut self, automatic: bool) {
+        let id = self.next_save;
+        self.next_save += 1;
+        let reject = |worker: &Self, message: String| {
+            log(format_args!("save #{id}: rejected: {message}"));
+            worker.save_failed(message);
+        };
         let Some(replay) = self.replay.as_mut() else {
-            self.save_failed(REPLAY_NOT_RUNNING);
+            reject(self, REPLAY_NOT_RUNNING.to_owned());
             return;
         };
         let snapshot = match replay.snapshot() {
             Ok(snapshot) => snapshot,
-            Err(_) if automatic => return,
+            Err(error) if automatic => {
+                log(format_args!("save #{id}: nothing to keep: {error}"));
+                return;
+            }
             Err(ReplayError::NotReady) => {
-                self.save_failed("The replay buffer is still filling; try again in a moment.");
+                let message = "The replay buffer is still filling; try again in a moment.";
+                reject(self, message.to_owned());
                 return;
             }
             Err(error) => {
-                self.save_failed(error.to_string());
+                reject(self, error.to_string());
                 return;
             }
         };
-        let directory = self.replay_output.clone();
-        if self.exporter.is_none() {
-            match Exporter::spawn(EXPORT_QUEUE) {
-                Ok(exporter) => self.exporter = Some(exporter),
-                Err(error) => {
-                    self.save_failed(format!("Could not start the clip exporter: {error}"));
-                    return;
-                }
-            }
+        if let Err(error) = self.ensure_exporter() {
+            reject(self, format!("Could not start the clip exporter: {error}"));
+            return;
         }
-        let Some(exporter) = self.exporter.as_ref() else {
+        let (Some(exporter), Some(completed)) = (
+            self.exporter.as_ref(),
+            self.completions.as_ref().and_then(Completions::sender),
+        ) else {
             return;
         };
+        let directory = self.replay_output.clone();
         // In-memory reservation only: folder creation and the on-disk name
         // check run on the export thread (`prepare`).
         let name = self.clip_names.reserve(&replay_clip_base(), |_| false);
+        let interval = format!(
+            "last {:?} up to {:.3} s, {} GOPs",
+            snapshot.requested,
+            snapshot.end_pts as f64 / 1e7,
+            snapshot.gops.len()
+        );
         let job = ExportJob {
             snapshot,
             final_path: directory.join(&name),
         };
         let prepare: ExportPrepare = Box::new(move |job| {
+            log(format_args!("save #{id}: export started"));
             fs::create_dir_all(&directory)
                 .map_err(|error| ReplayError::io("creating the clip folder", &directory, error))?;
             let base = job
@@ -507,35 +596,63 @@ impl Worker<'_> {
             job.final_path = directory.join(unique);
             Ok(())
         });
-        let events = self.endpoint.events.clone();
         let names = self.clip_names.clone();
-        let shutting_down = Arc::clone(&self.shutting_down);
         let reserved = name.clone();
         let done = Box::new(move |result: Result<SavedClip, ReplayError>| {
             // Runs on the export thread, only after export_clip returned:
             // the file is finalized and renamed on Ok.
             let event = match result {
-                Ok(saved) => RecorderEvent::ReplaySaved {
-                    path: saved.path,
-                    duration: saved.duration,
-                },
-                Err(error) => RecorderEvent::ReplaySaveFailed {
-                    message: error.to_string(),
-                },
+                Ok(saved) => {
+                    log(format_args!(
+                        "save #{id}: saved {} ({:?}, {} bytes)",
+                        saved.path.display(),
+                        saved.duration,
+                        saved.bytes
+                    ));
+                    RecorderEvent::ReplaySaved {
+                        path: saved.path,
+                        duration: saved.duration,
+                    }
+                }
+                Err(error) => {
+                    log(format_args!("save #{id}: failed: {error}"));
+                    RecorderEvent::ReplaySaveFailed {
+                        message: error.to_string(),
+                    }
+                }
             };
             names.release(&reserved);
-            send_without_hanging(&events, event, &shutting_down);
+            // Never blocks: the forwarder thread waits for room in the UI queue.
+            let _ = completed.send(event);
         });
+        // Before submitting: a quick export could otherwise report
+        // ReplaySaved ahead of ReplaySaving and leave "Saving…" on screen.
+        self.notify(RecorderEvent::ReplaySaving);
         match exporter.try_submit_with(job, Some(prepare), done) {
-            Ok(()) => self.notify(RecorderEvent::ReplaySaving),
+            Ok(()) => log(format_args!("save #{id}: queued ({interval}) as {name}")),
             Err(error) => {
                 self.clip_names.release(&name);
-                self.save_failed(match error {
+                let message = match error {
                     ReplayError::Busy => "Already saving clips; try again in a moment.".to_owned(),
                     other => other.to_string(),
-                });
+                };
+                reject(self, message);
             }
         }
+    }
+
+    /// Spawns the export thread and its completion forwarder, once.
+    fn ensure_exporter(&mut self) -> std::io::Result<()> {
+        if self.completions.is_none() {
+            self.completions = Some(Completions::spawn(
+                self.endpoint.events.clone(),
+                Arc::clone(&self.shutting_down),
+            )?);
+        }
+        if self.exporter.is_none() {
+            self.exporter = Some(Exporter::spawn(EXPORT_QUEUE)?);
+        }
+        Ok(())
     }
 
     fn stop_audio_test(&mut self, failure: Option<String>) {
@@ -925,7 +1042,7 @@ pub(crate) fn encoder_message(error: &EncoderError) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::round_up_even;
+    use super::*;
 
     #[test]
     fn rounds_up_to_even() {
@@ -933,5 +1050,48 @@ mod tests {
         assert_eq!(round_up_even(1081), 1082);
         assert_eq!(round_up_even(0), 2);
         assert_eq!(round_up_even(u32::MAX), u32::MAX - 1);
+    }
+
+    fn failed(index: usize) -> RecorderEvent {
+        RecorderEvent::ReplaySaveFailed {
+            message: index.to_string(),
+        }
+    }
+
+    #[test]
+    fn completions_never_block_the_export_thread_and_keep_order() {
+        // A UI queue of one that nobody reads yet: the export side must still
+        // hand over every result immediately.
+        let (events, ui) = async_channel::bounded(1);
+        let completions = Completions::spawn(events, Arc::new(AtomicBool::new(false))).unwrap();
+        let sender = completions.sender().unwrap();
+        for index in 0..5 {
+            sender.send(failed(index)).unwrap();
+        }
+        let delivered: Vec<_> = (0..5).map(|_| ui.recv_blocking().unwrap()).collect();
+        assert_eq!(delivered, (0..5).map(failed).collect::<Vec<_>>());
+        drop(sender);
+        drop(completions);
+    }
+
+    #[test]
+    fn completions_give_up_on_a_stalled_queue_at_shutdown() {
+        let (events, ui) = async_channel::bounded(1);
+        let shutting_down = Arc::new(AtomicBool::new(false));
+        let completions = Completions::spawn(events, Arc::clone(&shutting_down)).unwrap();
+        let sender = completions.sender().unwrap();
+        for index in 0..3 {
+            sender.send(failed(index)).unwrap();
+        }
+        drop(sender);
+        shutting_down.store(true, Ordering::Release);
+        let (joined, done) = mpsc::channel();
+        std::thread::spawn(move || {
+            drop(completions);
+            joined.send(()).unwrap();
+        });
+        done.recv_timeout(Duration::from_secs(10))
+            .expect("joining the forwarder hung on a full UI queue");
+        drop(ui);
     }
 }
