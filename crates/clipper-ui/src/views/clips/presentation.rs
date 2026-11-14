@@ -453,56 +453,60 @@ impl Render for ClipLibrary {
             .take(if self.visible { PAGE_SIZE } else { 0 })
             .copied()
             .collect::<Vec<_>>();
-        let mut grid = div()
-            .id("library-clips")
-            .track_scroll(&self.scroll)
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .key_context(CONTEXT)
-            .track_focus(&self.focus)
-            .flex()
-            .flex_col()
-            .gap(px(if list { 8. } else { GAP }))
-            .on_action(cx.listener(|this, _: &Play, _, cx| this.open(false, cx)))
-            .on_action(cx.listener(|this, _: &Edit, _, cx| this.open(true, cx)))
-            .on_action(cx.listener(|this, _: &Rename, window, cx| this.begin_rename(window, cx)))
-            .on_action(cx.listener(|this, _: &Delete, _, cx| this.confirm_delete(cx)))
-            .on_action(cx.listener(|this, _: &SelectAll, _, cx| {
-                this.selection.all(&this.ordered());
-                cx.notify();
-            }))
-            .on_action(cx.listener(|this, _: &Clear, _, cx| {
-                this.selection.clear();
-                this.context_position = None;
-                this.delete_targets.clear();
-                this.rename_target = None;
-                cx.notify();
-            }))
-            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
-                let delta = match event.keystroke.key.as_str() {
-                    "left" => -1,
-                    "right" => 1,
-                    "up" => {
-                        -((if this.settings.view == LibraryView::List {
-                            1
-                        } else {
-                            this.columns
-                        }) as isize)
-                    }
-                    "down" => {
-                        (if this.settings.view == LibraryView::List {
-                            1
-                        } else {
-                            this.columns
-                        }) as isize
-                    }
-                    _ => return,
-                };
-                cx.stop_propagation();
-                window.prevent_default();
-                this.move_selection(delta, event.keystroke.modifiers.shift, window, cx);
-            }));
+        let mut grid = crate::components::smooth_scroll(
+            div().id("library-clips"),
+            "library-smooth-scroll",
+            &self.scroll,
+            window,
+            cx,
+        )
+        .flex_1()
+        .min_h_0()
+        .overflow_y_scroll()
+        .key_context(CONTEXT)
+        .track_focus(&self.focus)
+        .flex()
+        .flex_col()
+        .gap(px(if list { 8. } else { GAP }))
+        .on_action(cx.listener(|this, _: &Play, _, cx| this.open(false, cx)))
+        .on_action(cx.listener(|this, _: &Edit, _, cx| this.open(true, cx)))
+        .on_action(cx.listener(|this, _: &Rename, window, cx| this.begin_rename(window, cx)))
+        .on_action(cx.listener(|this, _: &Delete, _, cx| this.confirm_delete(cx)))
+        .on_action(cx.listener(|this, _: &SelectAll, _, cx| {
+            this.selection.all(&this.ordered());
+            cx.notify();
+        }))
+        .on_action(cx.listener(|this, _: &Clear, _, cx| {
+            this.selection.clear();
+            this.context_position = None;
+            this.delete_targets.clear();
+            this.rename_target = None;
+            cx.notify();
+        }))
+        .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+            let delta = match event.keystroke.key.as_str() {
+                "left" => -1,
+                "right" => 1,
+                "up" => {
+                    -((if this.settings.view == LibraryView::List {
+                        1
+                    } else {
+                        this.columns
+                    }) as isize)
+                }
+                "down" => {
+                    (if this.settings.view == LibraryView::List {
+                        1
+                    } else {
+                        this.columns
+                    }) as isize
+                }
+                _ => return,
+            };
+            cx.stop_propagation();
+            window.prevent_default();
+            this.move_selection(delta, event.keystroke.modifiers.shift, window, cx);
+        }));
         if self.loading || self.duration_pending {
             grid = grid.child(empty_state(
                 &t,

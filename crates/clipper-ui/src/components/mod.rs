@@ -3,11 +3,13 @@
 
 mod dropdown;
 mod slider;
+mod smooth_scroll;
 mod text_input;
 mod toggle;
 mod tooltip;
 pub use dropdown::{DropdownOption, dropdown, step};
 pub use slider::slider;
+pub use smooth_scroll::smooth_scroll;
 pub use text_input::{TextInput, TextInputEvent};
 pub use toggle::toggle;
 pub use tooltip::tooltip;

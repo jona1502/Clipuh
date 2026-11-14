@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clipper_editor::{AudioTrack, EditSession, format_timestamp, parse_timestamp};
 use clipper_media::audio::WaveformSet;
@@ -99,7 +99,11 @@ pub struct ClipEditor {
     duration: Option<Duration>,
     /// The current player has loaded and accepts commands.
     ready: bool,
+    /// Authoritative position: last value reported by the player or set by
+    /// a seek. Edits (set in/out) and the time readout use it.
     position: Duration,
+    /// Drawn playhead: `position` interpolated between player updates.
+    playhead: playhead::PlayheadClock,
     playing: bool,
     ended: bool,
     error: Option<String>,
@@ -227,6 +231,7 @@ impl ClipEditor {
             duration: None,
             ready: false,
             position: Duration::ZERO,
+            playhead: playhead::PlayheadClock::default(),
             playing: false,
             ended: false,
             error: None,
@@ -449,6 +454,9 @@ impl ClipEditor {
                     PlaybackStep::Continue => {}
                     PlaybackStep::Seek(target) => {
                         self.pending_seek = Some(target);
+                        // Show the jump now instead of freezing until the
+                        // first frame after the seek arrives.
+                        self.playhead.jump(target, Instant::now());
                         if let Some(player) = &self.player {
                             player.seek(target);
                         }
@@ -461,6 +469,7 @@ impl ClipEditor {
                         self.playing = false;
                         self.ended = true;
                         self.position = end;
+                        self.playhead.stop(end);
                         cx.notify();
                         return;
                     }
@@ -487,25 +496,29 @@ impl ClipEditor {
                     self.position = self.position.min(duration);
                     player.seek(self.position);
                 }
+                self.playhead.stop(self.position);
             }
             PlayerEvent::Frame(frame) => {
-                self.position = frame.position;
+                self.set_reported_position(frame.position);
                 if let Some(image) = render_image(frame)
                     && let Some(old) = self.frame.replace(image)
                 {
                     let _ = window.drop_image(old);
                 }
             }
-            PlayerEvent::Position(position) => self.position = position,
+            PlayerEvent::Position(position) => self.set_reported_position(position),
             PlayerEvent::Playing(playing) => {
                 self.playing = playing;
                 if playing {
                     self.ended = false;
+                } else {
+                    self.playhead.stop(self.position);
                 }
             }
             PlayerEvent::Ended => {
                 self.playing = false;
                 self.ended = true;
+                self.playhead.stop(self.position);
             }
             PlayerEvent::AudioError(message) => {
                 self.notice = Some(format!("Audio preview: {message}").into());
@@ -514,9 +527,48 @@ impl ClipEditor {
                 self.ready = false;
                 self.error = Some(message);
                 self.playing = false;
+                self.playhead.stop(self.position);
             }
         }
         cx.notify();
+    }
+
+    /// A frame or position report from the player (the authoritative clock).
+    fn set_reported_position(&mut self, position: Duration) {
+        self.position = position;
+        if self.playing {
+            self.playhead.sync(position, Instant::now());
+        } else {
+            self.playhead.stop(position);
+        }
+    }
+
+    /// Playhead position to draw now (see [`playhead::PlayheadClock`]).
+    pub(super) fn playhead_position(&self) -> Duration {
+        let Some(duration) = self.duration else {
+            return self.position;
+        };
+        if !self.playing {
+            return self.position.min(duration);
+        }
+        let limit = self
+            .edits
+            .as_ref()
+            .and_then(|edits| {
+                edits
+                    .segments()
+                    .iter()
+                    .find(|s| self.position >= s.start && self.position < s.end)
+                    .map(|s| s.end)
+            })
+            .unwrap_or(duration)
+            .min(duration);
+        self.playhead.display(Instant::now(), limit)
+    }
+
+    /// While playing, the playhead moves every display refresh.
+    pub(super) fn playhead_animating(&self) -> bool {
+        self.playing && self.ready && self.playhead.is_running()
     }
 
     fn toggle_playback(&mut self, cx: &mut Context<Self>) {
@@ -529,6 +581,7 @@ impl ClipEditor {
         if self.playing {
             self.pending_seek = None;
             player.pause();
+            self.playhead.stop(self.position);
         } else {
             if let Some(edits) = &self.edits {
                 let start = if self.ended {
@@ -550,6 +603,8 @@ impl ClipEditor {
                 if let Some(start) = start {
                     self.pending_seek = Some(start);
                     player.seek(start);
+                    self.position = start;
+                    self.playhead.stop(start);
                 }
             }
             player.play();
@@ -569,6 +624,11 @@ impl ClipEditor {
         self.pending_seek = self.playing.then_some(position);
         player.seek(position);
         self.position = position;
+        if self.playing {
+            self.playhead.jump(position, Instant::now());
+        } else {
+            self.playhead.stop(position);
+        }
         self.ended = false;
         cx.notify();
     }
@@ -815,6 +875,7 @@ pub(super) fn empty(t: &Theme) -> Div {
 }
 
 mod audio;
+mod playhead;
 mod presentation;
 impl ClipEditor {
     fn export_status(&self, cx: &mut Context<Self>) -> Option<Div> {
