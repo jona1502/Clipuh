@@ -154,6 +154,23 @@ pub fn badge(t: &Theme, label: impl Into<SharedString>, tone: Tone) -> Div {
         .child(label.into())
 }
 
+/// One line of text cut off with an ellipsis.
+///
+/// Prefer this over `truncate()` for text whose container width is only known
+/// after layout (flex columns, grid cards). GPUI 0.2.2 caches a text's
+/// measured size keyed by its *wrap* width only; with `truncate()`
+/// (`white-space: nowrap`) that key is empty, so the first measurement wins:
+/// when the first layout probe offers a tiny width, the text stays "…" even
+/// after the real width is known. A one-line clamp keeps normal wrapping, so
+/// the available width is part of the key and the ellipsis is recomputed.
+pub trait SingleLine: Styled + Sized {
+    fn single_line(self) -> Self {
+        self.line_clamp(1).text_ellipsis()
+    }
+}
+
+impl<T: Styled> SingleLine for T {}
+
 /// Compact button. Disabled buttons keep their layout but drop hover and pointer.
 /// Callers attach `on_click` to the returned element.
 pub fn button(
@@ -563,4 +580,25 @@ pub fn divider(t: &Theme) -> Div {
 #[allow(dead_code)]
 pub fn vertical_divider(t: &Theme) -> Div {
     div().h_full().w(px(1.)).flex_none().bg(t.colors.border)
+}
+
+#[cfg(test)]
+mod single_line_tests {
+    use super::*;
+    use gpui::{Overflow, TextOverflow, WhiteSpace};
+
+    #[test]
+    fn single_line_clamps_without_nowrap() {
+        let mut element = div().single_line();
+        let style = element.style();
+        let text = style.text.clone().expect("text style");
+        assert_eq!(text.line_clamp, Some(1));
+        assert!(matches!(
+            text.text_overflow,
+            Some(TextOverflow::Truncate(_))
+        ));
+        // Keeps normal wrapping: the wrap width is what GPUI caches on.
+        assert_ne!(text.white_space, Some(WhiteSpace::Nowrap));
+        assert_eq!(style.overflow.x, Some(Overflow::Hidden));
+    }
 }
