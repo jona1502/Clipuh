@@ -12,7 +12,7 @@ the Rust workspace (no Cargo involvement in either direction).
 
 ## Commands
 
-Run from `/website` (Node >= 20, npm):
+Run from `/website` (Node >= 22.23.4, npm):
 
 | Command           | Purpose                                         |
 | ----------------- | ----------------------------------------------- |
@@ -68,4 +68,6 @@ Planned routes: `/features`, `/showcase`, `/download`, `/changelog`, `/docs`, `/
   (enables canonical URLs and later a sitemap).
 
 `IntegrationCheck.tsx` only proves the React integration works and is not used
-on any page; replace it with the first real island.
+on any page; replace it with the first real island. Because it is
+unreferenced, visitors download no JavaScript, but `dist/` still contains an
+unused React client chunk. That is expected until the first island lands.

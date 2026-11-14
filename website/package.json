@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Official clipuh website (Astro, static).",
   "engines": {
-    "node": ">=20"
+    "node": ">=22.23.4"
   },
   "scripts": {
     "dev": "astro dev",

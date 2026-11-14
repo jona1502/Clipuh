@@ -6,8 +6,11 @@
  * update or generate this file from it; components must only use the
  * semantic names below, never raw colors.
  *
+ * This is a subset of the app theme: SIDEBAR, SCRIM, NEUTRAL and RECORDING*
+ * are omitted for now.
+ *
  * Tailwind v4 turns every --color-* into utilities (bg-surface,
- * text-secondary, border-border, ...).
+ * text-text-secondary, border-border, ...).
  */
 @theme {
   /* Surfaces, darkest to lightest. Never pure black. */
@@ -22,6 +25,8 @@
   /* Text hierarchy. */
   --color-text: #ececf1;
   --color-text-secondary: #a0a0ab;
+  /* text-tertiary is for non-body/decorative use only: it fails WCAG AA for
+     small text on surfaces (~3.35:1 on surface). Use text-secondary for copy. */
   --color-text-tertiary: #6a6a75;
 
   /* Brand accent: user-customizable in the app, so always go through these. */
@@ -29,14 +34,16 @@
   --color-accent-hover: #9d8eff;
   --color-accent-subtle: #8c7bff24;
   --color-on-accent: #ffffff;
+  --color-focus-ring: #8c7bffaa;
 
   /* Status. */
   --color-success: #4ade80;
   --color-warning: #fbbf24;
   --color-danger: #f87171;
 
-  --font-sans:
-    "Inter", ui-sans-serif, system-ui, "Segoe UI", Roboto, sans-serif;
+  /* System stack only: no font is shipped yet. A self-hosted font comes with
+     the design phase. */
+  --font-sans: ui-sans-serif, system-ui, "Segoe UI", Roboto, sans-serif;
   --font-mono: ui-monospace, "Cascadia Code", "JetBrains Mono", monospace;
 
   --radius-surface: 0.75rem;
