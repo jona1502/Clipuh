@@ -117,6 +117,11 @@ pub struct Decor {
     pub ghost: bool,
     pub leading: Option<AnyElement>,
     pub chevron: Option<AnyElement>,
+    /// Second line under the value (e.g. the capture type of a source).
+    pub subtitle: Option<SharedString>,
+    /// Tall, accent-outlined trigger: the value is the card's focal point
+    /// (selected capture source).
+    pub panel: bool,
 }
 
 /// [`dropdown`] with a decorated trigger (see [`Decor`]).
@@ -170,6 +175,8 @@ fn styled_dropdown(
         ghost,
         leading,
         chevron,
+        subtitle,
+        panel,
     } = decor;
     let id: ElementId = id.into();
     let open = highlighted.is_some();
@@ -196,10 +203,15 @@ fn styled_dropdown(
             t.colors.focus_ring
         } else if ghost {
             gpui::transparent_black()
+        } else if panel {
+            t.colors.accent
         } else {
             t.colors.border
         })
         .when(!ghost, |this| this.bg(t.colors.surface_raised))
+        .when(panel, |this| {
+            this.h_auto().py_3().px_3().gap_3().rounded_lg()
+        })
         .text_sm()
         .when(ghost, |this| this.justify_center().gap_2().text_base())
         .text_color(t.colors.text)
@@ -215,13 +227,32 @@ fn styled_dropdown(
         })
         // Long labels (device names) truncate instead of spilling over
         // neighbouring controls; the full text is in the open menu.
-        .child(
-            div()
+        .child(match subtitle {
+            None => div()
                 .min_w_0()
                 .truncate()
                 .when(!ghost, |this| this.flex_1())
                 .child(label),
-        )
+            Some(subtitle) => div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .text_base()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .truncate()
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(t.colors.text_muted)
+                        .truncate()
+                        .child(subtitle),
+                ),
+        })
         .child(match chevron {
             Some(chevron) => chevron,
             None => icon(Icon::ChevronDown, px(12.))

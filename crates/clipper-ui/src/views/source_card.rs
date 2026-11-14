@@ -3,11 +3,12 @@
 
 use clipper_core::recording::{CaptureSource, RecorderCommand, SourceKind};
 use gpui::prelude::*;
-use gpui::{Context, Div, SharedString, Window, div};
+use gpui::{Context, Div, SharedString, Window, div, px};
 
 use super::{ClipperWindow, Confirm, Dismiss, SelectNext, SelectPrevious};
 use crate::components::{
-    ButtonVariant, DropdownOption, Icon, Tone, button, dropdown, icon_card, status_dot, step,
+    ButtonVariant, Decor, DropdownOption, Icon, Tone, button, button_with_icon, dropdown_decorated,
+    icon, icon_card, icon_tile, status_dot, step, tooltip,
 };
 use crate::state::{Phase, ReplayPhase, format_elapsed};
 use crate::theme::ActiveTheme;
@@ -142,42 +143,80 @@ impl ClipperWindow {
         }
     }
 
-    /// Left card of the Capture page.
+    /// Left card of the Capture page (capture.png): the selected source as a
+    /// prominent panel (the source menu's trigger), then Change Source next
+    /// to the manual Record button. Status and hints stay as short lines.
     pub(super) fn source_card(&self, window: &Window, cx: &mut Context<Self>) -> Div {
         let t = *cx.theme();
         let state = &self.recording;
         let enabled = state.settings_enabled();
-        let muted =
-            |text: SharedString| div().text_xs().text_color(t.colors.text_muted).child(text);
+        let muted = |text: SharedString| {
+            div()
+                .text_xs()
+                .text_color(t.colors.text_muted)
+                .truncate()
+                .child(text)
+        };
 
-        let refresh = button(
-            &t,
-            "refresh-sources",
-            "Refresh",
-            ButtonVariant::Ghost,
-            None,
-            enabled,
-        )
-        .when(enabled, |this| {
-            this.on_click(cx.listener(|this, _, _, cx| {
-                this.send(RecorderCommand::RefreshSources);
-                cx.notify();
-            }))
-        });
+        let refresh = div()
+            .id("refresh-sources")
+            .flex_none()
+            .size(px(32.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .text_color(t.colors.text_secondary)
+            .tooltip(tooltip("Refresh the list of displays and windows"))
+            .child(icon(Icon::Refresh, px(15.)))
+            .when(enabled, |this| {
+                this.cursor_pointer()
+                    .hover(|style| style.bg(t.colors.surface_hover).text_color(t.colors.text))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.send(RecorderCommand::RefreshSources);
+                        cx.notify();
+                    }))
+            })
+            .when(!enabled, |this| this.opacity(0.45));
 
-        // Source picker, or a hint when there is nothing to pick.
-        let picker = if state.sources.is_empty() {
-            muted("No sources found — open the game or window, then Refresh.".into())
+        let current = state.selected_source();
+        // The selected source, as the source menu's trigger.
+        let panel = if state.sources.is_empty() {
+            div()
+                .flex()
+                .items_center()
+                .gap_3()
+                .px_3()
+                .py_3()
+                .rounded_lg()
+                .border_1()
+                .border_color(t.colors.border)
+                .bg(t.colors.surface_raised)
+                .child(icon_tile(&t, Icon::Monitor, px(40.)))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(div().text_base().child("No sources found"))
+                        .child(muted("Open the game or window, then refresh.".into())),
+                )
                 .into_any_element()
         } else {
             let (options, selected) = self.source_options();
             let focus = &self.source_focus;
             let entity = cx.entity();
             let (on_toggle, on_select, on_dismiss) = (entity.clone(), entity.clone(), entity);
+            let kind_icon = match current.map(|s| s.kind) {
+                Some(SourceKind::Window) => Icon::Game,
+                _ => Icon::Monitor,
+            };
+            let subtitle = current.map_or("No source selected", |s| type_label(s.kind));
             div()
                 .relative()
                 .w_full()
-                .child(dropdown(
+                .child(dropdown_decorated(
                     &t,
                     "source-menu",
                     &options,
@@ -186,6 +225,12 @@ impl ClipperWindow {
                     focus,
                     focus.is_focused(window),
                     enabled,
+                    Decor {
+                        panel: true,
+                        leading: Some(icon_tile(&t, kind_icon, px(40.)).into_any_element()),
+                        subtitle: Some(subtitle.into()),
+                        ..Decor::default()
+                    },
                     move |_, app| on_toggle.update(app, |this, cx| this.source_toggle(cx)),
                     move |index, _, app| {
                         on_select.update(app, |this, cx| this.source_apply(index, cx))
@@ -199,15 +244,6 @@ impl ClipperWindow {
                 .into_any_element()
         };
 
-        let lock_note = if enabled {
-            None
-        } else if state.phase == Phase::Idle {
-            Some("Stop instant replay to change the source.")
-        } else {
-            Some("Stop the recording to change the source.")
-        };
-
-        let current = state.selected_source();
         let (status, tone) = source_status(
             state.phase,
             &state.replay.phase,
@@ -215,16 +251,73 @@ impl ClipperWindow {
             current.map(|s| s.name.as_str()),
             state.error.as_deref().or(state.replay.error.as_deref()),
         );
+        let lock_note = if enabled {
+            None
+        } else if state.phase == Phase::Idle {
+            Some("Stop instant replay to change the source.")
+        } else {
+            Some("Stop the recording to change the source.")
+        };
+        // One short line under the status: live recording stats, where the
+        // last recording went, why the source is locked, or why recording
+        // cannot start.
+        let detail: Option<String> = match (&state.phase, &state.finished) {
+            (Phase::Recording, _) => {
+                let s = &state.stats;
+                Some(format!(
+                    "{} · {:.0} fps · {} dropped",
+                    format_elapsed(s.elapsed),
+                    s.current_fps,
+                    s.frames_dropped
+                ))
+            }
+            (Phase::Idle, Some(finished)) => Some(format!(
+                "Recording saved: {}",
+                finished
+                    .path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            )),
+            _ => lock_note.map(str::to_owned),
+        };
 
+        let change = button_with_icon(
+            &t,
+            "change-source",
+            icon(Icon::Monitor, px(15.)).into_any_element(),
+            "Change Source",
+            ButtonVariant::Secondary,
+            enabled && !state.sources.is_empty(),
+        )
+        .flex_1()
+        .min_w_0()
+        .justify_center()
+        .when_some(lock_note, |this, note| this.tooltip(tooltip(note)))
+        .on_click(cx.listener(|this, _, window, cx| {
+            window.focus(&this.source_focus);
+            this.source_toggle(cx);
+        }));
+
+        // Manual recording keeps its own control next to Change Source.
         let (label, variant, button_enabled) = match state.phase {
-            Phase::Idle => ("Start recording", ButtonVariant::Primary, state.can_start()),
+            Phase::Idle => ("Record", ButtonVariant::Primary, state.can_start()),
             Phase::Starting => ("Starting…", ButtonVariant::Primary, false),
-            Phase::Recording => ("Stop recording", ButtonVariant::Danger, state.can_stop()),
+            Phase::Recording => ("Stop", ButtonVariant::Danger, state.can_stop()),
             Phase::Stopping => ("Saving…", ButtonVariant::Danger, false),
         };
         let stop = state.phase == Phase::Recording;
+        let hint = (state.phase == Phase::Idle)
+            .then(|| state.start_hint())
+            .flatten()
+            .unwrap_or(if stop {
+                "Stop and save the recording"
+            } else {
+                "Record the selected source to a file"
+            });
         let record = button(&t, "record-toggle", label, variant, None, button_enabled)
-            .w_full()
+            .flex_none()
+            .tooltip(tooltip(hint))
             .when(button_enabled, |this| {
                 this.on_click(cx.listener(move |this, _, _, cx| {
                     if stop {
@@ -237,35 +330,6 @@ impl ClipperWindow {
                     cx.notify();
                 }))
             });
-        let live = (state.phase == Phase::Recording).then(|| {
-            let s = &state.stats;
-            muted(
-                format!(
-                    "{} · {:.0} fps · {} dropped",
-                    format_elapsed(s.elapsed),
-                    s.current_fps,
-                    s.frames_dropped
-                )
-                .into(),
-            )
-        });
-
-        // Below the button: why it can't record, or where the last recording went.
-        let after = match (&state.phase, &state.finished) {
-            (Phase::Idle, Some(finished)) => Some(muted(
-                format!(
-                    "Recording saved: {}",
-                    finished
-                        .path
-                        .file_name()
-                        .map(|name| name.to_string_lossy().into_owned())
-                        .unwrap_or_default()
-                )
-                .into(),
-            )),
-            (Phase::Idle, None) => state.start_hint().map(|hint| muted(hint.into())),
-            _ => None,
-        };
 
         icon_card(
             &t,
@@ -274,35 +338,35 @@ impl ClipperWindow {
             "Select what to capture.",
             Some(refresh.into_any_element()),
         )
-        .h_full()
-        .justify_between()
+        .child(panel)
         .child(
             div()
                 .flex()
                 .flex_col()
-                .gap_2()
-                .child(muted("Select what to capture.".into()))
-                .child(picker)
-                .children(lock_note.map(|note| muted(note.into())))
-                .children(current.map(|s| muted(type_label(s.kind).into())))
+                .gap_1()
                 .child(
                     div()
                         .flex()
                         .items_center()
                         .gap_2()
+                        .min_w_0()
                         .text_sm()
                         .child(status_dot(&t, tone))
-                        .child(status),
-                ),
+                        .child(div().min_w_0().truncate().child(status)),
+                )
+                .children(detail.map(|text| muted(text.into()))),
         )
+        // Bottom-aligned like the other two cards' bottom controls.
+        // The bottom control's wrapper takes the card's spare height and
+        // keeps the control at its end, so all three cards' bottom controls
+        // line up (no extra spacer child: that over-measured the row).
         .child(
             div()
+                .flex_grow()
                 .flex()
                 .flex_col()
-                .gap_2()
-                .child(record)
-                .children(live)
-                .children(after),
+                .justify_end()
+                .child(div().flex().gap_2().child(change).child(record)),
         )
     }
 }

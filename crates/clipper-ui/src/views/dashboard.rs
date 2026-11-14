@@ -3,7 +3,7 @@ use clipper_core::recording::{
 };
 use clipper_storage::{VIDEO_FPS, VIDEO_RESOLUTIONS, video_mode_supported};
 use gpui::prelude::*;
-use gpui::{Context, Div, Window, div, px};
+use gpui::{Context, Div, Window, div};
 
 use super::{CaptureMenu, ClipperWindow};
 use crate::components::{ButtonVariant, DropdownOption, Tone, button, panel, status_dot, step};
@@ -16,17 +16,9 @@ pub(super) fn content(
     cx: &mut Context<ClipperWindow>,
 ) -> Div {
     let t = *cx.theme();
-    // Three equal cards in one row; each stretches to the tallest so their
-    // edges line up. Below 3 x MIN_CARD_WIDTH they wrap instead of squeezing.
-    let card = |content: Div| {
-        div()
-            .flex_1()
-            .flex_basis(px(0.))
-            .min_w(px(MIN_CARD_WIDTH))
-            .flex()
-            .flex_col()
-            .child(content.flex_1())
-    };
+    // Three equal columns; the grid row is as tall as the tallest card and
+    // stretches the others, whose spacers push their bottom controls to the
+    // shared bottom edge (capture.png).
     div()
         .flex()
         .flex_col()
@@ -39,21 +31,22 @@ pub(super) fn content(
                 .map(|message| error_banner(message, cx)),
         )
         .child(
+            // A grid sizes its columns first and the cards at their real
+            // width; a flex row measured them at zero basis and reserved
+            // empty height under all three. The 1080 px minimum window still
+            // gives each column more than MIN_CARD_WIDTH.
             div()
-                .flex()
-                .flex_wrap()
+                .grid()
+                .grid_cols(3)
                 .gap(t.metrics.gap * 2.)
-                .child(card(window.source_card(win, cx)))
-                .child(card(window.storage_card(win, cx)))
-                .child(card(window.recent_card(cx))),
+                .child(window.source_card(win, cx))
+                .child(window.storage_card(win, cx))
+                .child(window.recent_card(win, cx)),
         )
         // The audio mixer region: today's working audio controls live here
         // until the Phase 4 mixer replaces them in place.
         .child(super::audio::content(window, cx))
 }
-
-/// Narrowest a dashboard card gets before the row wraps.
-const MIN_CARD_WIDTH: f32 = 240.0;
 
 pub(super) fn error_banner(message: String, cx: &mut Context<ClipperWindow>) -> Div {
     let t = *cx.theme();

@@ -301,6 +301,8 @@ pub struct ClipperWindow {
     storage: StorageStatus,
     /// Highlighted row while the Capture page's source menu is open.
     source_menu: Option<usize>,
+    /// Recent Clips row whose ⋯ menu is open (index into the shown rows).
+    recent_menu: Option<usize>,
     source_focus: FocusHandle,
     /// Latest clips in the recordings folder for the Capture page.
     library: Entity<clips::ClipLibrary>,
@@ -606,6 +608,7 @@ impl ClipperWindow {
             active_video: None,
             storage: StorageStatus::Unknown,
             source_menu: None,
+            recent_menu: None,
             // First control of the Capture page, after the capture bar (4-8).
             source_focus: cx.focus_handle().tab_index(9).tab_stop(true),
             library,
