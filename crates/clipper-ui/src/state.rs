@@ -817,6 +817,38 @@ mod tests {
     }
 
     #[test]
+    fn saves_ending_during_stop_neither_hold_nor_revive_it() {
+        let mut s = state_with_source();
+        s.replay.begin_start();
+        s.apply(RecorderEvent::ReplayStarted {
+            encoder: "hw".into(),
+        });
+        s.apply(RecorderEvent::ReplaySaving);
+        s.apply(RecorderEvent::ReplaySaving);
+        s.replay.begin_stop();
+        let path = PathBuf::from("a.mp4");
+        s.apply(RecorderEvent::ReplaySaved {
+            path: path.clone(),
+            duration: Duration::from_secs(30),
+        });
+        s.apply(RecorderEvent::ReplaySaveFailed {
+            message: "disk full".into(),
+        });
+        assert_eq!(s.replay.phase, ReplayPhase::Stopping);
+        assert_eq!(s.saved_clips[0].path, path);
+        s.apply(RecorderEvent::ReplayStopped { error: None });
+        assert!(s.replay.is_off());
+        // A save finishing after the stop changes nothing, and replay restarts.
+        s.apply(RecorderEvent::ReplaySaved {
+            path: PathBuf::from("b.mp4"),
+            duration: Duration::from_secs(30),
+        });
+        assert!(s.replay.is_off() && s.can_start_replay());
+        s.replay.begin_start();
+        assert_eq!(s.replay.phase, ReplayPhase::Starting);
+    }
+
+    #[test]
     fn replay_stop_with_error_shows_it_and_goes_off() {
         let mut s = state_with_source();
         s.replay.begin_start();
