@@ -54,9 +54,37 @@ const CATEGORY_INDENT: f32 = 30.0;
 /// Free space below this on the chosen clip folder gets a warning.
 const LOW_SPACE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
+/// Imports a picked sound. MP3 files (and WAVs the strict PCM check rejects,
+/// e.g. 32-bit float) are decoded with Media Foundation into a 16-bit WAV
+/// first; both then use clipper-storage's validated, atomic import. The
+/// source file is only read. Blocking: call off the UI thread.
+fn import_sound_file(path: &Path) -> Result<PathBuf, String> {
+    use clipper_media::notification_sound as decode;
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase);
+    let decoded = || -> Result<PathBuf, String> {
+        let wav = decode::decode_to_wav(path).map_err(|error| error.to_string())?;
+        clipper_storage::import_notification_wav_bytes(path, &wav)
+            .map_err(|error| error.to_string())
+    };
+    match extension.as_deref() {
+        Some("mp3") => decoded(),
+        Some("wav") => match clipper_storage::import_notification_sound(path) {
+            Ok(stored) => Ok(stored),
+            Err(clipper_storage::NotificationSoundError::Invalid(reason)) => {
+                decoded().map_err(|_| reason.to_owned())
+            }
+            Err(error) => Err(error.to_string()),
+        },
+        _ => Err("Choose a WAV or MP3 file.".into()),
+    }
+}
+
 fn sound_file_label(path: Option<&Path>) -> String {
     match path {
-        None => "Default Windows sound".into(),
+        None => "Default · clipuh Synth Check".into(),
         Some(path) => path
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
@@ -835,18 +863,14 @@ impl ClipperWindow {
             files: true,
             directories: false,
             multiple: false,
-            prompt: Some("Import notification WAV".into()),
+            prompt: Some("Import notification sound".into()),
         });
         cx.spawn_in(window, async move |this, cx| {
             let result = match paths.await {
                 Ok(Ok(Some(mut paths))) => match paths.pop() {
                     Some(path) => {
-                        cx.background_spawn(async move {
-                            clipper_storage::import_notification_sound(&path)
-                                .map(Some)
-                                .map_err(|error| error.to_string())
-                        })
-                        .await
+                        cx.background_spawn(async move { import_sound_file(&path).map(Some) })
+                            .await
                     }
                     None => Ok(None),
                 },
@@ -1802,7 +1826,7 @@ impl ClipperWindow {
             .child(div().flex().flex_wrap().items_center().gap_2().child(default).child(import).child(preview))
             .child(div().id("notification-sound-selection").min_w_0().text_sm().text_color(t.colors.text_secondary)
                 .truncate().tooltip(tooltip(selected.clone())).child(selected))
-            .child(note(t, "For saved clips and notification alerts. WAV: PCM 8/16-bit, mono/stereo, up to 10 seconds and 5 MiB. Imported into clipuh; Preview plays even when automatic sounds are off."))
+            .child(note(t, "Plays after a clip is saved; failed saves play the system error sound. WAV or MP3, up to 10 seconds. Imported into clipuh; Preview plays even when automatic sounds are off."))
             .children(self.notification_sound_notice.clone().map(|message| note(t, message)))
     }
 
@@ -2289,7 +2313,14 @@ mod tests {
 
     #[test]
     fn sound_selection_label_shows_filename_without_exposing_folders() {
-        assert_eq!(sound_file_label(None), "Default Windows sound");
+        assert_eq!(sound_file_label(None), "Default · clipuh Synth Check");
+        // Formats Windows cannot decode are refused before anything is read.
+        for name in ["chime.ogg", "chime.flac", "chime"] {
+            assert_eq!(
+                import_sound_file(Path::new(name)).unwrap_err(),
+                "Choose a WAV or MP3 file."
+            );
+        }
         assert_eq!(
             sound_file_label(Some(Path::new("C:/Users/private/sounds/Clip ready.wav"))),
             "Clip ready.wav"

@@ -1,12 +1,14 @@
 # Notification sounds
 
-Settings keeps the existing notification and sound switches. The selected sound is either the Windows default notification sound or an imported custom WAV. Preview is an explicit user action; notification playback continues to obey notification preferences.
+Settings keeps the existing notification and sound switches. The clip-saved sound is either clipuh's default sound or an imported custom sound. Preview is an explicit user action; notification playback continues to obey notification preferences.
 
-Imports are validated and copied into clipuh-managed storage so moving the original file does not break the selection. Supported imports are RIFF/WAVE PCM, 8-bit or 16-bit, mono or stereo, 8–192 kHz, no longer than 10 seconds, and no larger than 5 MiB. Unsupported or malformed files leave the prior selection intact. Existing configurations retain the Windows default.
+The default sound is `assets/sounds/clipuh_05_synth_check.wav`, the approved file, unmodified. It is embedded in the executable, so it works offline and needs no installed files. If a selected custom file is unavailable or Windows cannot play it, the default plays instead; the Windows system sound is only the last resort when even the bundled sound cannot play.
 
-Playback is dispatched outside GPUI through a bounded worker using native Windows sound APIs. It does not run on capture, encoder, or replay export threads. Progress feedback stays silent. Replay clip completion and completed manual recordings use the chosen sound. App playback replaces native balloon audio so background notices do not produce two dings. If a selected custom file is unavailable or Windows cannot play it, playback falls back to the system default. Sounds do not overlap: requests made while a custom sound plays are discarded, and rapid requests within 500 ms are suppressed. Imported managed copies are retained when switching back to Default; original files are never removed.
+The clip-saved sound plays only when a clip was saved and finalised (the recorder's `ReplaySaved` event) and for completed manual recordings. Pressing the hotkey, a queued save and the "Saving…" toast are silent. A failed save plays the system error sound instead, never the clip-saved sound.
 
-The supplied request ended at the Project heading. Scope therefore follows the explicit default/custom selection requirement, with file import, preview and persistence. The untracked `clipuh_05_synth_check.wav` in the original checkout is not incorporated without the user's choice about making it the bundled default.
+Imports accept WAV and MP3. MP3 files, and WAVs that are not plain PCM (for example 32-bit float), are decoded with Media Foundation (the decoder the editor uses) into a 16-bit 48 kHz stereo WAV first: at most 10 seconds, not silent, peaks limited to -1 dBFS and never amplified. OGG is not offered because Windows has no built-in Vorbis decoder. Every import is then validated and copied into clipuh-managed storage (PCM 8/16-bit, mono or stereo, 8–192 kHz, at most 10 seconds and 5 MiB), so moving the original file does not break the selection. Unsupported or malformed files leave the prior selection intact. Existing configurations get the clipuh default sound.
+
+Playback is dispatched outside GPUI through a bounded worker using native Windows sound APIs. It does not run on capture, encoder, or replay export threads. App playback replaces native balloon audio so background notices do not produce two dings. Sounds do not overlap: requests made while a sound plays are discarded, and rapid requests within 500 ms are suppressed. Imported managed copies are retained when switching back to Default; original files are never removed.
 
 ## Verification
 
