@@ -22,7 +22,8 @@ impl Render for ClipEditor {
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .font_weight(FontWeight::MEDIUM)
+                    .text_lg()
+                    .font_weight(FontWeight::SEMIBOLD)
                     .child(file_name(&self.path)),
             )
             .child(muted(&t).child("Non-destructive edits"))
@@ -157,34 +158,41 @@ impl Render for ClipEditor {
                 .child(preview.h(px(0.)).flex_1().min_h_0())
                 .child(div().p_3().child(controls));
         }
-        let tabs = div().flex().w_full().gap_1().children(
-            ["Trim", "Effects", "Audio", "Text", "Export"]
-                .into_iter()
-                .enumerate()
-                .map(|(i, label)| {
-                    button(
-                        &t,
-                        ("editor-tab", i),
-                        label,
-                        if self.tab == i {
-                            ButtonVariant::Primary
-                        } else {
-                            ButtonVariant::Ghost
-                        },
-                        None,
-                        true,
-                    )
-                    .flex_1()
-                    .min_w_0()
-                    .px_1()
-                    .justify_center()
-                    .text_size(px(11.))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.tab = i;
-                        cx.notify();
-                    }))
-                }),
-        );
+        let tabs = div()
+            .flex()
+            .w_full()
+            .gap_1()
+            .p_1()
+            .rounded_lg()
+            .bg(t.colors.surface_raised)
+            .children(
+                ["Trim", "Effects", "Audio", "Text", "Export"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, label)| {
+                        button(
+                            &t,
+                            ("editor-tab", i),
+                            label,
+                            if self.tab == i {
+                                ButtonVariant::Primary
+                            } else {
+                                ButtonVariant::Ghost
+                            },
+                            None,
+                            true,
+                        )
+                        .flex_1()
+                        .min_w_0()
+                        .px_1()
+                        .justify_center()
+                        .text_size(px(11.))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.tab = i;
+                            cx.notify();
+                        }))
+                    }),
+            );
         let mut inspector = panel(&t)
             .w(relative(0.30))
             .min_w(px(290.))
@@ -585,10 +593,10 @@ impl ClipEditor {
                 .bottom_0()
                 .left(relative(fraction(self.position, duration)))
                 .w(px(2.))
-                .bg(t.colors.text),
+                .bg(t.colors.accent),
         );
         let mut labels = div()
-            .w(px(224.))
+            .w(px(300.))
             .flex_shrink_0()
             .flex()
             .flex_col()

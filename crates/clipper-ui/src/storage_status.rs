@@ -54,11 +54,7 @@ impl VolumeUsage {
 
     pub fn used_label(&self) -> String {
         let used = self.total_bytes.saturating_sub(self.free_bytes);
-        format!(
-            "{} of {} used",
-            fmt_bytes(used),
-            fmt_bytes(self.total_bytes)
-        )
+        format!("{} / {}", fmt_bytes(used), fmt_bytes(self.total_bytes))
     }
 }
 
@@ -102,7 +98,7 @@ mod tests {
             total_bytes: TB,
             free_bytes: TB - 412 * GB,
         };
-        assert_eq!(u.used_label(), "412 GB of 1.0 TB used");
+        assert_eq!(u.used_label(), "412 GB / 1.0 TB");
         assert_eq!(u.free_label(), "612 GB free");
     }
 

@@ -8,14 +8,16 @@ use gpui::prelude::*;
 use gpui::{AnyElement, Context, Div, FontWeight, SharedString, Stateful, Window, div, px};
 
 use super::{CaptureMenu, ClipperWindow, Confirm, Dismiss, Page, SelectNext, SelectPrevious};
-use crate::components::{dropdown, toggle, tooltip, vertical_divider};
+use crate::components::{Icon, dropdown_ghost, icon, icon_tile, toggle, tooltip, vertical_divider};
 use crate::state::{Phase, ReplayPhase};
 use crate::theme::{ActiveTheme, Theme};
 
-/// Height of the bar; tall enough for the two-line source label.
-pub(super) const BAR_HEIGHT: f32 = 56.0;
-/// Width of each dropdown trigger.
-const MENU_WIDTH: f32 = 92.0;
+/// Height of the bar; tall enough for the source tile and two-line label.
+pub(super) const BAR_HEIGHT: f32 = 72.0;
+/// Narrowest a dropdown slot gets; slots share the remaining width.
+const MENU_WIDTH: f32 = 84.0;
+/// Horizontal inset of the bar and of page content from the window edges.
+pub(super) const PAGE_GUTTER: f32 = 24.0;
 
 /// What the bar shows for the capture source.
 #[derive(Debug, PartialEq, Eq)]
@@ -70,34 +72,41 @@ impl ClipperWindow {
         ]
         .map(|menu| self.bar_menu(&t, menu, window, cx));
 
+        // A rounded card above every page, controls spread evenly between
+        // dividers like the references.
         div()
             .id("capture-bar")
             .h(px(BAR_HEIGHT))
             .flex_none()
-            .px_4()
+            .mx(px(PAGE_GUTTER))
+            .mt_4()
+            .px_3()
             .flex()
             .flex_row()
             .flex_nowrap()
             .items_center()
             .gap(t.metrics.gap)
-            .border_b_1()
+            .rounded_xl()
+            .border_1()
             .border_color(t.colors.border)
-            .bg(t.colors.background)
+            .bg(t.colors.surface)
             .child(self.bar_source(&t, cx))
-            .child(vertical_divider(&t).h(px(28.)))
+            .child(vertical_divider(&t).h(px(36.)))
             .children(menus.into_iter().flat_map(|menu| {
                 [
                     menu.into_any_element(),
-                    vertical_divider(&t).h(px(28.)).into_any_element(),
+                    vertical_divider(&t).h(px(36.)).into_any_element(),
                 ]
             }))
             .child(
                 div()
-                    .flex_none()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .flex()
+                    .justify_center()
                     .child(self.hotkey_bar_control(&t, window, cx)),
             )
-            .child(div().flex_1().min_w(px(0.)))
-            .child(vertical_divider(&t).h(px(28.)))
+            .child(vertical_divider(&t).h(px(36.)))
             .child(self.bar_replay(&t, window, cx))
     }
 
@@ -115,41 +124,57 @@ impl ClipperWindow {
         } else {
             label.method
         };
+        let kind_icon = match selected.map(|(kind, _)| kind) {
+            Some(SourceKind::Window) => Icon::Game,
+            _ => Icon::Monitor,
+        };
         div()
             .id("capture-bar-source")
             .flex_shrink()
-            .min_w(px(96.))
-            .max_w(px(220.))
+            .min_w(px(110.))
+            .max_w(px(300.))
+            .flex()
+            .items_center()
+            .gap_3()
             .px_2()
             .py_1()
-            .rounded_md()
+            .rounded_lg()
             .cursor_pointer()
             .hover(|style| style.bg(t.colors.surface_hover))
             .tooltip(tooltip("Choose the capture source on the Capture page"))
             .on_click(cx.listener(|this, _, window, cx| this.navigate(Page::Dashboard, window, cx)))
+            .child(icon_tile(t, kind_icon, px(44.)))
             .child(
                 div()
-                    .text_sm()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(if label.missing {
-                        t.colors.warning
-                    } else {
-                        t.colors.text
-                    })
-                    .truncate()
-                    .child(label.name),
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .text_base()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(if label.missing {
+                                t.colors.warning
+                            } else {
+                                t.colors.text
+                            })
+                            .truncate()
+                            .child(label.name),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(if recording {
+                                t.colors.recording
+                            } else {
+                                t.colors.text_muted
+                            })
+                            .truncate()
+                            .child(method),
+                    ),
             )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(if recording {
-                        t.colors.recording
-                    } else {
-                        t.colors.text_muted
-                    })
-                    .truncate()
-                    .child(method),
-            )
+            .child(icon(Icon::ChevronDown, px(12.)).text_color(t.colors.text_muted))
             .into_any_element()
     }
 
@@ -170,7 +195,7 @@ impl ClipperWindow {
         let pending = self.capture_pending(menu);
         let entity = cx.entity();
         let (on_toggle, on_select, on_dismiss) = (entity.clone(), entity.clone(), entity);
-        let trigger = dropdown(
+        let trigger = dropdown_ghost(
             t,
             ("capture-bar-menu", menu as usize),
             &options,
@@ -188,8 +213,8 @@ impl ClipperWindow {
         div()
             .id(("capture-bar-slot", menu as usize))
             .relative()
-            .flex_none()
-            .w(px(MENU_WIDTH))
+            .flex_1()
+            .min_w(px(MENU_WIDTH))
             .child(trigger)
             // A changed resolution or frame rate only takes effect when replay
             // or recording restarts; say so instead of implying it is live.
@@ -251,10 +276,13 @@ impl ClipperWindow {
             .tooltip(tooltip(hint))
             .child(
                 div()
-                    .text_sm()
+                    .text_base()
+                    .font_weight(FontWeight::MEDIUM)
                     .whitespace_nowrap()
                     .text_color(if failed {
                         t.colors.danger
+                    } else if replay.is_running() {
+                        t.colors.success
                     } else if on {
                         t.colors.text
                     } else {
