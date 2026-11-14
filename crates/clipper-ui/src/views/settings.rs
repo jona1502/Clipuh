@@ -1804,6 +1804,13 @@ pub(super) fn content(
 ) -> Div {
     let t = *cx.theme();
     let show_nav = win.viewport_size().width >= px(NAV_MIN_VIEWPORT);
+    let scroll = crate::components::smooth_scroll(
+        div().id("settings-scroll"),
+        "settings-smooth-scroll",
+        &window.settings_scroll,
+        win,
+        cx,
+    );
     let grid = div()
         .flex()
         .flex_col()
@@ -1854,13 +1861,11 @@ pub(super) fn content(
                 .gap(t.metrics.gap * 2.)
                 .when(show_nav, |this| this.child(window.section_nav(&t, win, cx)))
                 .child(
-                    div()
-                        .id("settings-scroll")
+                    scroll
                         .flex_1()
                         .min_w_0()
                         .h_full()
                         .overflow_y_scroll()
-                        .track_scroll(&window.settings_scroll)
                         .child(grid.pb_4()),
                 ),
         )

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clipper_editor::{AudioTrack, EditSession, format_timestamp, parse_timestamp};
 use clipper_media::audio::WaveformSet;
@@ -99,7 +99,15 @@ pub struct ClipEditor {
     duration: Option<Duration>,
     /// The current player has loaded and accepts commands.
     ready: bool,
+    /// Authoritative position: last value reported by the player or set by
+    /// a seek. Edits (set in/out) and the time readout use it.
     position: Duration,
+    /// Drawn playhead: `position` interpolated between player updates.
+    playhead: playhead::PlayheadClock,
+    /// Playhead x (px from the timeline origin) in the last rendered frame.
+    playhead_drawn_x: Cell<f32>,
+    /// A vsync check for the playhead is queued (at most one at a time).
+    playhead_frame_queued: Cell<bool>,
     playing: bool,
     ended: bool,
     error: Option<String>,
@@ -121,6 +129,8 @@ pub struct ClipEditor {
     audio_metadata: Option<Vec<AudioTrack>>,
     last_audio_mix: Option<Vec<AudioTrack>>,
     waveforms: Option<Arc<WaveformSet>>,
+    /// Column peaks of the drawn waveforms (see `audio::PeakCache`).
+    waveform_peaks: Rc<std::cell::RefCell<audio::PeakCache>>,
     waveform_task: Option<Task<()>>,
     waveform_error: Option<String>,
     audio_start_input: Entity<TextInput>,
@@ -227,6 +237,9 @@ impl ClipEditor {
             duration: None,
             ready: false,
             position: Duration::ZERO,
+            playhead: playhead::PlayheadClock::default(),
+            playhead_drawn_x: Cell::new(0.),
+            playhead_frame_queued: Cell::new(false),
             playing: false,
             ended: false,
             error: None,
@@ -248,6 +261,7 @@ impl ClipEditor {
             audio_metadata: None,
             last_audio_mix: None,
             waveforms: None,
+            waveform_peaks: Rc::default(),
             waveform_task: None,
             waveform_error: None,
             audio_start_input,
@@ -449,6 +463,9 @@ impl ClipEditor {
                     PlaybackStep::Continue => {}
                     PlaybackStep::Seek(target) => {
                         self.pending_seek = Some(target);
+                        // Show the jump now instead of freezing until the
+                        // first frame after the seek arrives.
+                        self.playhead.jump(target, Instant::now());
                         if let Some(player) = &self.player {
                             player.seek(target);
                         }
@@ -461,6 +478,7 @@ impl ClipEditor {
                         self.playing = false;
                         self.ended = true;
                         self.position = end;
+                        self.playhead.stop(end);
                         cx.notify();
                         return;
                     }
@@ -487,25 +505,29 @@ impl ClipEditor {
                     self.position = self.position.min(duration);
                     player.seek(self.position);
                 }
+                self.playhead.stop(self.position);
             }
             PlayerEvent::Frame(frame) => {
-                self.position = frame.position;
+                self.set_reported_position(frame.position);
                 if let Some(image) = render_image(frame)
                     && let Some(old) = self.frame.replace(image)
                 {
                     let _ = window.drop_image(old);
                 }
             }
-            PlayerEvent::Position(position) => self.position = position,
+            PlayerEvent::Position(position) => self.set_reported_position(position),
             PlayerEvent::Playing(playing) => {
                 self.playing = playing;
                 if playing {
                     self.ended = false;
+                } else {
+                    self.playhead.stop(self.position);
                 }
             }
             PlayerEvent::Ended => {
                 self.playing = false;
                 self.ended = true;
+                self.playhead.stop(self.position);
             }
             PlayerEvent::AudioError(message) => {
                 self.notice = Some(format!("Audio preview: {message}").into());
@@ -514,9 +536,89 @@ impl ClipEditor {
                 self.ready = false;
                 self.error = Some(message);
                 self.playing = false;
+                self.playhead.stop(self.position);
             }
         }
         cx.notify();
+    }
+
+    /// A frame or position report from the player (the authoritative clock).
+    fn set_reported_position(&mut self, position: Duration) {
+        self.position = position;
+        if self.playing {
+            self.playhead.sync(position, Instant::now());
+        } else {
+            self.playhead.stop(position);
+        }
+    }
+
+    /// Playhead position to draw now (see [`playhead::PlayheadClock`]).
+    /// Records the drawn x for [`Self::queue_playhead_frame`].
+    pub(super) fn playhead_position(&self) -> Duration {
+        let position = self.playhead_at(false);
+        if let Some(duration) = self.duration {
+            self.playhead_drawn_x
+                .set(self.playhead_x(position, duration));
+        }
+        position
+    }
+
+    fn playhead_x(&self, position: Duration, duration: Duration) -> f32 {
+        f32::from(self.timeline.get().size.width) * fraction(position, duration)
+    }
+
+    fn playhead_at(&self, peek: bool) -> Duration {
+        let Some(duration) = self.duration else {
+            return self.position;
+        };
+        if !self.playing {
+            return self.position.min(duration);
+        }
+        let limit = self
+            .edits
+            .as_ref()
+            .and_then(|edits| {
+                edits
+                    .segments()
+                    .iter()
+                    .find(|s| self.position >= s.start && self.position < s.end)
+                    .map(|s| s.end)
+            })
+            .unwrap_or(duration)
+            .min(duration);
+        if peek {
+            self.playhead.peek(Instant::now(), limit)
+        } else {
+            self.playhead.display(Instant::now(), limit)
+        }
+    }
+
+    /// While playing, checks once per display refresh whether the playhead
+    /// moved far enough to be visible (half a pixel) and only then redraws.
+    /// At low zoom the line moves a fraction of a pixel per refresh, so most
+    /// refreshes cost nothing; at high zoom it redraws every refresh.
+    pub(super) fn queue_playhead_frame(&self, window: &Window, cx: &mut Context<Self>) {
+        if !self.playhead_animating() || self.playhead_frame_queued.replace(true) {
+            return;
+        }
+        let editor = cx.entity().downgrade();
+        window.on_next_frame(move |window, cx| playhead_frame(editor, window, cx));
+    }
+
+    /// `Some(true)`: redraw now; `Some(false)`: check again next refresh;
+    /// `None`: not playing any more.
+    fn playhead_moved(&self) -> Option<bool> {
+        if !self.playhead_animating() {
+            return None;
+        }
+        let duration = self.duration?;
+        let x = self.playhead_x(self.playhead_at(true), duration);
+        Some((x - self.playhead_drawn_x.get()).abs() >= PLAYHEAD_MIN_STEP_PX)
+    }
+
+    /// While playing, the playhead moves every display refresh.
+    pub(super) fn playhead_animating(&self) -> bool {
+        self.playing && self.ready && self.playhead.is_running()
     }
 
     fn toggle_playback(&mut self, cx: &mut Context<Self>) {
@@ -529,6 +631,7 @@ impl ClipEditor {
         if self.playing {
             self.pending_seek = None;
             player.pause();
+            self.playhead.stop(self.position);
         } else {
             if let Some(edits) = &self.edits {
                 let start = if self.ended {
@@ -550,6 +653,8 @@ impl ClipEditor {
                 if let Some(start) = start {
                     self.pending_seek = Some(start);
                     player.seek(start);
+                    self.position = start;
+                    self.playhead.stop(start);
                 }
             }
             player.play();
@@ -569,6 +674,11 @@ impl ClipEditor {
         self.pending_seek = self.playing.then_some(position);
         player.seek(position);
         self.position = position;
+        if self.playing {
+            self.playhead.jump(position, Instant::now());
+        } else {
+            self.playhead.stop(position);
+        }
         self.ended = false;
         cx.notify();
     }
@@ -786,6 +896,25 @@ fn position_fraction(x: Pixels, bounds: Bounds<Pixels>) -> f32 {
     (f32::from(x - bounds.origin.x) / width).clamp(0.0, 1.0)
 }
 
+/// Smallest playhead movement worth a redraw, in logical pixels.
+const PLAYHEAD_MIN_STEP_PX: f32 = 0.5;
+
+fn playhead_frame(editor: gpui::WeakEntity<ClipEditor>, window: &mut Window, cx: &mut gpui::App) {
+    let Some(editor) = editor.upgrade() else {
+        return;
+    };
+    let moved = editor.update(cx, |this, _| {
+        this.playhead_frame_queued.set(false);
+        this.playhead_moved()
+    });
+    match moved {
+        // Rendering queues the next check.
+        Some(true) => editor.update(cx, |_, cx| cx.notify()),
+        Some(false) => editor.update(cx, |this, cx| this.queue_playhead_frame(window, cx)),
+        None => {}
+    }
+}
+
 fn fraction(at: Duration, duration: Duration) -> f32 {
     if duration.is_zero() {
         0.0
@@ -815,6 +944,7 @@ pub(super) fn empty(t: &Theme) -> Div {
 }
 
 mod audio;
+mod playhead;
 mod presentation;
 impl ClipEditor {
     fn export_status(&self, cx: &mut Context<Self>) -> Option<Div> {

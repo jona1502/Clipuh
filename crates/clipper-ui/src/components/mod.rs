@@ -4,12 +4,14 @@
 mod dropdown;
 mod icon;
 mod slider;
+mod smooth_scroll;
 mod text_input;
 mod toggle;
 mod tooltip;
 pub use dropdown::{DropdownOption, dropdown, dropdown_ghost, step};
 pub use icon::{Icon, icon, icon_tile};
 pub use slider::slider;
+pub use smooth_scroll::smooth_scroll;
 pub use text_input::{TextInput, TextInputEvent};
 pub use toggle::toggle;
 pub use tooltip::tooltip;
