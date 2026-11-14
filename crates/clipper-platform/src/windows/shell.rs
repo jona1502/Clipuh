@@ -1,10 +1,19 @@
 //! Shell actions: open a file with its default app, reveal it in Explorer.
 //!
-//! Callers must be on a thread in a COM apartment (the GPUI UI thread is).
+//! `open_path` and `reveal_in_folder` run the actual shell call on a
+//! dedicated STA thread and return right after their checks. `ShellExecuteW`
+//! and `SHOpenFolderAndSelectItems` pump window messages while they work;
+//! called from a GPUI event handler they re-entered GPUI's window procedure
+//! while the app state was borrowed and the app aborted ("RefCell already
+//! borrowed" when opening a clip from the save notification). They are also
+//! not awaited: a shell call may send messages to our own window, which must
+//! keep pumping meanwhile. Failures of the shell call itself are logged.
 
 use std::io::{Error, ErrorKind, Result};
 use std::os::windows::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Sender, channel};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
@@ -30,11 +39,56 @@ fn not_found(path: &Path) -> Error {
     )
 }
 
-/// Opens `path` (file or folder) with its default handler.
+/// A shell call for the worker thread.
+#[derive(Debug, PartialEq, Eq)]
+enum ShellJob {
+    Open(PathBuf),
+    Reveal(PathBuf),
+}
+
+/// Sends `job` to the shell worker (started on first use).
+fn dispatch(job: ShellJob) -> Result<()> {
+    static WORKER: OnceLock<Option<Mutex<Sender<ShellJob>>>> = OnceLock::new();
+    let worker = WORKER.get_or_init(|| {
+        let (sender, receiver) = channel::<ShellJob>();
+        std::thread::Builder::new()
+            .name("shell-actions".into())
+            .spawn(move || {
+                // The shell needs an STA with a message loop it can pump.
+                let _apartment = StaApartment::init();
+                while let Ok(job) = receiver.recv() {
+                    let result = match &job {
+                        ShellJob::Open(path) => execute_open(path),
+                        ShellJob::Reveal(path) => execute_reveal(path),
+                    };
+                    if let Err(error) = result {
+                        log::warn!("shell action failed: {error}");
+                    }
+                }
+            })
+            .ok()
+            .map(|_| Mutex::new(sender))
+    });
+    let Some(sender) = worker else {
+        return Err(Error::other("the shell helper thread could not be started"));
+    };
+    sender
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .send(job)
+        .map_err(|_| Error::other("the shell helper thread stopped"))
+}
+
+/// Opens `path` (file or folder) with its default handler. Returns after
+/// checking the path; the shell call runs on the shell worker thread.
 pub fn open_path(path: &Path) -> Result<()> {
     if !path.exists() {
         return Err(not_found(path));
     }
+    dispatch(ShellJob::Open(path.to_path_buf()))
+}
+
+fn execute_open(path: &Path) -> Result<()> {
     let wide = wide(path);
     // SAFETY: `wide` is a NUL-terminated UTF-16 string that outlives the call;
     // the other pointer arguments are null/None.
@@ -59,7 +113,8 @@ pub fn open_path(path: &Path) -> Result<()> {
 }
 
 /// Opens Explorer with `path` selected. If the file is gone but its folder
-/// exists, opens the folder instead.
+/// exists, opens the folder instead. Returns after checking the path; the
+/// shell call runs on the shell worker thread.
 pub fn reveal_in_folder(path: &Path) -> Result<()> {
     if !path.exists() {
         return match path.parent() {
@@ -67,6 +122,10 @@ pub fn reveal_in_folder(path: &Path) -> Result<()> {
             _ => Err(not_found(path)),
         };
     }
+    dispatch(ShellJob::Reveal(path.to_path_buf()))
+}
+
+fn execute_reveal(path: &Path) -> Result<()> {
     let wide = wide(path);
     let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
     // SAFETY: `wide` is NUL-terminated and outlives the call; `pidl` is a valid
@@ -231,5 +290,20 @@ mod tests {
 
         result.unwrap();
         assert!(!source_remains, "recycled file remains at its source path");
+    }
+}
+
+#[cfg(test)]
+mod dispatch_tests {
+    use super::*;
+
+    #[test]
+    fn missing_paths_fail_before_anything_is_dispatched() {
+        let missing = std::env::temp_dir().join("clipuh-definitely-missing-file.mp4");
+        assert_eq!(open_path(&missing).unwrap_err().kind(), ErrorKind::NotFound);
+        assert_eq!(
+            reveal_in_folder(&missing.join("x")).unwrap_err().kind(),
+            ErrorKind::NotFound
+        );
     }
 }
