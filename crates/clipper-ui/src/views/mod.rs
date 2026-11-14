@@ -50,6 +50,7 @@ const HOTKEY_CONTEXT: &str = "HotkeyRecorder";
 /// Registers the window's keyboard shortcuts. Call once at startup.
 pub fn bind_keys(cx: &mut App) {
     crate::components::bind_keys(cx);
+    clips::bind_keys(cx);
     let window = Some(WINDOW_CONTEXT);
     let palette = Some(PALETTE_CONTEXT);
     let dropdown = Some("Dropdown");
@@ -250,9 +251,7 @@ pub struct ClipperWindow {
     source_menu: Option<usize>,
     source_focus: FocusHandle,
     /// Latest clips in the recordings folder for the Capture page.
-    recent_clips: crate::recent_clips::RecentClips,
-    /// Bumped per refresh so only the newest scan's result is applied.
-    recent_clips_generation: u64,
+    library: Entity<clips::ClipLibrary>,
     /// The clip open in the Editor page; its player only runs while that page is shown.
     editor: Option<Entity<editor::ClipEditor>>,
     /// Custom accent color field on the Settings page.
@@ -401,6 +400,21 @@ impl ClipperWindow {
         })
         .detach();
 
+        let directory = config
+            .recording_options()
+            .map(|o| o.output_directory)
+            .unwrap_or_default();
+        let library =
+            cx.new(|cx| clips::ClipLibrary::new(config.library.clone(), directory, window, cx));
+        cx.subscribe_in(&library, window, |this, _, event, window, cx| match event {
+            clips::LibraryEvent::Changed => cx.notify(),
+            clips::LibraryEvent::Settings(settings) => {
+                this.config.library = settings.clone();
+                this.persist_config(cx);
+            }
+            clips::LibraryEvent::Editor(path) => this.open_in_editor(path.clone(), window, cx),
+        })
+        .detach();
         let mut this = Self {
             handle,
             hotkeys,
@@ -450,8 +464,7 @@ impl ClipperWindow {
             source_menu: None,
             // First control of the Capture page, after the capture bar (4-8).
             source_focus: cx.focus_handle().tab_index(9).tab_stop(true),
-            recent_clips: Default::default(),
-            recent_clips_generation: 0,
+            library,
             editor: None,
             accent_input,
             // Settings page, after every Capture page control (0-11).
@@ -487,6 +500,12 @@ impl ClipperWindow {
                 .await;
             if let Err(message) = result {
                 this.update(cx, |this, cx| {
+                    this.library.update(cx, |library, cx| {
+                        library.show_error(
+                            format!("Could not save library preferences: {message}"),
+                            cx,
+                        )
+                    });
                     this.recording
                         .fail(format!("Could not save settings: {message}"));
                     cx.notify();
@@ -553,6 +572,12 @@ impl ClipperWindow {
     }
 
     fn navigate(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
+        self.library.update(cx, |library, cx| {
+            library.set_visible(page == Page::Clips, window, cx)
+        });
+        if page == Page::Clips {
+            self.refresh_recent_clips(window, cx);
+        }
         // An open capture menu belongs to the page being left.
         self.capture_menu = None;
         let palette_was_open = self.palette.take().is_some();
@@ -755,7 +780,7 @@ impl ClipperWindow {
     fn page_content(&self, window: &Window, cx: &mut Context<Self>) -> Div {
         match self.active_page {
             Page::Dashboard => dashboard::content(self, window, cx),
-            Page::Clips => clips::content(self, cx),
+            Page::Clips => div().h_full().child(self.library.clone()),
             Page::Editor => match &self.editor {
                 Some(editor) => div().child(editor.clone()),
                 None => editor::empty(cx.theme()),
@@ -1009,15 +1034,22 @@ impl Render for ClipperWindow {
                     .flex_col()
                     .child(self.capture_bar(window, cx))
                     .child(
-                        div().id("main-scroll").flex_1().overflow_y_scroll().child(
-                            div()
-                                .w_full()
-                                .max_w(px(960.))
-                                .mx_auto()
-                                .px_8()
-                                .py_6()
-                                .child(self.page_content(window, cx)),
-                        ),
+                        div()
+                            .id("main-scroll")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .child(
+                                div()
+                                    .w_full()
+                                    .when(self.active_page == Page::Clips, |d| d.h_full())
+                                    .when(self.active_page != Page::Clips, |d| {
+                                        d.max_w(px(960.)).mx_auto()
+                                    })
+                                    .px_8()
+                                    .py_6()
+                                    .child(self.page_content(window, cx)),
+                            ),
                     ),
             )
             .children(palette)

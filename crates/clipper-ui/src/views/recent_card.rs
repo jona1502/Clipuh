@@ -11,10 +11,8 @@ use gpui::{AnyElement, Context, Div, ObjectFit, RenderImage, SharedString, Windo
 
 use super::{ClipperWindow, Page};
 use crate::components::{ButtonVariant, button, card};
-use crate::recent_clips::{self, RecentClip, RecentClips, relative_time, size_label};
+use crate::recent_clips::{RecentClip, RecentClips, relative_time, size_label};
 use crate::theme::{ActiveTheme, Theme};
-
-const LIMIT: usize = 3;
 
 fn clock(d: Duration) -> String {
     let s = d.as_secs();
@@ -22,9 +20,12 @@ fn clock(d: Duration) -> String {
 }
 
 fn meta(clip: &RecentClip, now: SystemTime) -> String {
-    let mut parts: Vec<String> = clip.duration.map(clock).into_iter().collect();
-    parts.push(size_label(clip.size_bytes));
-    parts.push(relative_time(now, clip.modified));
+    let mut parts: Vec<String> = clip.clip.duration.map(clock).into_iter().collect();
+    parts.push(size_label(clip.clip.size_bytes));
+    parts.push(relative_time(
+        now,
+        clip.clip.created.unwrap_or(clip.clip.modified),
+    ));
     parts.join(" · ")
 }
 
@@ -32,40 +33,12 @@ impl ClipperWindow {
     /// Starts a background reload (scan + probe + thumbnails), replacing the
     /// list when done and freeing the replaced thumbnails.
     pub(super) fn refresh_recent_clips(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let config = self.config.clone();
-        self.recent_clips_generation += 1;
-        let generation = self.recent_clips_generation;
-        cx.spawn_in(window, async move |this, cx| {
-            let loaded = cx
-                .background_spawn(async move {
-                    match config.recording_options() {
-                        Ok(options) => recent_clips::load(&options.output_directory, LIMIT),
-                        Err(error) => RecentClips::Unavailable(error.to_string()),
-                    }
-                })
-                .await;
-            this.update_in(cx, |this, window, cx| {
-                // Two saves in quick succession start two scans; an older one
-                // finishing last must not hide the newest clip.
-                if generation != this.recent_clips_generation {
-                    if let RecentClips::Ready(clips) = loaded {
-                        for image in clips.into_iter().filter_map(|c| c.thumbnail) {
-                            let _ = window.drop_image(image);
-                        }
-                    }
-                    return;
-                }
-                let old = std::mem::replace(&mut this.recent_clips, loaded);
-                if let RecentClips::Ready(clips) = old {
-                    for image in clips.into_iter().filter_map(|c| c.thumbnail) {
-                        let _ = window.drop_image(image);
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
+        match self.config.recording_options() {
+            Ok(options) => self.library.update(cx, |library, cx| {
+                library.set_directory(options.output_directory, window, cx)
+            }),
+            Err(error) => self.recording.fail(error.to_string()),
+        }
     }
 
     /// Right card of the Capture page.
@@ -81,7 +54,8 @@ impl ClipperWindow {
         )
         .on_click(cx.listener(|this, _, window, cx| this.navigate(Page::Clips, window, cx)))
         .into_any_element();
-        let body = match &self.recent_clips {
+        let recent = self.library.read(cx).recent();
+        let body = match &recent {
             RecentClips::Loading => note(&t, "Loading clips…"),
             RecentClips::Unavailable(message) => note(&t, message.clone()),
             RecentClips::Ready(clips) if clips.is_empty() => div()
@@ -139,7 +113,9 @@ fn row(
         ),
         None => thumb,
     };
-    let (open, folder): (PathBuf, PathBuf) = (clip.path.clone(), clip.path.clone());
+    let expected_open = clip.clip.clone();
+    let expected_folder = clip.clip.clone();
+    let (open, folder): (PathBuf, PathBuf) = (clip.clip.path.clone(), clip.clip.path.clone());
     div()
         .id(("recent-clip", index))
         .flex()
@@ -150,7 +126,9 @@ fn row(
         .cursor_pointer()
         .hover(|style| style.bg(t.colors.surface_hover))
         .on_click(cx.listener(move |this, _, _, cx| {
-            if let Err(error) = shell::open_path(&open) {
+            if let Err(error) = clipper_storage::library::verify(&expected_open)
+                .and_then(|()| shell::open_path(&open))
+            {
                 this.recording.fail(error.to_string());
                 cx.notify();
             }
@@ -162,7 +140,7 @@ fn row(
                 .min_w_0()
                 .flex()
                 .flex_col()
-                .child(div().text_sm().truncate().child(clip.name.clone()))
+                .child(div().text_sm().truncate().child(clip.clip.name.clone()))
                 .child(
                     div()
                         .text_xs()
@@ -182,7 +160,9 @@ fn row(
             )
             .on_click(cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
-                if let Err(error) = shell::reveal_in_folder(&folder) {
+                if let Err(error) = clipper_storage::library::verify(&expected_folder)
+                    .and_then(|()| shell::reveal_in_folder(&folder))
+                {
                     this.recording.fail(error.to_string());
                     cx.notify();
                 }
