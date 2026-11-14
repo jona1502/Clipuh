@@ -794,6 +794,7 @@ dependencies = [
  "clipper-core",
  "clipper-media",
  "clipper-platform",
+ "clipper-recorder",
  "clipper-storage",
  "gpui",
  "image",
