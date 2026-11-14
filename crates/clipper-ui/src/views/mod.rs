@@ -218,6 +218,7 @@ pub struct ClipperWindow {
     audio_loading: bool,
     /// Latest per-source peaks and engine state; empty when no session runs.
     audio_levels: Vec<clipper_core::recording::SourceLevel>,
+    audio_levels_drawn_at: Option<std::time::Instant>,
     audio_sources: Vec<clipper_core::recording::AudioSourceState>,
     /// Add Source popup step; `None` is closed.
     audio_add: Option<audio::AddStep>,
@@ -294,9 +295,18 @@ impl ClipperWindow {
                     this.storage_projection_run.apply_event(&event);
                     match &event {
                         RecorderEvent::AudioLevels(levels) => {
-                            this.audio_levels = levels.clone();
-                            // Meters only exist on the Capture page: store, don't redraw.
-                            quiet = !levels.is_empty() && this.active_page != Page::Dashboard;
+                            // Meters only exist on the Capture page, and only visible
+                            // change (>= 10 Hz apart) is worth a redraw.
+                            let since = this.audio_levels_drawn_at.map(|t| t.elapsed());
+                            let redraw = this.active_page == Page::Dashboard
+                                && audio::levels_need_redraw(&this.audio_levels, levels, since);
+                            if redraw {
+                                this.audio_levels_drawn_at = Some(std::time::Instant::now());
+                                this.audio_levels = levels.clone();
+                            } else if this.active_page != Page::Dashboard {
+                                this.audio_levels = levels.clone();
+                            }
+                            quiet = !redraw && !levels.is_empty();
                         }
                         RecorderEvent::AudioSources(states) => {
                             this.audio_sources = states.clone();
@@ -415,6 +425,7 @@ impl ClipperWindow {
             audio_menu: None,
             audio_loading: false,
             audio_levels: Vec::new(),
+            audio_levels_drawn_at: None,
             audio_sources: Vec::new(),
             audio_add: None,
             audio_add_focus: cx.focus_handle(),
