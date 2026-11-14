@@ -239,6 +239,23 @@ impl SlotTimeline {
     }
 }
 
+/// Shortest silence after a slot's end before it is filled with a repeated
+/// frame: 1/60 s, the WGC delivery latency budget.
+const MIN_REPEAT_LAG_TICKS: i64 = 166_667;
+
+/// Silence after a slot's end before a static-scene gap is filled with a
+/// repeated frame, so a merely late real frame is not overtaken by a repeat
+/// (which would discard it as late and duplicate the previous frame).
+///
+/// One frame interval, but never less than [`MIN_REPEAT_LAG_TICKS`]: WGC
+/// delivers frames some milliseconds after their timestamp, so at 120 fps a
+/// one-interval (8.3 ms) lag replaced about a quarter of the real frames by
+/// repeats. The lag only delays the static-scene fill; audio is mixed far
+/// further behind real time.
+pub fn repeat_lag_ticks(interval: i64) -> i64 {
+    interval.max(MIN_REPEAT_LAG_TICKS)
+}
+
 /// Status warning text of a replay session (`None` when all is well).
 pub fn replay_warning(
     disk: Option<&str>,
@@ -408,6 +425,17 @@ fn describe(error: CoreError) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn repeat_lag_is_one_interval_but_at_least_a_60_fps_frame() {
+        use super::repeat_lag_ticks;
+        // 30 / 60 fps: unchanged, one frame interval.
+        assert_eq!(repeat_lag_ticks(333_333), 333_333);
+        assert_eq!(repeat_lag_ticks(166_666), 166_667);
+        // 120 / 240 fps: raised to the 60 fps budget.
+        assert_eq!(repeat_lag_ticks(83_333), 166_667);
+        assert_eq!(repeat_lag_ticks(41_666), 166_667);
+    }
+
     #[test]
     fn output_keeps_aspect_and_never_upscales() {
         use super::fit_output_size;

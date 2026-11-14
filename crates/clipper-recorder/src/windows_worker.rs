@@ -468,11 +468,12 @@ impl Worker<'_> {
             ));
             let started = Instant::now();
             let diagnostics = session.diagnostics();
+            let delivered = session.capture_delivered();
             session.finish_audio_report(self.endpoint);
             // Releases capture, encoder, audio, buffer and device, in that order.
             drop(session);
             log(format_args!(
-                "replay stop: capture and encoder released in {:?}; {diagnostics:?}",
+                "replay stop: capture and encoder released in {:?}; {diagnostics:?}, capture delivered {delivered} frames",
                 started.elapsed()
             ));
         }
@@ -885,6 +886,8 @@ fn build_recording(
         signal_handler(wake_tx.clone(), Arc::clone(&source_closed)),
     )
     .map_err(|error| error.to_string())?;
+    // Optional (Windows 11 24H2+); older builds keep the WGC default.
+    let _ = session.set_target_fps(options.fps);
 
     let (width, height) = session.size();
     let (output_width, output_height) =

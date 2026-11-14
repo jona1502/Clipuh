@@ -22,14 +22,10 @@ use clipper_replay::EncodedPacket;
 use clipper_replay::disk::DiskConfig;
 use clipper_replay::error::ReplayError;
 use clipper_replay::hybrid::{ReplayBuffer, ReplayConfig, ReplaySnapshot};
-use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
-    ID3D11Texture2D,
-};
 
 use crate::logic::{
-    Counters, SlotTimeline, fit_output_size, replay_failure_text, replay_status, replay_warning,
-    valid_replay_duration,
+    Counters, SlotTimeline, fit_output_size, repeat_lag_ticks, replay_failure_text, replay_status,
+    replay_warning, valid_replay_duration,
 };
 use crate::recording_audio::{AudioPlan, AudioReporter, RecordingAudio};
 use crate::windows_worker::{encoder_message, round_up_even, signal_handler};
@@ -41,24 +37,12 @@ pub const WAKE_WAIT: Duration = Duration::from_millis(30);
 const MAX_FRAMES_PER_PUMP: usize = 4;
 /// Repeated frames submitted per service iteration.
 const MAX_REPEATS_PER_PUMP: usize = 16;
-/// Silence (in half frame intervals) before a gap is filled with repeated
-/// frames, so a merely late real frame is not overtaken by a repeat.
-const REPEAT_LAG_HALF_FRAMES: i64 = 2;
 /// Longest wait for the first captured frame before the session gives up.
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
 /// Audio is mixed this far behind real time (same as manual recording).
 const AUDIO_LAG_TICKS: i64 = 800_000;
 /// Audio/video clock gap that cannot be recovered.
 const MAX_CLOCK_GAP_TICKS: i64 = 10_000_000;
-
-/// GPU-side copy of the newest captured frame. Its content is re-submitted
-/// while WGC delivers nothing (static scene) so the stream keeps a constant
-/// frame rate and regular keyframes. Never read back to the CPU.
-struct LastFrame {
-    texture: ID3D11Texture2D,
-    dims: (u32, u32),
-    content: (u32, u32),
-}
 
 /// A real frame waiting for the repeats that fill the slots before it.
 struct PendingFrame {
@@ -88,8 +72,8 @@ pub struct ReplaySession {
     audio: Option<RecordingAudio>,
     audio_reporter: AudioReporter,
     buffer: Option<ReplayBuffer>,
-    last_frame: Option<LastFrame>,
-    d3d: D3DContext,
+    /// Keeps the device alive until everything above is released.
+    _d3d: D3DContext,
     config: ReplayConfig,
     origin: i64,
     pacer: FramePacer,
@@ -125,6 +109,8 @@ impl ReplaySession {
             signal_handler(wake_tx.clone(), Arc::clone(&source_closed)),
         )
         .map_err(|error| replay_failure_text(&error.to_string()))?;
+        // Optional (Windows 11 24H2+); older builds keep the WGC default.
+        let _ = capture.set_target_fps(recording.fps);
 
         let (width, height) = capture.size();
         let (output_width, output_height) =
@@ -167,8 +153,7 @@ impl ReplaySession {
             audio,
             audio_reporter,
             buffer: None,
-            last_frame: None,
-            d3d,
+            _d3d: d3d,
             config: ReplayConfig {
                 duration: options.duration,
                 memory_limit_bytes: usize::try_from(options.memory_limit_bytes)
@@ -266,6 +251,12 @@ impl ReplaySession {
         }
     }
 
+    /// Frames WGC delivered so far, including superseded ones: the source
+    /// frame rate as the capture sees it, before pacing.
+    pub fn capture_delivered(&self) -> u64 {
+        self.capture.frames_delivered()
+    }
+
     /// Cheap Arc-clone snapshot of the configured duration; no file I/O.
     pub fn snapshot(&mut self) -> Result<ReplaySnapshot, ReplayError> {
         let duration = self.config.duration;
@@ -279,7 +270,7 @@ impl ReplaySession {
     pub fn pump(&mut self) -> Result<(), String> {
         let interval = self.pacer.interval();
         if self.video_start.is_none()
-            && self.last_frame.is_none()
+            && !self.encoder.has_frame()
             && self.pending.is_none()
             && self.started.elapsed() > FIRST_FRAME_TIMEOUT
         {
@@ -306,8 +297,10 @@ impl ReplaySession {
                     // Before the shared origin (initial WGC frame delivered
                     // while audio was starting): keep it as the repeat source
                     // so a static scene still produces video.
-                    if self.last_frame.is_none() {
-                        self.remember(frame.texture(), frame.content_size())?;
+                    if !self.encoder.has_frame() {
+                        self.encoder
+                            .stage(frame.texture(), frame.content_size())
+                            .map_err(|error| replay_failure_text(&encoder_message(&error)))?;
                     }
                     continue;
                 };
@@ -367,7 +360,7 @@ impl ReplaySession {
         }
         if !self.timeline.started() {
             // A remembered pre-origin frame lets the video start at 0.
-            self.begin_video(if self.last_frame.is_some() { 0 } else { slot });
+            self.begin_video(if self.encoder.has_frame() { 0 } else { slot });
         }
         while self.timeline.next() < slot {
             if *repeats_left == 0 || !self.submit_repeat(interval)? {
@@ -390,8 +383,9 @@ impl ReplaySession {
             SubmitOutcome::Submitted => {
                 self.counters.encoded += 1;
                 self.meter.record();
+                // The encoder's staging texture now holds this frame and
+                // serves as the repeat source: no extra GPU copy.
                 self.timeline.advance();
-                self.remember(pending.frame.texture(), size)?;
             }
             // The slot stays empty; the static-scene fill repeats the last
             // frame there.
@@ -404,15 +398,15 @@ impl ReplaySession {
     /// Fills the next slot with the last frame. `Ok(false)` when the encoder
     /// is busy.
     fn submit_repeat(&mut self, interval: i64) -> Result<bool, String> {
-        let Some(last) = &self.last_frame else {
+        if !self.encoder.has_frame() {
             // Nothing to repeat (cannot happen once video started).
             self.timeline.advance();
             return Ok(true);
-        };
+        }
         let time = self.timeline.time_of(self.timeline.next());
         let outcome = self
             .encoder
-            .submit(&last.texture, last.content, time, interval)
+            .submit_repeat(time, interval)
             .map_err(|error| replay_failure_text(&encoder_message(&error)))?;
         match outcome {
             SubmitOutcome::Submitted => {
@@ -437,10 +431,10 @@ impl ReplaySession {
         {
             return Err("the audio and video clocks drifted apart".into());
         }
-        if self.pending.is_some() || self.last_frame.is_none() {
+        if self.pending.is_some() || !self.encoder.has_frame() {
             return Ok(());
         }
-        let due = now - REPEAT_LAG_HALF_FRAMES * interval / 2;
+        let due = now - repeat_lag_ticks(interval);
         while *repeats_left > 0 {
             if self.timeline.end_ticks() + interval > due {
                 break;
@@ -482,68 +476,6 @@ impl ReplaySession {
                 Err(error) => return Err(replay_failure_text(&error.to_string())),
             }
         }
-        Ok(())
-    }
-
-    /// GPU-copies the content area of `source` into the repeat texture.
-    #[allow(unsafe_code)]
-    fn remember(&mut self, source: &ID3D11Texture2D, content: (u32, u32)) -> Result<(), String> {
-        let mut desc = D3D11_TEXTURE2D_DESC::default();
-        // SAFETY: `source` is a live texture and `desc` a valid out-pointer.
-        unsafe { source.GetDesc(&mut desc) };
-        let dims = (desc.Width, desc.Height);
-        if self
-            .last_frame
-            .as_ref()
-            .is_none_or(|last| last.dims != dims)
-        {
-            desc.Usage = D3D11_USAGE_DEFAULT;
-            desc.BindFlags = D3D11_BIND_SHADER_RESOURCE.0 as u32;
-            desc.CPUAccessFlags = 0;
-            desc.MiscFlags = 0;
-            let mut texture: Option<ID3D11Texture2D> = None;
-            // SAFETY: valid descriptor and out-pointer; no initial data.
-            unsafe {
-                self.d3d
-                    .device()
-                    .CreateTexture2D(&desc, None, Some(&mut texture))
-            }
-            .map_err(|error| format!("could not allocate the replay frame copy: {error}"))?;
-            let texture = texture.ok_or("could not allocate the replay frame copy")?;
-            self.last_frame = Some(LastFrame {
-                texture,
-                dims,
-                content: (0, 0),
-            });
-        }
-        let Some(last) = self.last_frame.as_mut() else {
-            return Ok(());
-        };
-        let content = (content.0.clamp(1, dims.0), content.1.clamp(1, dims.1));
-        let region = D3D11_BOX {
-            left: 0,
-            top: 0,
-            front: 0,
-            right: content.0,
-            bottom: content.1,
-            back: 1,
-        };
-        // SAFETY: both textures belong to this device and have the same
-        // format; the region lies inside both. The immediate context is
-        // multithread protected and the copy stays on the GPU.
-        unsafe {
-            self.d3d.context().CopySubresourceRegion(
-                &last.texture,
-                0,
-                0,
-                0,
-                0,
-                source,
-                0,
-                Some(&region),
-            );
-        }
-        last.content = content;
         Ok(())
     }
 }

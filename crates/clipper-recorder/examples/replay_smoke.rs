@@ -15,6 +15,8 @@
 //! * `disk`     SSD budget in MiB (default 4096)
 //! * `setdur`   `SECONDS@AT`: send `SetReplayDuration` after AT seconds
 //! * `desktop`/`mic` 1 or 0 (default 1 / 0)
+//! * `fps`      capture frame rate (default 60)
+//! * `profile`  `performance`, `balanced` or `quality` (default balanced)
 #[cfg(windows)]
 fn main() {
     smoke::run();
@@ -111,6 +113,11 @@ mod smoke {
         let fps = number("fps", 60) as u32;
         let desktop = number("desktop", 1) != 0;
         let mic = number("mic", 0) != 0;
+        let profile = match args.get("profile").map(String::as_str) {
+            Some("performance") => QualityProfile::Performance,
+            Some("quality") => QualityProfile::Quality,
+            _ => QualityProfile::Balanced,
+        };
         let set_duration = args.get("setdur").and_then(|value| {
             let (seconds, at) = value.split_once('@')?;
             Some((
@@ -183,7 +190,7 @@ mod smoke {
                         height: 1080,
                         fps,
                         bitrate_mbps: 16,
-                        profile: QualityProfile::Balanced,
+                        profile,
                         output_directory: output.clone(),
                     },
                     duration,
