@@ -1,18 +1,17 @@
 ---
 import { site } from "@/data/site";
+import { withBase } from "@/lib/url";
 
 interface Props {
   /** Link target; defaults to the site root. */
   href?: string;
   class?: string;
+  /** Accessible name; defaults to "<name> home". */
+  label?: string;
   [attr: string]: unknown;
 }
 
-const {
-  href = import.meta.env.BASE_URL,
-  class: className,
-  ...rest
-} = Astro.props;
+const { href = withBase(), class: className, label, ...rest } = Astro.props;
 ---
 
 <a
@@ -21,7 +20,7 @@ const {
     "text-text inline-flex min-h-11 items-center gap-2.5 rounded-md font-semibold tracking-tight",
     className,
   ]}
-  aria-label={`${site.name} home`}
+  aria-label={label ?? `${site.name} home`}
   {...rest}
 >
   <svg

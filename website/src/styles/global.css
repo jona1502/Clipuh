@@ -75,8 +75,11 @@
     text-wrap: pretty;
   }
 
+  /* Opaque accent-hover, not --color-focus-ring (70% alpha is ~2.8:1 on the
+     background; WCAG 1.4.11 needs 3:1). The 2px offset keeps the ring on the
+     page background, so it also reads around the purple primary button. */
   :focus-visible {
-    outline: 2px solid var(--color-focus-ring);
+    outline: 2px solid var(--color-accent-hover);
     outline-offset: 2px;
   }
 

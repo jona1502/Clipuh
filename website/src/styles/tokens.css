@@ -40,6 +40,11 @@
     var(--color-accent) 16%,
     transparent
   );
+  /*
+   * App focus ring (70% alpha). NOT used by the web: at that alpha it is
+   * ~2.8:1 on the background, below the 3:1 of WCAG 1.4.11. global.css
+   * :focus-visible uses opaque --color-accent-hover instead.
+   */
   --color-focus-ring: color-mix(in srgb, var(--color-accent) 70%, transparent);
   /*
    * Text on accent fills. palette.rs foreground_for() picks white or ink

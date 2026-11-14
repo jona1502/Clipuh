@@ -3,6 +3,7 @@ import Button from "@/components/ui/Button.astro";
 import Container from "@/components/ui/Container.astro";
 import Logo from "./Logo.astro";
 import { site } from "@/data/site";
+import { withBase } from "@/lib/url";
 
 /*
  * Download CTA stays a link to the in-page #download section with a "Soon"
@@ -26,10 +27,10 @@ const badgeClass =
 
 <header
   data-site-header
-  class="bg-background-elevated/90 border-border sticky top-0 z-40 border-b backdrop-blur-sm"
+  class="bg-background-elevated border-border sticky top-0 z-40 border-b"
 >
   <Container class="flex h-(--spacing-header) items-center justify-between">
-    <Logo href={`${import.meta.env.BASE_URL}#top`} />
+    <Logo href={withBase("#top")} />
 
     <nav aria-label="Primary" class="hidden items-center gap-1 md:flex">
       {links.map((l) => (
@@ -101,11 +102,11 @@ const badgeClass =
     }
   }
   :global(html.js) .menu-panel {
+    border-bottom: 1px solid var(--color-border-hover);
     position: absolute;
     top: 100%;
     left: 0;
     right: 0;
-    border-bottom: 1px solid var(--color-border);
     background: var(--color-background-elevated);
     box-shadow: var(--shadow-lg);
     visibility: hidden;
@@ -152,8 +153,24 @@ const badgeClass =
     const isOpen = () => panel.dataset.open === "true";
 
     button.addEventListener("click", () => setOpen(!isOpen()));
+    // Link click: close without moving focus; the browser then focuses the
+    // anchor target natively (no focus restore to the button, no drop to body).
     panel.addEventListener("click", (e) => {
-      if ((e.target as Element).closest("a")) setOpen(false);
+      const a = (e.target as Element).closest("a");
+      if (!a) return;
+      const id = new URL(a.href, location.href).hash.slice(1);
+      const target = id ? document.getElementById(id) : null;
+      if (target) {
+        // Make the target programmatically focusable so focus lands there.
+        if (!target.hasAttribute("tabindex")) target.tabIndex = -1;
+        target.focus({ preventScroll: true });
+      }
+      setOpen(false);
+    });
+    // Outside tap closes. The menu button is inside header, so its own
+    // click still toggles exactly once.
+    document.addEventListener("pointerdown", (e) => {
+      if (isOpen() && !header.contains(e.target as Node)) setOpen(false);
     });
     document.addEventListener("keydown", (e) => {
       if (e.key === "Escape" && isOpen()) setOpen(false, true);
