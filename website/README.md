@@ -27,8 +27,7 @@ Run from `/website` (Node >= 22.23.4, npm):
 
 ```text
 website/
-├── public/                 static files served as-is
-│   └── icons/
+├── public/                 static files served as-is (favicons, clipuh logo)
 ├── src/
 │   ├── components/
 │   │   ├── ui/             Button, Container, SectionHeading
