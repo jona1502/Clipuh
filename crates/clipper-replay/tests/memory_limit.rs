@@ -25,17 +25,24 @@ fn lowering_memory_limit_keeps_footage_on_disk() {
         layout(1, 1920, 1080),
     )
     .unwrap();
-    // Feeds one GOP, then lets the spill thread make progress like a real
-    // capture would give it time to (the synthetic stream is far faster than
-    // real time).
-    let gop = |synth: &mut Synth, buf: &mut ReplayBuffer| {
+    // Feeds one GOP, then waits until the spill thread has brought RAM back
+    // under `limit`, as real-time capture gives it time to (the synthetic
+    // stream is far faster than real time). Waiting on the buffer's own state
+    // instead of a fixed sleep keeps the test independent of disk speed (a
+    // fixed 150 ms flaked on slow CI runners).
+    let gop = |synth: &mut Synth, buf: &mut ReplayBuffer, limit: usize| {
         let next = synth.frames() + GOP_FRAMES;
         synth.run_frames(next, |p| buf.push(p)).unwrap();
-        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            wait_for(Duration::from_secs(20), || buf.stats().ram_bytes as u64
+                <= limit as u64),
+            "spilling did not catch up: {:?}",
+            buf.stats()
+        );
     };
     // 40 s of footage (about 76 MiB, so the SSD tier is already in use).
     for _ in 0..20 {
-        gop(&mut synth, &mut buf);
+        gop(&mut synth, &mut buf, 64 * MIB);
     }
     let before = buf.stats();
     assert!(before.buffered >= Duration::from_secs(38));
@@ -43,7 +50,7 @@ fn lowering_memory_limit_keeps_footage_on_disk() {
 
     buf.set_memory_limit(4 * MIB);
     for _ in 0..10 {
-        gop(&mut synth, &mut buf);
+        gop(&mut synth, &mut buf, 4 * MIB);
     }
     assert!(wait_for(Duration::from_secs(10), || {
         buf.stats().tier == BufferTier::Hybrid
