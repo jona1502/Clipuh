@@ -1,0 +1,93 @@
+---
+import Button from "@/components/ui/Button.astro";
+import Container from "@/components/ui/Container.astro";
+import AppPreview from "@/components/sections/AppPreview.astro";
+import { sections, site } from "@/data/site";
+
+const { download } = site;
+const directUrl = download.available ? download.url : null;
+const downloadHref = directUrl ?? `#${sections.download}`;
+---
+
+<section
+  id={sections.hero}
+  class="pb-section relative isolate overflow-hidden pt-16 md:pt-24"
+>
+  <!-- Restrained accent glow + faint grid, CSS only -->
+  <div
+    class="hero-bg pointer-events-none absolute inset-0 -z-10"
+    aria-hidden="true"
+  ></div>
+
+  <Container>
+    <div class="hero-in mx-auto flex max-w-3xl flex-col items-center text-center">
+      <h1 class="text-display">{site.tagline}</h1>
+      <p class="text-lead text-text-secondary mt-5 max-w-2xl">
+        Instantly save your favorite gaming moments, manage your audio sources,
+        and turn clips into highlights, without leaving your game.
+      </p>
+      <div class="mt-8 flex w-full flex-col gap-3 min-[431px]:w-auto min-[431px]:flex-row">
+        <Button href={downloadHref} size="lg">
+          Download for {download.platform}
+          {!directUrl && (
+            <span class="bg-accent-foreground/15 text-caption ml-1 rounded-sm px-2 py-0.5 font-semibold">
+              {download.statusLabel}
+            </span>
+          )}
+        </Button>
+        <Button href={`#${sections.features}`} variant="secondary" size="lg">
+          Explore {site.name}
+        </Button>
+      </div>
+    </div>
+
+    <div class="hero-in hero-in-delay mx-auto mt-14 max-w-5xl md:mt-20">
+      <AppPreview eager />
+    </div>
+  </Container>
+</section>
+
+<style>
+  .hero-bg {
+    background:
+      radial-gradient(
+        60rem 28rem at 50% -8%,
+        color-mix(in srgb, var(--color-accent) 22%, transparent),
+        transparent 70%
+      ),
+      radial-gradient(
+        40rem 24rem at 85% 30%,
+        color-mix(in srgb, var(--color-accent) 8%, transparent),
+        transparent 70%
+      );
+  }
+  .hero-bg::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background-image:
+      linear-gradient(var(--color-border) 1px, transparent 1px),
+      linear-gradient(90deg, var(--color-border) 1px, transparent 1px);
+    background-size: 64px 64px;
+    opacity: 0.25;
+    mask-image: radial-gradient(
+      ellipse 70% 60% at 50% 0%,
+      #000,
+      transparent 75%
+    );
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    .hero-in {
+      animation: hero-in 600ms var(--ease-out) both;
+    }
+    .hero-in-delay {
+      animation-delay: 120ms;
+    }
+  }
+  @keyframes hero-in {
+    from {
+      opacity: 0;
+      transform: translateY(12px);
+    }
+  }
+</style>
