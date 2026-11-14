@@ -735,6 +735,12 @@ pub struct NotificationSettings {
     pub open_clip_action: bool,
     /// Also notify when saving a clip fails.
     pub notify_on_failure: bool,
+    /// Show compact toasts inside the main window (replay, capture, storage
+    /// and clip feedback). Older files without the key keep them on.
+    pub in_app: bool,
+    /// Show native Windows notifications from the tray icon for important
+    /// events while the main window is not in front. Needs the tray icon.
+    pub native: bool,
 }
 
 impl Default for NotificationSettings {
@@ -745,6 +751,8 @@ impl Default for NotificationSettings {
             sound: true,
             open_clip_action: true,
             notify_on_failure: true,
+            in_app: true,
+            native: true,
         }
     }
 }
@@ -1898,6 +1906,8 @@ hotkey = \"F9\"
             sound: false,
             open_clip_action: false,
             notify_on_failure: false,
+            in_app: false,
+            native: false,
         };
         let path = temp.path("custom.toml");
         config.save_to(&path).expect("save");

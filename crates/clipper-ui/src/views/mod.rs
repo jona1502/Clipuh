@@ -3,6 +3,7 @@ mod capture_bar;
 mod clips;
 mod dashboard;
 mod editor;
+mod quick_actions;
 mod recent_card;
 mod settings;
 mod source_card;
@@ -11,6 +12,7 @@ mod storage_card;
 use clipper_core::hotkey::Hotkey;
 use clipper_core::recording::{RecorderCommand, RecorderEvent, RecorderHandle};
 use clipper_platform::windows::hotkey::HotkeyHandle;
+use clipper_platform::windows::tray::{TrayCommand, TrayHandle};
 use clipper_storage::AppConfig;
 use gpui::prelude::*;
 use gpui::{
@@ -218,6 +220,9 @@ pub struct ClipperWindow {
     /// Awaits recorder events; the UI re-renders only when one arrives.
     _events: Task<()>,
     _hotkey_failures: Task<()>,
+    /// Phase 9: toasts, tray state and quick-action bookkeeping.
+    feedback: quick_actions::Feedback,
+    _tray_commands: Option<Task<()>>,
     active_page: Page,
     focus: FocusHandle,
     nav_focus: Vec<FocusHandle>,
@@ -288,6 +293,7 @@ impl ClipperWindow {
         handle: RecorderHandle,
         hotkeys: HotkeyHandle,
         hotkey_failures: async_channel::Receiver<String>,
+        tray: Option<(TrayHandle, async_channel::Receiver<TrayCommand>)>,
         config: AppConfig,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -314,6 +320,14 @@ impl ClipperWindow {
                 );
                 let updated = this.update_in(cx, |this, window, cx| {
                     let mut quiet = false;
+                    let notices = crate::feedback::notices(
+                        &event,
+                        &crate::feedback::Before {
+                            replay: &this.recording.replay.phase,
+                            selected_source: this.recording.selected_source(),
+                            audio: &this.audio_sources,
+                        },
+                    );
                     this.storage_projection_run.apply_event(&event);
                     match &event {
                         RecorderEvent::AudioLevels(levels) => {
@@ -370,9 +384,17 @@ impl ClipperWindow {
                     if sources_listed {
                         this.maybe_autostart_replay();
                     }
-                    if let Some(toast) = toast {
+                    // The overlay toast covers clip saves unless in-app toasts
+                    // already show them in the focused main window.
+                    if let Some(toast) = toast
+                        && !(this.config.notifications.in_app && this.main_in_front())
+                    {
                         this.notifier.show(toast, &this.config.notifications, cx);
                     }
+                    for notice in notices {
+                        this.notify_user(notice, cx);
+                    }
+                    this.sync_tray();
                     if !quiet {
                         cx.notify();
                     }
@@ -396,8 +418,19 @@ impl ClipperWindow {
         let failures = cx.spawn(async move |this, cx| {
             while let Ok(message) = hotkey_failures.recv().await {
                 let shown = this.update(cx, |this, cx| {
-                    let toast = Toast::Failed { message };
-                    this.notifier.show(toast, &this.config.notifications, cx);
+                    if this.config.notifications.in_app && this.main_in_front() {
+                        let notice = crate::notification_center::Notice::new(
+                            crate::feedback::CLIP_SAVE_KEY,
+                            crate::notification_center::Category::ClipSave,
+                            crate::notification_center::Severity::Error,
+                            "Clip not saved",
+                            message,
+                        );
+                        this.notify_user(notice, cx);
+                    } else {
+                        let toast = Toast::Failed { message };
+                        this.notifier.show(toast, &this.config.notifications, cx);
+                    }
                 });
                 if shown.is_err() {
                     return;
@@ -435,7 +468,11 @@ impl ClipperWindow {
         let library =
             cx.new(|cx| clips::ClipLibrary::new(config.library.clone(), directory, window, cx));
         cx.subscribe_in(&library, window, |this, _, event, window, cx| match event {
-            clips::LibraryEvent::Changed => cx.notify(),
+            clips::LibraryEvent::Changed => {
+                this.on_library_changed(cx);
+                this.sync_tray();
+                cx.notify()
+            }
             clips::LibraryEvent::Settings(settings) => {
                 this.config.library = settings.clone();
                 this.persist_config(cx);
@@ -443,6 +480,28 @@ impl ClipperWindow {
             clips::LibraryEvent::Editor(path) => this.open_in_editor(path.clone(), window, cx),
         })
         .detach();
+        let main_hwnd = crate::notifications::hwnd_of(window);
+        let (tray, tray_commands) = match tray {
+            Some((tray, commands)) => {
+                let task = cx.spawn_in(window, async move |this, cx| {
+                    while let Ok(command) = commands.recv().await {
+                        let alive = this.update_in(cx, |this, window, cx| {
+                            this.run_tray_command(command, window, cx)
+                        });
+                        if alive.is_err() {
+                            return;
+                        }
+                    }
+                });
+                (Some(tray), Some(task))
+            }
+            None => (None, None),
+        };
+        if tray.is_some()
+            && let Some(hwnd) = main_hwnd
+        {
+            Self::close_to_tray(hwnd, window, cx);
+        }
         let mut this = Self {
             handle,
             hotkeys,
@@ -456,6 +515,12 @@ impl ClipperWindow {
             storage_projection_run: StorageProjectionRun::default(),
             _events: task,
             _hotkey_failures: failures,
+            feedback: quick_actions::Feedback {
+                tray,
+                main_hwnd,
+                ..Default::default()
+            },
+            _tray_commands: tray_commands,
             active_page: Page::Dashboard,
             focus,
             nav_focus,
@@ -605,6 +670,7 @@ impl ClipperWindow {
                 })
                 .await;
             this.update(cx, |this, cx| {
+                this.on_storage_status(&status, cx);
                 if this.storage != status {
                     this.storage = status;
                     cx.notify();
@@ -1033,6 +1099,9 @@ impl Render for ClipperWindow {
         let full_height = matches!(self.active_page, Page::Clips | Page::Settings);
         let t = *cx.theme();
         self.snapshot_audio_focus(window);
+        // Covers state changes made without a recorder event (e.g. replay
+        // requested: Starting); set_state ignores unchanged snapshots.
+        self.sync_tray();
         let palette = self
             .palette
             .as_ref()
@@ -1115,6 +1184,7 @@ impl Render for ClipperWindow {
                             ),
                     ),
             )
+            .children(self.toast_stack(cx))
             .children(palette)
     }
 }
