@@ -408,6 +408,7 @@ impl ClipLibrary {
             leading: (menu == Menu::Source)
                 .then(|| icon(crate::components::RasterIcon::Filter, 16.)),
             chevron: Some(icon(crate::components::RasterIcon::ChevronDown, 14.)),
+            ..Default::default()
         };
         div()
             .w(px(if menu == Menu::Sort { 160. } else { 140. }))
