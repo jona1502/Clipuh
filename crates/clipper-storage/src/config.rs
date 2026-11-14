@@ -55,6 +55,7 @@ pub struct AppConfig {
     pub recording: RecordingSettings,
     pub notifications: NotificationSettings,
     pub app: AppSettings,
+    pub appearance: AppearanceSettings,
 }
 
 impl AppConfig {
@@ -181,6 +182,13 @@ impl AppConfig {
             ));
         }
 
+        if parse_hex_color(&self.appearance.accent_color).is_none() {
+            issues.push(ValidationIssue::new(
+                "appearance.accent_color",
+                "Use a color like #9B5CF6.",
+            ));
+        }
+
         if let Some(directory) = &self.recording.output_directory
             && !directory.is_absolute()
         {
@@ -275,6 +283,15 @@ impl AppConfig {
             path: path.to_owned(),
             source: Box::new(source),
         })?;
+        // An explicit `[appearance] mode` always beats the legacy `[app] theme`,
+        // even when it equals the default.
+        let explicit_mode = toml::from_str::<toml::Table>(&contents)
+            .ok()
+            .and_then(|table| table.get("appearance")?.get("mode").cloned())
+            .is_some();
+        if explicit_mode {
+            config.app.theme = None;
+        }
         config.migrate();
         config.validate().map_err(ConfigError::Validation)?;
         Ok(config)
@@ -302,6 +319,19 @@ impl AppConfig {
         if (5..=300).contains(&self.replay.duration_seconds) {
             self.replay.duration_seconds = nearest_replay_duration(self.replay.duration_seconds);
         }
+        // The legacy `[app] theme` is read but never written again. Adopt it
+        // only when `[appearance]` is untouched, so the new section wins.
+        let legacy_theme = self.app.theme.take();
+        if let Some(theme) = legacy_theme
+            && self.appearance == AppearanceSettings::default()
+        {
+            self.appearance.mode = theme;
+        }
+        // A bad accent must never block startup: fall back, or normalize case.
+        self.appearance.accent_color = match parse_hex_color(&self.appearance.accent_color) {
+            Some(rgb) => format_hex_color(rgb),
+            None => DEFAULT_ACCENT.to_owned(),
+        };
     }
 
     fn save_to(&self, path: &Path) -> Result<(), ConfigError> {
@@ -514,7 +544,9 @@ impl Default for NotificationSettings {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
-    pub theme: Theme,
+    /// Legacy; superseded by `appearance.mode`. Read for migration only.
+    #[serde(default, skip_serializing, deserialize_with = "lenient_option")]
+    pub theme: Option<Theme>,
     /// Enables automatic game detection when a future backend supports it.
     pub automatic_detection: bool,
     /// Keeps manual game selection available alongside automatic detection.
@@ -529,7 +561,7 @@ pub struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
-            theme: Theme::Dark,
+            theme: None,
             automatic_detection: true,
             manual_detection: true,
             start_on_login: false,
@@ -546,6 +578,80 @@ pub enum Theme {
     Dark,
     Light,
     System,
+}
+
+/// Default accent color, `#RRGGBB`.
+pub const DEFAULT_ACCENT: &str = "#9B5CF6";
+/// Accent presets offered in Settings, in display order.
+pub const ACCENT_PRESETS: [(&str, &str); 7] = [
+    ("Purple", "#9B5CF6"),
+    ("Blue", "#3B82F6"),
+    ("Cyan", "#06B6D4"),
+    ("Green", "#22C55E"),
+    ("Orange", "#F97316"),
+    ("Pink", "#EC4899"),
+    ("Red", "#EF4444"),
+];
+
+/// `[appearance]` section.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AppearanceSettings {
+    #[serde(deserialize_with = "lenient_default")]
+    pub mode: Theme,
+    pub accent_color: String,
+    #[serde(deserialize_with = "lenient_default")]
+    pub density: UiDensity,
+}
+
+impl Default for AppearanceSettings {
+    fn default() -> Self {
+        Self {
+            mode: Theme::Dark,
+            accent_color: DEFAULT_ACCENT.to_owned(),
+            density: UiDensity::Default,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiDensity {
+    Compact,
+    #[default]
+    Default,
+    Relaxed,
+}
+
+/// Parses exactly `#RRGGBB` (trimmed, any hex case) into `0xRRGGBB`.
+pub fn parse_hex_color(text: &str) -> Option<u32> {
+    let digits = text.trim().strip_prefix('#')?;
+    if digits.len() != 6 || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    u32::from_str_radix(digits, 16).ok()
+}
+
+/// Canonical stored form: `#RRGGBB`, uppercase.
+pub fn format_hex_color(rgb: u32) -> String {
+    format!("#{:06X}", rgb & 0xFF_FFFF)
+}
+
+// Unknown enum strings must not make the whole settings file unparsable.
+fn lenient_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    Ok(toml::Value::deserialize(deserializer)?.try_into().ok())
+}
+
+fn lenient_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned + Default,
+{
+    lenient_option(deserializer).map(Option::unwrap_or_default)
 }
 
 /// `<Videos>/Clipper` for the current user.
@@ -818,7 +924,7 @@ mod tests {
         assert_eq!(config.recording.quality, QualityPreset::Balanced);
         assert_eq!(config.recording.output_directory, None);
 
-        assert_eq!(config.app.theme, Theme::Dark);
+        assert_eq!(config.appearance.mode, Theme::Dark);
         assert!(config.app.automatic_detection);
         assert!(config.app.manual_detection);
         assert!(!config.app.start_on_login);
@@ -832,11 +938,96 @@ mod tests {
         let mut config = AppConfig::default();
         config.replay.hotkey = "Ctrl+Shift+F9".to_owned();
         config.audio.microphone = false;
-        config.app.theme = Theme::Light;
+        config.appearance.mode = Theme::Light;
 
         let toml = toml::to_string(&config).expect("serialize config");
         let loaded: AppConfig = toml::from_str(&toml).expect("deserialize config");
 
+        assert_eq!(loaded, config);
+    }
+
+    #[test]
+    fn parse_hex_color_accepts_only_rrggbb() {
+        assert_eq!(parse_hex_color("#9B5CF6"), Some(0x9B5CF6));
+        assert_eq!(parse_hex_color("#9b5cf6"), Some(0x9B5CF6));
+        assert_eq!(parse_hex_color("  #22C55E \n"), Some(0x22C55E));
+        for bad in ["9B5CF6", "#9B5", "#9B5CF6FF", "#GGGGGG", "", "#"] {
+            assert_eq!(parse_hex_color(bad), None, "{bad:?}");
+        }
+        for (_, hex) in ACCENT_PRESETS {
+            assert_eq!(format_hex_color(parse_hex_color(hex).unwrap()), hex);
+        }
+        assert_eq!(format_hex_color(0x0000AB), "#0000AB");
+    }
+
+    #[test]
+    fn default_config_writes_appearance_and_no_legacy_theme() {
+        let toml = toml::to_string(&AppConfig::default()).expect("serialize");
+        assert!(toml.contains("[appearance]"));
+        assert!(toml.contains("mode = \"dark\""));
+        assert!(toml.contains("accent_color = \"#9B5CF6\""));
+        assert!(toml.contains("density = \"default\""));
+        assert!(!toml.contains("theme"));
+    }
+
+    fn load_text(text: &str) -> AppConfig {
+        let dir = TestDir::new();
+        let path = dir.path("settings.toml");
+        fs::write(&path, text).expect("write config");
+        AppConfig::load_from(&path).expect("load config")
+    }
+
+    #[test]
+    fn legacy_app_theme_migrates_to_appearance_mode() {
+        let config = load_text("[app]\ntheme = \"light\"\n");
+        assert_eq!(config.appearance.mode, Theme::Light);
+        assert_eq!(config.app.theme, None);
+
+        let dir = TestDir::new();
+        let path = dir.path("out.toml");
+        config.save_to(&path).expect("save");
+        let written = fs::read_to_string(&path).expect("read");
+        assert!(!written.contains("theme"));
+        assert!(written.contains("mode = \"light\""));
+
+        // An explicit [appearance] wins over the legacy field.
+        let config = load_text("[app]\ntheme = \"light\"\n[appearance]\ndensity = \"compact\"\n");
+        assert_eq!(config.appearance.mode, Theme::Dark);
+        // Even an explicit mode equal to the default beats the legacy field.
+        let config = load_text("[app]\ntheme = \"light\"\n[appearance]\nmode = \"dark\"\n");
+        assert_eq!(config.appearance.mode, Theme::Dark);
+    }
+
+    #[test]
+    fn appearance_values_are_repaired_not_fatal() {
+        let config = load_text("[appearance]\naccent_color = \"purple\"\n");
+        assert_eq!(config.appearance.accent_color, DEFAULT_ACCENT);
+        let config = load_text("[appearance]\naccent_color = \"#9b5cf6\"\n");
+        assert_eq!(config.appearance.accent_color, "#9B5CF6");
+        let config = load_text("[appearance]\ndensity = \"huge\"\nmode = \"neon\"\n");
+        assert_eq!(config.appearance, AppearanceSettings::default());
+        let config = load_text("[app]\ntheme = \"neon\"\n");
+        assert_eq!(config.appearance.mode, Theme::Dark);
+
+        let mut config = AppConfig::default();
+        config.appearance.accent_color = "nope".to_owned();
+        let error = config.validate().expect_err("bad accent");
+        assert_eq!(error.issues()[0].field(), "appearance.accent_color");
+        assert_eq!(error.issues()[0].message(), "Use a color like #9B5CF6.");
+    }
+
+    #[test]
+    fn appearance_round_trips() {
+        let config = AppConfig {
+            appearance: AppearanceSettings {
+                mode: Theme::Light,
+                accent_color: "#22C55E".to_owned(),
+                density: UiDensity::Compact,
+            },
+            ..AppConfig::default()
+        };
+        let loaded: AppConfig =
+            toml::from_str(&toml::to_string(&config).expect("serialize")).expect("deserialize");
         assert_eq!(loaded, config);
     }
 
