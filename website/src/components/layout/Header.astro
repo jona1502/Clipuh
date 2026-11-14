@@ -15,11 +15,13 @@ const ctaHref = "#download";
 const ctaLabel = site.nav.find((l) => l.href === ctaHref)?.label ?? "Download";
 const links = site.nav.filter((l) => l.href !== ctaHref);
 const linkClass =
-  "text-small text-text-secondary hover:text-text aria-[current=location]:text-text rounded-md px-3 py-2 font-medium transition-colors duration-150";
+  "text-small text-text-secondary hover:text-text aria-[current=location]:text-text inline-flex min-h-11 items-center rounded-md px-3 font-medium transition-colors duration-150";
 const mobileLinkClass =
   "text-body text-text-secondary hover:bg-surface-hover hover:text-text aria-[current=location]:text-text flex min-h-11 items-center rounded-md px-3 font-medium";
+// Ink pill on the accent fill: accent-hover text on accent-foreground is
+// >= 4.5:1 at caption size (a translucent ink tint over accent was 3.6:1).
 const badgeClass =
-  "bg-accent-foreground/15 text-caption rounded-sm px-1.5 py-0.5";
+  "bg-accent-foreground text-accent-hover text-caption rounded-sm px-1.5 py-0.5";
 ---
 
 <header
@@ -35,7 +37,7 @@ const badgeClass =
           {l.label}
         </a>
       ))}
-      <Button href={ctaHref} data-nav-link class="ml-3">
+      <Button href={ctaHref} data-nav-link class="ml-3 min-h-11">
         {ctaLabel}
         {!site.download.available && <span class={badgeClass}>Soon</span>}
       </Button>
@@ -105,6 +107,7 @@ const badgeClass =
     right: 0;
     border-bottom: 1px solid var(--color-border);
     background: var(--color-background-elevated);
+    box-shadow: var(--shadow-lg);
     visibility: hidden;
     opacity: 0;
     transform: translateY(-6px);
@@ -182,8 +185,9 @@ const badgeClass =
     const visible = new Set<string>();
     const order = [...targets.keys()];
     const apply = () => {
-      // First visible section in link order wins.
-      const active = order.find((id) => visible.has(id));
+      // Last visible section in link order wins, so the final section
+      // (Download) can become active while the one above is still in the band.
+      const active = order.findLast((id) => visible.has(id));
       for (const a of links) {
         if (active && hashOf(a) === active)
           a.setAttribute("aria-current", "location");

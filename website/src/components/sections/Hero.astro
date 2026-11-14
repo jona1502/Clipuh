@@ -30,7 +30,7 @@ const downloadHref = directUrl ?? `#${sections.download}`;
         <Button href={downloadHref} size="lg">
           Download for {download.platform}
           {!directUrl && (
-            <span class="bg-accent-foreground/15 text-caption ml-1 rounded-sm px-2 py-0.5 font-semibold">
+            <span class="bg-accent-foreground text-accent-hover text-caption ml-1 rounded-sm px-2 py-0.5 font-semibold">
               {download.statusLabel}
             </span>
           )}
