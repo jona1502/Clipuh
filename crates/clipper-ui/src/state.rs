@@ -27,7 +27,7 @@ pub(crate) struct StorageProjectionKey {
     codec: VideoCodec,
     quality: clipper_storage::config::QualityPreset,
     bitrate_mbps: u32,
-    /// Encoded audio tracks (enabled sources plus the mix); the only audio input.
+    /// Audio tracks the session is planned to encode on this Windows version; the only audio input.
     audio_tracks: u32,
     replay_duration_seconds: u32,
     replay_memory_limit_megabytes: u32,
@@ -42,7 +42,7 @@ impl From<&AppConfig> for StorageProjectionKey {
             codec: config.video.codec,
             quality: config.recording.quality,
             bitrate_mbps: config.video.bitrate_mbps,
-            audio_tracks: config.audio.recording_options().encoded_track_count(),
+            audio_tracks: clipper_recorder::planned_audio_tracks(&config.audio.recording_options()),
             replay_duration_seconds: config.replay.duration_seconds,
             replay_memory_limit_megabytes: config.replay.memory_limit_megabytes,
         }

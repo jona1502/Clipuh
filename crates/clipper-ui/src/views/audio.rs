@@ -33,6 +33,9 @@ const TRACKS_KEY: u32 = u32::MAX;
 const LEVEL_MIN_INTERVAL: Duration = Duration::from_millis(100);
 /// Smaller peak changes are invisible on a 6 px bar.
 const LEVEL_EPSILON: f32 = 0.02;
+/// Peaks at or below this read as silence.
+const LEVEL_SILENCE: f32 = 0.005;
+const IDLE_APP_HINT: &str = "Starts capturing when the app plays audio";
 const NO_LOOPBACK: &str = "Needs Windows 11 or Windows 10 build 20348+";
 
 /// Keyboard focus of one mixer row.
@@ -74,25 +77,17 @@ fn row_status(
 }
 
 /// Why a source cannot be captured on this machine right now, if known.
-/// `apps` is `None` until the application list has loaded.
+/// Whether an application is running is not decided here: the app list only holds apps
+/// currently playing audio, so the engine's per-source status is the authority.
 fn row_unavailable(
     kind: AudioSourceType,
     target: Option<&str>,
     loopback: bool,
-    apps: Option<&[AudioApplication]>,
     device_known: Option<bool>,
-    has_engine_state: bool,
 ) -> Option<&'static str> {
     match kind {
         AudioSourceType::Game if !loopback => Some(NO_LOOPBACK),
         AudioSourceType::Application if !loopback => Some(NO_LOOPBACK),
-        AudioSourceType::Application if !has_engine_state => {
-            let (apps, target) = (apps?, target?);
-            (!apps
-                .iter()
-                .any(|a| a.executable.eq_ignore_ascii_case(target)))
-            .then_some("Application not running")
-        }
         AudioSourceType::Desktop | AudioSourceType::Microphone
             if target.is_some() && device_known == Some(false) =>
         {
@@ -112,6 +107,15 @@ pub(super) fn levels_need_redraw(
     let sources_differ =
         shown.len() != next.len() || shown.iter().zip(next).any(|(a, b)| a.source != b.source);
     if sources_differ {
+        return true;
+    }
+    // The engine sends only on change, so a drop to silence may be the last update:
+    // never throttle it away or the meter would stick.
+    if shown
+        .iter()
+        .zip(next)
+        .any(|(a, b)| a.peak > LEVEL_SILENCE && b.peak <= LEVEL_SILENCE)
+    {
         return true;
     }
     if since_last.is_some_and(|d| d < LEVEL_MIN_INTERVAL) {
@@ -837,11 +841,17 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
             source.kind,
             source.target.as_deref(),
             window.process_loopback(),
-            lists_loaded.then_some(window.audio_apps.as_slice()),
             device_known,
-            state.is_some(),
         );
-        let (tone, text, meter) = row_status(source.enabled, state.map(|s| &s.status), unavailable);
+        let (tone, mut text, meter) =
+            row_status(source.enabled, state.map(|s| &s.status), unavailable);
+        if source.enabled
+            && state.is_none()
+            && unavailable.is_none()
+            && source.kind == AudioSourceType::Application
+        {
+            text = Some(IDLE_APP_HINT.into());
+        }
         let peak = window
             .audio_levels
             .iter()
@@ -1154,37 +1164,17 @@ mod tests {
     #[test]
     fn unavailability_reasons() {
         use AudioSourceType::*;
+        assert_eq!(row_unavailable(Game, None, false, None), Some(NO_LOOPBACK));
+        assert_eq!(row_unavailable(Game, None, true, None), None);
         assert_eq!(
-            row_unavailable(Game, None, false, None, None, false),
+            row_unavailable(Application, Some("a.exe"), false, None),
             Some(NO_LOOPBACK)
         );
-        assert_eq!(row_unavailable(Game, None, true, None, None, false), None);
         assert_eq!(
-            row_unavailable(Application, Some("a.exe"), false, None, None, false),
-            Some(NO_LOOPBACK)
-        );
-        // List not loaded yet: no claim either way.
-        assert_eq!(
-            row_unavailable(Application, Some("a.exe"), true, None, None, false),
-            None
-        );
-        assert_eq!(
-            row_unavailable(Application, Some("a.exe"), true, Some(&[]), None, false),
-            Some("Application not running")
-        );
-        // Engine state wins over the list.
-        assert_eq!(
-            row_unavailable(Application, Some("a.exe"), true, Some(&[]), None, true),
-            None
-        );
-        assert_eq!(
-            row_unavailable(Microphone, Some("id"), true, None, Some(false), false),
+            row_unavailable(Microphone, Some("id"), true, Some(false)),
             Some("Device not available")
         );
-        assert_eq!(
-            row_unavailable(Microphone, None, true, None, Some(false), false),
-            None
-        );
+        assert_eq!(row_unavailable(Microphone, None, true, Some(false)), None);
     }
 
     #[test]
@@ -1198,6 +1188,11 @@ mod tests {
         assert!(!levels_need_redraw(&[l(1, 0.0)], &[l(1, 0.5)], ms(99)));
         assert!(!levels_need_redraw(&[l(1, 0.50)], &[l(1, 0.51)], ms(500)));
         assert!(levels_need_redraw(&[l(1, 0.5)], &[l(2, 0.5)], ms(0)));
+        // Drop to silence is always drawn, even inside the throttle window.
+        assert!(levels_need_redraw(&[l(1, 0.5)], &[l(1, 0.0)], ms(10)));
+        assert!(levels_need_redraw(&[l(1, 0.01)], &[l(1, 0.0)], ms(10)));
+        assert!(!levels_need_redraw(&[l(1, 0.0)], &[l(1, 0.001)], ms(10)));
+        assert!(!levels_need_redraw(&[l(1, 0.0)], &[l(1, 0.0)], ms(500)));
     }
 
     #[test]

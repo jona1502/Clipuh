@@ -12,6 +12,7 @@ clipper-media.workspace = true
 image.workspace = true
 clipper-audio.workspace = true
 clipper-platform.workspace = true
+clipper-recorder.workspace = true
 clipper-storage.workspace = true
 gpui.workspace = true
 raw-window-handle.workspace = true
