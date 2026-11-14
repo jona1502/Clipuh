@@ -7,6 +7,34 @@ const GAP: f32 = 16.0;
 const MIN_CARD_WIDTH: f32 = 270.0;
 /// Sidebar plus page padding, subtracted from the viewport for the grid width.
 const CHROME_WIDTH: f32 = 304.0;
+/// Content width the one-row toolbar needs with every tab label shown.
+const TOOLBAR_FULL_WIDTH: f32 = 1150.0;
+/// Content width it needs with icon-only filter tabs (All Clips keeps its
+/// label); below this the shortcut hint goes and the dropdowns get shorter.
+const TOOLBAR_ICON_TABS_WIDTH: f32 = 900.0;
+
+/// How much the Library toolbar shows so that it always fits on one row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolbarDensity {
+    /// Labels on every tab.
+    Full,
+    /// Favorites, Game Clips and Recordings as icons with tooltips.
+    IconTabs,
+    /// Icon tabs, no Ctrl+F hint, shorter dropdowns, narrower search.
+    Tight,
+}
+
+fn toolbar_density(viewport: f32) -> ToolbarDensity {
+    let content = viewport - CHROME_WIDTH;
+    if content >= TOOLBAR_FULL_WIDTH {
+        ToolbarDensity::Full
+    } else if content >= TOOLBAR_ICON_TABS_WIDTH {
+        ToolbarDensity::IconTabs
+    } else {
+        ToolbarDensity::Tight
+    }
+}
+
 /// Thumbnail height / card width, as in the approved Library design.
 const THUMB_RATIO: f32 = 9.0 / 16.0;
 
@@ -186,7 +214,9 @@ impl ClipLibrary {
         self.favorites_changed(window, cx);
     }
 
-    fn tabs(&self, t: &Theme, cx: &mut Context<Self>) -> Div {
+    /// Filter tabs; `icons_only` drops the labels of every tab but All Clips
+    /// (the label becomes a tooltip) so the toolbar stays on one row.
+    fn tabs(&self, t: &Theme, icons_only: bool, cx: &mut Context<Self>) -> Div {
         let enabled = !self.busy;
         div()
             .flex()
@@ -201,13 +231,20 @@ impl ClipLibrary {
                     .enumerate()
                     .map(|(index, (tab, glyph, label))| {
                         let active = self.tab == tab;
+                        let compact = icons_only && tab != Tab::All;
                         let item = div()
                             .id(("library-tab", index))
+                            .flex_none()
                             .flex()
                             .items_center()
+                            .justify_center()
                             .gap_2()
                             .h(t.metrics.control_height)
-                            .px_3()
+                            .when(compact, |d| {
+                                d.w(t.metrics.control_height)
+                                    .tooltip(crate::components::tooltip(label))
+                            })
+                            .when(!compact, |d| d.px_3())
                             .rounded_md()
                             .border_1()
                             .text_sm()
@@ -223,7 +260,7 @@ impl ClipLibrary {
                                 }
                             })
                             .child(glyph)
-                            .child(label);
+                            .when(!compact, |d| d.child(label));
                         let focus = &self.controls[19 + index];
                         item.when(enabled, |d| {
                             d.cursor_pointer()
@@ -350,24 +387,40 @@ impl Render for ClipLibrary {
                 .iter()
                 .all(|id| self.settings.favorites.contains(id));
 
+        // Always one row: labels and hints give way before anything wraps.
+        let density = toolbar_density(viewport);
+        let tight = density == ToolbarDensity::Tight;
         let search = div()
-            .w(px(260.))
+            .flex_1()
+            .min_w(px(120.))
+            .max_w(px(260.))
             .flex()
             .items_center()
             .gap_2()
             .child(div().flex_1().min_w_0().child(self.search.clone()))
-            .child(crate::components::shortcut(&t, &["Ctrl", "F"]));
+            .when(!tight, |d| {
+                d.child(crate::components::shortcut(&t, &["Ctrl", "F"]))
+            });
         let toolbar = div()
             .flex()
-            .flex_wrap()
+            .flex_nowrap()
             .items_center()
-            .gap_3()
-            .child(self.tabs(&t, cx))
-            .child(div().flex_1())
+            .gap(px(if tight { 8. } else { 12. }))
+            .min_w_0()
+            .child(self.tabs(&t, density != ToolbarDensity::Full, cx))
+            .child(div().flex_1().min_w(px(0.)))
             .child(search)
-            .child(self.menu_control(&t, Menu::Source, window, cx))
-            .child(self.menu_control(&t, Menu::Sort, window, cx))
-            .child(self.view_toggle(&t, window, cx))
+            .child(
+                div()
+                    .flex_none()
+                    .child(self.menu_control(&t, Menu::Source, tight, window, cx)),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .child(self.menu_control(&t, Menu::Sort, tight, window, cx)),
+            )
+            .child(div().flex_none().child(self.view_toggle(&t, window, cx)))
             // Only needed when Windows cannot watch the folder for changes.
             .when(self.watcher.is_none(), |d| {
                 d.child(control(
@@ -1221,6 +1274,14 @@ mod tests {
     #[test]
     fn four_columns_at_the_reference_size_fewer_when_narrow() {
         assert_eq!(columns_for(1672.), 4);
+        // Toolbar density follows the content width (viewport minus chrome).
+        assert_eq!(toolbar_density(1920.), ToolbarDensity::Full);
+        assert_eq!(toolbar_density(1300.), ToolbarDensity::IconTabs);
+        assert_eq!(toolbar_density(1080.), ToolbarDensity::Tight);
+        assert_eq!(
+            toolbar_density(CHROME_WIDTH + TOOLBAR_FULL_WIDTH),
+            ToolbarDensity::Full
+        );
         assert_eq!(columns_for(1920.), 4);
         assert_eq!(columns_for(1100.), 2);
         assert_eq!(columns_for(400.), 1);
