@@ -5,10 +5,10 @@ use std::{cell::Cell, rc::Rc};
 use gpui::prelude::*;
 use gpui::{
     App, Bounds, Div, ElementId, FocusHandle, MouseButton, Pixels, SharedString, Stateful, Window,
-    anchored, canvas, deferred, div, px, rgb, rgba,
+    anchored, canvas, deferred, div, px,
 };
 
-use crate::theme;
+use crate::theme::Theme;
 
 #[derive(Clone, Debug)]
 pub struct DropdownOption {
@@ -45,6 +45,7 @@ pub fn step(options: &[DropdownOption], from: usize, delta: isize) -> usize {
 /// trigger, so clicking the trigger while open closes instead of dismiss+reopen.
 #[allow(clippy::too_many_arguments)] // fixed API agreed with the caller view
 pub fn dropdown(
+    t: &Theme,
     id: impl Into<ElementId>,
     options: &[DropdownOption],
     selected: usize,
@@ -73,18 +74,18 @@ pub fn dropdown(
         .items_center()
         .justify_between()
         .w_full()
-        .h(px(32.))
-        .px_3()
+        .h(t.metrics.control_height)
+        .px(t.metrics.control_padding)
         .rounded_md()
         .border_1()
-        .border_color(rgb(if focused || open {
-            theme::FOCUS_RING
+        .border_color(if focused || open {
+            t.colors.focus_ring
         } else {
-            theme::BORDER
-        }))
-        .bg(rgb(theme::SURFACE_RAISED))
+            t.colors.border
+        })
+        .bg(t.colors.surface_raised)
         .text_sm()
-        .text_color(rgb(theme::TEXT))
+        .text_color(t.colors.text)
         .track_focus(focus)
         .key_context("Dropdown")
         .child(
@@ -93,10 +94,10 @@ pub fn dropdown(
                 .size_full(),
         )
         .child(div().child(label))
-        .child(div().text_color(rgb(theme::TEXT_TERTIARY)).child("▾"))
+        .child(div().text_color(t.colors.text_muted).child("▾"))
         .when(enabled, |this| {
             this.cursor_pointer()
-                .hover(|s| s.bg(rgb(theme::SURFACE_HOVER)))
+                .hover(|s| s.bg(t.colors.surface_hover))
                 .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                     window.focus(&focus_click);
                     on_toggle(window, cx);
@@ -120,24 +121,23 @@ pub fn dropdown(
                 .child(
                     div()
                         .w(px(14.))
-                        .text_color(rgb(theme::ACCENT))
+                        .text_color(t.colors.accent)
                         .child(if i == selected { "✓" } else { "" }),
                 )
                 .child(div().flex_1().child(o.label.clone()))
-                .children(o.detail.clone().map(|d| {
-                    div()
-                        .text_xs()
-                        .text_color(rgb(theme::TEXT_TERTIARY))
-                        .child(d)
-                }));
+                .children(
+                    o.detail
+                        .clone()
+                        .map(|d| div().text_xs().text_color(t.colors.text_muted).child(d)),
+                );
             if o.enabled {
-                row.text_color(rgb(theme::TEXT))
+                row.text_color(t.colors.text)
                     .cursor_pointer()
-                    .when(i == hi, |r| r.bg(rgba(theme::ACCENT_SUBTLE)))
-                    .when(i != hi, |r| r.hover(|s| s.bg(rgb(theme::SURFACE_HOVER))))
+                    .when(i == hi, |r| r.bg(t.colors.accent_subtle))
+                    .when(i != hi, |r| r.hover(|s| s.bg(t.colors.surface_hover)))
                     .on_click(move |_, window, cx| on_select(i, window, cx))
             } else {
-                row.text_color(rgb(theme::TEXT_TERTIARY))
+                row.text_color(t.colors.text_muted)
                     .children(o.reason.clone().map(|r| div().text_xs().child(r)))
             }
         });
@@ -153,8 +153,8 @@ pub fn dropdown(
                     .p_1()
                     .rounded_lg()
                     .border_1()
-                    .border_color(rgb(theme::BORDER_STRONG))
-                    .bg(rgb(theme::SURFACE))
+                    .border_color(t.colors.border_strong)
+                    .bg(t.colors.surface)
                     .shadow_lg()
                     .children(rows)
                     .on_mouse_down_out(move |_, window, cx| {
@@ -173,7 +173,11 @@ pub fn dropdown(
         .child(trigger)
         .children(menu.map(|m| {
             // zero-size slot just below the trigger; anchored sits at its layout position
-            div().absolute().top(px(36.)).left_0().child(m)
+            div()
+                .absolute()
+                .top(t.metrics.control_height + px(4.))
+                .left_0()
+                .child(m)
         }))
 }
 

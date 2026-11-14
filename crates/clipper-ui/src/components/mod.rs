@@ -2,12 +2,35 @@
 //! spacing and states stay consistent across pages.
 
 mod dropdown;
+mod text_input;
+mod toggle;
+mod tooltip;
 pub use dropdown::{DropdownOption, dropdown, step};
+pub use text_input::{TextInput, TextInputEvent};
+pub use toggle::toggle;
+pub use tooltip::tooltip;
 
 use gpui::prelude::*;
-use gpui::{Div, ElementId, FontWeight, IntoElement, SharedString, Stateful, div, px, rgb, rgba};
+use gpui::{
+    AnyElement, App, Div, ElementId, FontWeight, Hsla, IntoElement, KeyBinding, SharedString,
+    Stateful, actions, div, px, transparent_black,
+};
 
-use crate::theme;
+use crate::theme::Theme;
+
+actions!(components, [Activate, Submit, Dismiss]);
+
+/// Registers the key bindings the stateful components rely on. Call once at startup.
+/// Actions (not raw key-down) are used because bindings run before `on_key_down` and the
+/// window context already binds `enter`.
+pub fn bind_keys(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("space", Activate, Some("Toggle")),
+        KeyBinding::new("enter", Activate, Some("Toggle")),
+        KeyBinding::new("enter", Submit, Some("TextInput")),
+        KeyBinding::new("escape", Dismiss, Some("TextInput")),
+    ]);
+}
 
 /// Semantic color for badges and status dots.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -19,12 +42,12 @@ pub enum Tone {
 }
 
 impl Tone {
-    fn color(self) -> u32 {
+    pub fn color(self, t: &Theme) -> Hsla {
         match self {
-            Self::Neutral => theme::NEUTRAL,
-            Self::Success => theme::SUCCESS,
-            Self::Warning => theme::WARNING,
-            Self::Danger => theme::DANGER,
+            Self::Neutral => t.colors.neutral,
+            Self::Success => t.colors.success,
+            Self::Warning => t.colors.warning,
+            Self::Danger => t.colors.danger,
         }
     }
 }
@@ -38,16 +61,20 @@ pub enum ButtonVariant {
 }
 
 /// The base surface: one subtle border, one fill, one radius.
-pub fn panel() -> Div {
+pub fn panel(t: &Theme) -> Div {
     div()
         .rounded_xl()
         .border_1()
-        .border_color(rgb(theme::BORDER))
-        .bg(rgb(theme::SURFACE))
+        .border_color(t.colors.border)
+        .bg(t.colors.surface)
 }
 
 /// Small uppercase-free section label with optional trailing note.
-pub fn section_header(title: impl Into<SharedString>, trailing: Option<SharedString>) -> Div {
+pub fn section_header(
+    t: &Theme,
+    title: impl Into<SharedString>,
+    trailing: Option<SharedString>,
+) -> Div {
     div()
         .flex()
         .items_center()
@@ -57,19 +84,14 @@ pub fn section_header(title: impl Into<SharedString>, trailing: Option<SharedStr
             div()
                 .text_xs()
                 .font_weight(FontWeight::SEMIBOLD)
-                .text_color(rgb(theme::TEXT_SECONDARY))
+                .text_color(t.colors.text_secondary)
                 .child(title.into()),
         )
-        .children(trailing.map(|note| {
-            div()
-                .text_xs()
-                .text_color(rgb(theme::TEXT_TERTIARY))
-                .child(note)
-        }))
+        .children(trailing.map(|note| div().text_xs().text_color(t.colors.text_muted).child(note)))
 }
 
 /// A keycap. Pass one key per call ("Ctrl", "K").
-pub fn kbd(key: impl Into<SharedString>) -> Div {
+pub fn kbd(t: &Theme, key: impl Into<SharedString>) -> Div {
     div()
         .min_w(px(18.))
         .h(px(18.))
@@ -79,29 +101,29 @@ pub fn kbd(key: impl Into<SharedString>) -> Div {
         .justify_center()
         .rounded_sm()
         .border_1()
-        .border_color(rgb(theme::BORDER_STRONG))
-        .bg(rgb(theme::SURFACE_RAISED))
+        .border_color(t.colors.border_strong)
+        .bg(t.colors.surface_raised)
         .text_size(px(10.))
         .font_weight(FontWeight::MEDIUM)
-        .text_color(rgb(theme::TEXT_SECONDARY))
+        .text_color(t.colors.text_secondary)
         .child(key.into())
 }
 
 /// Key combination such as `&["Ctrl", "K"]`.
-pub fn shortcut(keys: &[&'static str]) -> Div {
+pub fn shortcut(t: &Theme, keys: &[&'static str]) -> Div {
     div()
         .flex()
         .items_center()
         .gap(px(3.))
-        .children(keys.iter().map(|key| kbd(*key)))
+        .children(keys.iter().map(|key| kbd(t, *key)))
 }
 
-pub fn status_dot(tone: Tone) -> Div {
-    div().size(px(6.)).rounded_full().bg(rgb(tone.color()))
+pub fn status_dot(t: &Theme, tone: Tone) -> Div {
+    div().size(px(6.)).rounded_full().bg(tone.color(t))
 }
 
 /// Minimal pill: colored dot plus muted label.
-pub fn badge(label: impl Into<SharedString>, tone: Tone) -> Div {
+pub fn badge(t: &Theme, label: impl Into<SharedString>, tone: Tone) -> Div {
     div()
         .flex()
         .items_center()
@@ -110,17 +132,18 @@ pub fn badge(label: impl Into<SharedString>, tone: Tone) -> Div {
         .px_2()
         .rounded_md()
         .border_1()
-        .border_color(rgb(theme::BORDER))
-        .bg(rgb(theme::SURFACE_RAISED))
+        .border_color(t.colors.border)
+        .bg(t.colors.surface_raised)
         .text_xs()
-        .text_color(rgb(theme::TEXT_SECONDARY))
-        .child(status_dot(tone))
+        .text_color(t.colors.text_secondary)
+        .child(status_dot(t, tone))
         .child(label.into())
 }
 
 /// Compact button. Disabled buttons keep their layout but drop hover and pointer.
 /// Callers attach `on_click` to the returned element.
 pub fn button(
+    t: &Theme,
     id: impl Into<ElementId>,
     label: impl Into<SharedString>,
     variant: ButtonVariant,
@@ -129,28 +152,28 @@ pub fn button(
 ) -> Stateful<Div> {
     let (bg, hover, text, border) = match variant {
         ButtonVariant::Primary => (
-            theme::ACCENT,
-            theme::ACCENT_HOVER,
-            theme::TEXT_ON_ACCENT,
-            theme::ACCENT,
+            t.colors.accent,
+            t.colors.accent_hover,
+            t.colors.accent_foreground,
+            t.colors.accent,
         ),
         ButtonVariant::Secondary => (
-            theme::SURFACE_RAISED,
-            theme::SURFACE_HOVER,
-            theme::TEXT,
-            theme::BORDER_STRONG,
+            t.colors.surface_raised,
+            t.colors.surface_hover,
+            t.colors.text,
+            t.colors.border_strong,
         ),
         ButtonVariant::Danger => (
-            theme::RECORDING,
-            theme::RECORDING_HOVER,
-            theme::TEXT_ON_ACCENT,
-            theme::RECORDING,
+            t.colors.recording,
+            t.colors.recording_hover,
+            t.colors.recording_foreground,
+            t.colors.recording,
         ),
         ButtonVariant::Ghost => (
-            theme::SURFACE,
-            theme::SURFACE_HOVER,
-            theme::TEXT_SECONDARY,
-            theme::SURFACE,
+            transparent_black(),
+            t.colors.surface_hover,
+            t.colors.text_secondary,
+            transparent_black(),
         ),
     };
 
@@ -159,20 +182,20 @@ pub fn button(
         .flex()
         .items_center()
         .gap_2()
-        .h(px(30.))
-        .px_3()
+        .h(t.metrics.control_height)
+        .px(t.metrics.control_padding)
         .rounded_md()
         .border_1()
-        .border_color(rgb(border))
-        .bg(rgb(bg))
+        .border_color(border)
+        .bg(bg)
         .text_xs()
         .font_weight(FontWeight::MEDIUM)
-        .text_color(rgb(text))
+        .text_color(text)
         .child(label.into())
-        .children(keys.map(shortcut))
+        .children(keys.map(|k| shortcut(t, k)))
         .map(|this| {
             if enabled {
-                this.cursor_pointer().hover(|style| style.bg(rgb(hover)))
+                this.cursor_pointer().hover(|style| style.bg(hover))
             } else {
                 this.opacity(0.45)
             }
@@ -181,6 +204,7 @@ pub fn button(
 
 /// Selectable option chip (resolution, fps, quality). Callers attach `on_click` only when enabled.
 pub fn chip(
+    t: &Theme,
     id: impl Into<ElementId>,
     label: impl Into<SharedString>,
     selected: bool,
@@ -188,8 +212,8 @@ pub fn chip(
 ) -> Stateful<Div> {
     div()
         .id(id)
-        .h(px(26.))
-        .px_2p5()
+        .h(t.metrics.control_height_small)
+        .px(t.metrics.control_padding)
         .flex()
         .items_center()
         .rounded_md()
@@ -198,19 +222,19 @@ pub fn chip(
         .font_weight(FontWeight::MEDIUM)
         .map(|this| {
             if selected {
-                this.border_color(rgba(theme::FOCUS_RING))
-                    .bg(rgba(theme::ACCENT_SUBTLE))
-                    .text_color(rgb(theme::TEXT))
+                this.border_color(t.colors.focus_ring)
+                    .bg(t.colors.accent_subtle)
+                    .text_color(t.colors.text)
             } else {
-                this.border_color(rgb(theme::BORDER))
-                    .bg(rgb(theme::SURFACE_RAISED))
-                    .text_color(rgb(theme::TEXT_SECONDARY))
+                this.border_color(t.colors.border)
+                    .bg(t.colors.surface_raised)
+                    .text_color(t.colors.text_secondary)
             }
         })
         .map(|this| {
             if enabled {
                 this.cursor_pointer().when(!selected, |this| {
-                    this.hover(|style| style.border_color(rgb(theme::BORDER_STRONG)))
+                    this.hover(|style| style.border_color(t.colors.border_strong))
                 })
             } else {
                 this.opacity(0.45)
@@ -221,6 +245,7 @@ pub fn chip(
 
 /// One label/value line inside a panel. Rows after the first draw a top divider.
 pub fn property_row(
+    t: &Theme,
     label: impl Into<SharedString>,
     description: Option<SharedString>,
     value: impl IntoElement,
@@ -231,10 +256,10 @@ pub fn property_row(
         .items_center()
         .justify_between()
         .gap_6()
-        .px_4()
-        .py_3()
+        .px(t.metrics.card_padding)
+        .py(t.metrics.row_padding)
         .when(!first, |this| {
-            this.border_t_1().border_color(rgb(theme::BORDER))
+            this.border_t_1().border_color(t.colors.border)
         })
         .child(
             div()
@@ -243,27 +268,25 @@ pub fn property_row(
                 .gap_0p5()
                 .min_w_0()
                 .child(div().text_sm().child(label.into()))
-                .children(description.map(|text| {
-                    div()
-                        .text_xs()
-                        .text_color(rgb(theme::TEXT_TERTIARY))
-                        .child(text)
-                })),
+                .children(
+                    description
+                        .map(|text| div().text_xs().text_color(t.colors.text_muted).child(text)),
+                ),
         )
         .child(value)
 }
 
 /// Right-aligned secondary value for `property_row`.
-pub fn value_text(text: impl Into<SharedString>) -> Div {
+pub fn value_text(t: &Theme, text: impl Into<SharedString>) -> Div {
     div()
         .flex_none()
         .text_sm()
-        .text_color(rgb(theme::TEXT_SECONDARY))
+        .text_color(t.colors.text_secondary)
         .child(text.into())
 }
 
 /// Read-only switch visual. Settings are not editable from the UI yet.
-pub fn switch(on: bool) -> Div {
+pub fn switch(t: &Theme, on: bool) -> Div {
     div()
         .flex_none()
         .w(px(28.))
@@ -271,37 +294,38 @@ pub fn switch(on: bool) -> Div {
         .p(px(2.))
         .flex()
         .rounded_full()
-        .bg(rgb(if on {
-            theme::ACCENT
+        .bg(if on {
+            t.colors.accent
         } else {
-            theme::BORDER_STRONG
-        }))
+            t.colors.border_strong
+        })
         .when(on, |this| this.justify_end())
         .child(
             div()
                 .size(px(12.))
                 .rounded_full()
-                .bg(rgb(theme::TEXT_ON_ACCENT)),
+                .bg(t.colors.accent_foreground),
         )
 }
 
 /// Label, large value and one line of context.
 pub fn stat_tile(
+    t: &Theme,
     label: impl Into<SharedString>,
     value: impl Into<SharedString>,
     detail: impl Into<SharedString>,
 ) -> Div {
-    panel()
+    panel(t)
         .flex_1()
         .min_w_0()
-        .p_4()
+        .p(t.metrics.card_padding)
         .flex()
         .flex_col()
         .gap_1()
         .child(
             div()
                 .text_xs()
-                .text_color(rgb(theme::TEXT_TERTIARY))
+                .text_color(t.colors.text_muted)
                 .child(label.into()),
         )
         .child(
@@ -314,13 +338,14 @@ pub fn stat_tile(
         .child(
             div()
                 .text_xs()
-                .text_color(rgb(theme::TEXT_SECONDARY))
+                .text_color(t.colors.text_secondary)
                 .truncate()
                 .child(detail.into()),
         )
 }
 
 pub fn empty_state(
+    t: &Theme,
     glyph: &'static str,
     title: impl Into<SharedString>,
     description: impl Into<SharedString>,
@@ -342,9 +367,9 @@ pub fn empty_state(
                 .justify_center()
                 .rounded_lg()
                 .border_1()
-                .border_color(rgb(theme::BORDER_STRONG))
-                .bg(rgb(theme::SURFACE_RAISED))
-                .text_color(rgb(theme::TEXT_SECONDARY))
+                .border_color(t.colors.border_strong)
+                .bg(t.colors.surface_raised)
+                .text_color(t.colors.text_secondary)
                 .child(glyph),
         )
         .child(
@@ -358,7 +383,7 @@ pub fn empty_state(
                 .max_w(px(380.))
                 .text_xs()
                 .text_center()
-                .text_color(rgb(theme::TEXT_TERTIARY))
+                .text_color(t.colors.text_muted)
                 .child(description.into()),
         )
 }
@@ -366,6 +391,7 @@ pub fn empty_state(
 /// Selectable list row shared by the sidebar and the command palette.
 /// `selected` is the keyboard/active selection; hover is a lighter preview of it.
 pub fn list_item(
+    t: &Theme,
     id: impl Into<ElementId>,
     glyph: &'static str,
     label: impl Into<SharedString>,
@@ -377,18 +403,17 @@ pub fn list_item(
         .flex()
         .items_center()
         .gap_2p5()
-        .h(px(32.))
+        .h(t.metrics.row_height)
         .px_2()
         .rounded_md()
         .cursor_pointer()
         .text_sm()
         .map(|this| {
             if selected {
-                this.bg(rgba(theme::ACCENT_SUBTLE))
-                    .text_color(rgb(theme::TEXT))
+                this.bg(t.colors.accent_subtle).text_color(t.colors.text)
             } else {
-                this.text_color(rgb(theme::TEXT_SECONDARY))
-                    .hover(|style| style.bg(rgb(theme::SURFACE_HOVER)))
+                this.text_color(t.colors.text_secondary)
+                    .hover(|style| style.bg(t.colors.surface_hover))
             }
         })
         .child(
@@ -396,13 +421,76 @@ pub fn list_item(
                 .w(px(16.))
                 .flex()
                 .justify_center()
-                .text_color(rgb(if selected {
-                    theme::ACCENT
+                .text_color(if selected {
+                    t.colors.accent
                 } else {
-                    theme::TEXT_TERTIARY
-                }))
+                    t.colors.text_muted
+                })
                 .child(glyph),
         )
         .child(div().flex_1().truncate().child(label.into()))
-        .children(keys.map(shortcut))
+        .children(keys.map(|k| shortcut(t, k)))
+}
+
+/// Button in a busy state: same look, no interaction. `…` marks the pending work.
+// shortcut: no caller until the Phase 2 pages; drop this allow when one exists.
+#[allow(dead_code)]
+pub fn button_loading(
+    t: &Theme,
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    variant: ButtonVariant,
+) -> Stateful<Div> {
+    let label: SharedString = format!("{}…", label.into()).into();
+    button(t, id, label, variant, None, false).cursor_default()
+}
+
+/// Bordered surface with an optional header row (title left, actions right).
+/// Callers append body children.
+// shortcut: no caller until the Phase 2 pages; drop this allow when one exists.
+#[allow(dead_code)]
+pub fn card(t: &Theme, title: Option<SharedString>, actions: Option<AnyElement>) -> Div {
+    let header = (title.is_some() || actions.is_some()).then(|| {
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(t.metrics.gap)
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(title.unwrap_or_default()),
+            )
+            .children(actions)
+    });
+    panel(t)
+        .p(t.metrics.card_padding)
+        .flex()
+        .flex_col()
+        .gap(t.metrics.gap)
+        .children(header)
+}
+
+/// `card` lifted off the page: raised fill plus a small shadow.
+// shortcut: no caller until the Phase 2 pages; drop this allow when one exists.
+#[allow(dead_code)]
+pub fn elevated_card(t: &Theme, title: Option<SharedString>, actions: Option<AnyElement>) -> Div {
+    card(t, title, actions)
+        .bg(t.colors.surface_raised)
+        .shadow_sm()
+}
+
+/// Horizontal 1px rule.
+// shortcut: no caller until the Phase 2 pages; drop this allow when one exists.
+#[allow(dead_code)]
+pub fn divider(t: &Theme) -> Div {
+    div().w_full().h(px(1.)).flex_none().bg(t.colors.border)
+}
+
+/// Vertical 1px rule; give the parent a height or `items_stretch`.
+// shortcut: no caller until the Phase 2 pages; drop this allow when one exists.
+#[allow(dead_code)]
+pub fn vertical_divider(t: &Theme) -> Div {
+    div().h_full().w(px(1.)).flex_none().bg(t.colors.border)
 }

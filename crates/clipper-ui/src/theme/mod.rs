@@ -1,35 +1,70 @@
-//! Design tokens. Colors are `0xRRGGBB`; translucent overlays are `0xRRGGBBAA` (use `rgba`).
-//! Spacing and radii use GPUI's built-in scale (`gap_2`, `rounded_lg`, ...) so there is one scale.
+//! Design system: semantic color tokens, density-scaled layout tokens and the
+//! active [`Theme`], stored as a GPUI global.
+//!
+//! Views read the theme once per render (`let t = *cx.theme();`, a cheap
+//! copy) and pass `&t` to components. Changing appearance replaces the global
+//! and refreshes the windows; nothing polls.
 
-// Surfaces, darkest to lightest. Neutral with a faint cool tint; never pure black.
-pub const BACKGROUND: u32 = 0x0e0e11;
-pub const SIDEBAR: u32 = 0x121216;
-pub const SURFACE: u32 = 0x17171c;
-pub const SURFACE_RAISED: u32 = 0x1e1e24;
-pub const SURFACE_HOVER: u32 = 0x24242b;
+mod density;
+mod palette;
 
-pub const BORDER: u32 = 0x25252c;
-pub const BORDER_STRONG: u32 = 0x33333b;
+pub use density::Metrics;
+pub use palette::{Brightness, Palette};
 
-// Text hierarchy.
-pub const TEXT: u32 = 0xececf1;
-pub const TEXT_SECONDARY: u32 = 0xa0a0ab;
-pub const TEXT_TERTIARY: u32 = 0x6a6a75;
+use clipper_storage::{AppearanceSettings, DEFAULT_ACCENT, Theme as ThemeMode, parse_hex_color};
+use gpui::{App, Global, WindowAppearance};
 
-// Brand accent, used sparingly: active indicators, focus rings, primary actions.
-pub const ACCENT: u32 = 0x8c7bff;
-pub const ACCENT_HOVER: u32 = 0x9d8eff;
-pub const TEXT_ON_ACCENT: u32 = 0xffffff;
-pub const ACCENT_SUBTLE: u32 = 0x8c7bff24;
-pub const FOCUS_RING: u32 = 0x8c7bffaa;
-// Dims the shell behind overlays.
-pub const SCRIM: u32 = 0x00000080;
+/// The resolved appearance every view and component styles itself from.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Theme {
+    pub brightness: Brightness,
+    pub colors: Palette,
+    pub metrics: Metrics,
+}
 
-// Status colors.
-pub const SUCCESS: u32 = 0x4ade80;
-pub const WARNING: u32 = 0xfbbf24;
-pub const DANGER: u32 = 0xf87171;
-pub const NEUTRAL: u32 = 0x7a7a86;
-// Solid fill for the live-recording dot and the stop button.
-pub const RECORDING: u32 = 0xe5484d;
-pub const RECORDING_HOVER: u32 = 0xee5a5f;
+impl Global for Theme {}
+
+impl Theme {
+    /// Resolves `System` with the OS appearance; an invalid accent falls back
+    /// to the default (settings validation normally prevents that).
+    pub fn new(settings: &AppearanceSettings, system: WindowAppearance) -> Self {
+        let brightness = match settings.mode {
+            ThemeMode::Dark => Brightness::Dark,
+            ThemeMode::Light => Brightness::Light,
+            ThemeMode::System => match system {
+                WindowAppearance::Light | WindowAppearance::VibrantLight => Brightness::Light,
+                WindowAppearance::Dark | WindowAppearance::VibrantDark => Brightness::Dark,
+            },
+        };
+        let accent = parse_hex_color(&settings.accent_color)
+            .or_else(|| parse_hex_color(DEFAULT_ACCENT))
+            .unwrap_or(0x9b5cf6);
+        Self {
+            brightness,
+            colors: Palette::new(brightness, accent),
+            metrics: Metrics::new(settings.density),
+        }
+    }
+}
+
+/// Installs or updates the global theme. Windows re-render only when the
+/// resolved theme actually changed, e.g. a System-mode OS switch that keeps
+/// the same brightness costs nothing.
+pub fn apply(settings: &AppearanceSettings, cx: &mut App) {
+    let theme = Theme::new(settings, cx.window_appearance());
+    if cx.try_global::<Theme>() != Some(&theme) {
+        cx.set_global(theme);
+        cx.refresh_windows();
+    }
+}
+
+/// Access to the active theme from any GPUI context.
+pub trait ActiveTheme {
+    fn theme(&self) -> &Theme;
+}
+
+impl ActiveTheme for App {
+    fn theme(&self) -> &Theme {
+        self.global::<Theme>()
+    }
+}
