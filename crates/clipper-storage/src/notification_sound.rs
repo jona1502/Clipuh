@@ -175,7 +175,34 @@ pub fn import_notification_sound_to(
     let mut bytes = Vec::new();
     file.take(MAX_NOTIFICATION_SOUND_BYTES as u64 + 1)
         .read_to_end(&mut bytes)?;
-    validate_notification_wav(&bytes)?;
+    store_notification_wav(source, &bytes, directory)
+}
+
+/// Like [`import_notification_sound`] for a WAV image produced in memory
+/// (e.g. an MP3 decoded to WAV). `source` only names the stored file.
+pub fn import_notification_wav_bytes(
+    source: &Path,
+    bytes: &[u8],
+) -> Result<PathBuf, NotificationSoundError> {
+    let config = crate::config_path().map_err(NotificationSoundError::Config)?;
+    let parent = config.parent().ok_or(NotificationSoundError::Invalid(
+        "Cannot locate notification sound storage.",
+    ))?;
+    store_notification_wav(source, bytes, &parent.join("sounds"))
+}
+
+/// Validates `bytes` and publishes them as a new managed WAV in `directory`.
+pub fn store_notification_wav(
+    source: &Path,
+    bytes: &[u8],
+    directory: &Path,
+) -> Result<PathBuf, NotificationSoundError> {
+    if bytes.len() > MAX_NOTIFICATION_SOUND_BYTES {
+        return Err(NotificationSoundError::Invalid(
+            "Notification sounds can be at most 5 MiB.",
+        ));
+    }
+    validate_notification_wav(bytes)?;
     fs::create_dir_all(directory)?;
     let stem: String = source
         .file_stem()
@@ -204,7 +231,7 @@ pub fn import_notification_sound_to(
         .create_new(true)
         .open(&temporary)?;
     let result = (|| {
-        output.write_all(&bytes)?;
+        output.write_all(bytes)?;
         output.sync_all()?;
         drop(output);
         // Linking publishes the complete file atomically and refuses to

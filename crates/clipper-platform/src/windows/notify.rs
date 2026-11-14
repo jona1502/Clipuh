@@ -6,14 +6,14 @@ use std::sync::mpsc::{SyncSender, sync_channel};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HWND, POINT, RECT};
-use windows::Win32::Media::Audio::{PlaySoundW, SND_FILENAME, SND_NODEFAULT, SND_SYNC};
+use windows::Win32::Media::Audio::{PlaySoundW, SND_FILENAME, SND_MEMORY, SND_NODEFAULT, SND_SYNC};
 use windows::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Shell::{
     QUNS_QUIET_TIME, QUNS_RUNNING_D3D_FULL_SCREEN, SHQueryUserNotificationState,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GWL_EXSTYLE, GetCursorPos, GetWindowLongPtrW, GetWindowRect, HWND_TOPMOST, MB_OK,
+    GWL_EXSTYLE, GetCursorPos, GetWindowLongPtrW, GetWindowRect, HWND_TOPMOST, MB_ICONHAND, MB_OK,
     SPI_GETWORKAREA, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_SHOWWINDOW,
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetWindowLongPtrW, SetWindowPos, SystemParametersInfoW,
     WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
@@ -99,6 +99,33 @@ pub fn play_notification_sound() {
     let _ = unsafe { MessageBeep(MB_OK) };
 }
 
+/// The system error sound, for a clip that could not be saved (never the
+/// clip-saved sound). Returns immediately.
+pub fn play_error_sound() {
+    // SAFETY: no pointer arguments.
+    let _ = unsafe { MessageBeep(MB_ICONHAND) };
+}
+
+/// clipuh's default clip-saved sound, embedded unmodified
+/// (`assets/sounds/clipuh_05_synth_check.wav`), so it works offline and
+/// without any installed files.
+pub const DEFAULT_SOUND_WAV: &[u8] =
+    include_bytes!("../../../../assets/sounds/clipuh_05_synth_check.wav");
+
+/// Plays [`DEFAULT_SOUND_WAV`] synchronously (on the sound worker).
+fn play_bundled_default() -> bool {
+    // SAFETY: SND_MEMORY reads the WAV image behind the pointer; it is a
+    // 'static embedded constant and the call is synchronous.
+    unsafe {
+        PlaySoundW(
+            PCWSTR(DEFAULT_SOUND_WAV.as_ptr().cast()),
+            None,
+            SND_MEMORY | SND_NODEFAULT | SND_SYNC,
+        )
+    }
+    .as_bool()
+}
+
 /// A single idle worker owns custom sound file loading and synchronous native
 /// playback. Sending never waits for a file, audio device or earlier sound.
 /// The one-slot mailbox and 500 ms suppression prevent notification bursts
@@ -171,13 +198,25 @@ fn play_custom_or_default(custom: Option<&Path>) -> bool {
             }
         }
     }
-    play_notification_sound();
+    // No (playable) custom sound: clipuh's bundled sound, and the system
+    // sound only if even that cannot play.
+    if !play_bundled_default() {
+        play_notification_sound();
+    }
     false
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundled_default_is_the_approved_wav() {
+        assert_eq!(&DEFAULT_SOUND_WAV[0..4], b"RIFF");
+        assert_eq!(&DEFAULT_SOUND_WAV[8..12], b"WAVE");
+        // clipuh_05_synth_check.wav: 0.72 s, 48 kHz, 16-bit stereo.
+        assert_eq!(DEFAULT_SOUND_WAV.len(), 138_284);
+    }
 
     #[test]
     fn play_never_blocks_on_a_full_mailbox() {
@@ -221,6 +260,7 @@ mod tests {
         std::fs::write(&path, wave).unwrap();
         // Direct worker-side helper calls verify native API calls return;
         // hearing the sound or judging its quality still requires a listener.
+        assert!(play_bundled_default(), "bundled clipuh sound accepted");
         assert!(play_custom_or_default(Some(&path)));
         assert!(!play_custom_or_default(None));
         std::fs::remove_file(&path).unwrap();

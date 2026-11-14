@@ -14,5 +14,6 @@ pub use config::{
 };
 pub use notification_sound::{
     NotificationSoundError, import_notification_sound, import_notification_sound_to,
+    import_notification_wav_bytes, store_notification_wav,
 };
 pub use storage_projection::{StorageProjection, StorageProjectionError};

@@ -48,6 +48,26 @@ const ACTION_H: f32 = 28.0;
 const ICON_W: f32 = 18.0;
 const TOAST_H: f32 = (PAD + BORDER) * 2.0 + TITLE_H + GAP + DESC_H + GAP + ACTION_H;
 
+/// Which sound a toast plays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SoundKind {
+    /// The chosen clip-saved sound (default: clipuh's bundled sound).
+    Success,
+    /// The system error sound: a failed save never sounds like a success.
+    Error,
+}
+
+/// `Saved` only comes from the recorder's `ReplaySaved` event, sent after the
+/// clip was finalised, so the clip-saved sound never plays for a pressed
+/// hotkey, a queued save or a failure.
+fn sound_for(toast: &Toast) -> Option<SoundKind> {
+    match toast {
+        Toast::Saved { .. } => Some(SoundKind::Success),
+        Toast::Failed { .. } => Some(SoundKind::Error),
+        Toast::Saving => None,
+    }
+}
+
 /// `None` means do nothing at all (no window, no sound).
 fn plan(
     toast: &Toast,
@@ -95,7 +115,11 @@ impl Notifier {
             return;
         };
         if plan.play_sound {
-            self.play_sound(settings.custom_sound.clone());
+            match sound_for(&toast) {
+                Some(SoundKind::Success) => self.play_sound(settings.custom_sound.clone()),
+                Some(SoundKind::Error) => notify::play_error_sound(),
+                None => {}
+            }
         }
         if !plan.show_window {
             return;
@@ -426,6 +450,13 @@ mod tests {
         st.notify_on_failure = false;
         assert_eq!(plan(&failed(), &st, false), None);
         assert!(plan(&saved(), &st, false).is_some());
+    }
+
+    #[test]
+    fn only_a_finished_save_plays_the_clip_saved_sound() {
+        assert_eq!(sound_for(&saved()), Some(SoundKind::Success));
+        assert_eq!(sound_for(&failed()), Some(SoundKind::Error));
+        assert_eq!(sound_for(&Toast::Saving), None);
     }
 
     #[test]
