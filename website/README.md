@@ -196,3 +196,23 @@ Zero-JS Astro primitives in `src/components/feature/`; copy comes from
 Honesty rules: every demo is visibly labelled (`DemoFrame` label) and is not a
 real capture; every feature shows its status badge; `planned` features are never
 presented as available; no performance numbers unless measured and sourced.
+
+## Browser regression checks
+
+```sh
+npm ci
+npx playwright install chromium
+npm run build
+npm run test:browser
+```
+
+Playwright starts a local preview on port 4392. Stop any other Astro preview
+for this checkout first (`npx astro preview stop`). Tests cover all seven W2
+viewport widths, mobile navigation, hotkey selection and activation, replay
+history, mixer gain and disabled states, all four editor audio tracks, trim
+bounds, playback, simulated export and reduced motion. Screenshots and failed
+traces are written to the ignored `test-results/` directory.
+
+The replay demo offers Ctrl+Shift+F8/F9/F10 (default F10). Selection affects
+only this demo, while focus is inside it; it does not configure a global
+shortcut or persist settings. All editor tracks remain visible on mobile.

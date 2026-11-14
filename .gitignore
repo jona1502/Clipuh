@@ -5,6 +5,8 @@
 /website/node_modules/
 /website/dist/
 /website/.astro/
+/website/test-results/
+/website/playwright-report/
 
 # Local environment files
 .env

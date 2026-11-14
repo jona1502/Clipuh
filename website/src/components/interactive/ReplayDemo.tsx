@@ -2,8 +2,7 @@ import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { useReducedMotion } from "./shared/useReducedMotion";
 
 /** Matches the app default (crates/clipper-core/src/hotkey.rs). */
-const HOTKEY = ["Ctrl", "Shift", "F10"] as const;
-const HOTKEY_TEXT = "Ctrl+Shift+F10";
+const HOTKEY_KEYS = ["F8", "F9", "F10"] as const;
 
 const DURATIONS = [
   { id: "15", label: "15 s", spoken: "15 seconds" },
@@ -37,6 +36,9 @@ export default function ReplayDemo() {
   const [saving, setSaving] = useState(false);
   const [clips, setClips] = useState<Clip[]>([]);
   const [announce, setAnnounce] = useState("");
+  const [hotkeyKey, setHotkeyKey] = useState<string>("F10");
+  const hotkey = ["Ctrl", "Shift", hotkeyKey];
+  const hotkeyText = hotkey.join("+");
 
   const duration = DURATIONS.find((d) => d.id === durationId) ?? DURATIONS[2];
 
@@ -67,7 +69,13 @@ export default function ReplayDemo() {
   }
 
   function onKeyDown(e: KeyboardEvent<HTMLDivElement>) {
-    if (e.key === "F10" && e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey) {
+    if (
+      e.key === hotkeyKey &&
+      e.ctrlKey &&
+      e.shiftKey &&
+      !e.altKey &&
+      !e.metaKey
+    ) {
       e.preventDefault();
       save();
     }
@@ -148,9 +156,9 @@ export default function ReplayDemo() {
           <div
             className="flex flex-wrap items-center gap-1.5"
             role="img"
-            aria-label={`Hotkey ${HOTKEY_TEXT}`}
+            aria-label={`Hotkey ${hotkeyText}`}
           >
-            {HOTKEY.map((k, i) => (
+            {hotkey.map((k, i) => (
               <span key={k} className="flex items-center gap-1.5">
                 {i > 0 && (
                   <span className="text-caption text-text-muted">+</span>
@@ -159,9 +167,21 @@ export default function ReplayDemo() {
               </span>
             ))}
           </div>
-          <span className="text-caption text-text-muted">
-            Default hotkey, customizable
-          </span>
+          <label className="flex flex-col gap-1.5 text-caption text-text-secondary">
+            Demo hotkey
+            <select
+              value={hotkeyKey}
+              onChange={(e) => setHotkeyKey(e.target.value)}
+              className="min-h-11 rounded-md border border-border-hover bg-surface-raised px-2 text-small text-text"
+            >
+              {HOTKEY_KEYS.map((key) => (
+                <option key={key} value={key}>
+                  Ctrl+Shift+{key}
+                  {key === "F10" ? " (default)" : ""}
+                </option>
+              ))}
+            </select>
+          </label>
         </div>
         <button
           type="button"
@@ -169,7 +189,7 @@ export default function ReplayDemo() {
           aria-disabled={saving}
           className="inline-flex min-h-11 items-center justify-center rounded-md bg-accent px-4 text-small font-semibold text-accent-foreground hover:bg-accent-hover aria-disabled:opacity-70"
         >
-          {saving ? "Saving…" : `Press ${HOTKEY_TEXT}`}
+          {saving ? "Saving…" : `Press ${hotkeyText}`}
         </button>
       </div>
 
@@ -209,7 +229,8 @@ export default function ReplayDemo() {
       </ul>
 
       <p className="m-0 text-caption text-text-muted">
-        With focus inside this demo, {HOTKEY_TEXT} also works.
+        With focus inside this demo, {hotkeyText} also works. This selection
+        changes only the website demo.
       </p>
 
       <div aria-live="polite" role="status" className="sr-only">
