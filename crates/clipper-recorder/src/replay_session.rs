@@ -201,6 +201,16 @@ impl ReplaySession {
         }
     }
 
+    pub fn set_audio_noise_gate(
+        &mut self,
+        source: u32,
+        settings: clipper_core::recording::NoiseGateSettings,
+    ) {
+        if let Some(audio) = &mut self.audio {
+            audio.set_noise_gate(source, settings);
+        }
+    }
+
     /// Source statuses and levels for the UI.
     pub fn report_audio(&mut self, endpoint: &RecorderEndpoint) {
         self.audio_reporter.report(endpoint, self.audio.as_mut());

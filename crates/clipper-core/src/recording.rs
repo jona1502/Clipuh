@@ -70,7 +70,7 @@ impl QualityProfile {
 }
 
 /// Everything the recorder needs to start one recording.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RecordingOptions {
     pub audio: RecordingAudioOptions,
     /// Output video size. The source is scaled on the GPU to this size.
@@ -141,18 +141,62 @@ pub const MAX_AUDIO_GAIN_PERCENT: u16 = 200;
 /// isolated AAC tracks.
 pub const MAX_RECORDED_AUDIO_SOURCES: usize = 4;
 
+/// Per-source gate parameters. Threshold is measured before source gain.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct NoiseGateSettings {
+    pub enabled: bool,
+    pub threshold_db: f32,
+    pub attack_ms: f32,
+    pub hold_ms: f32,
+    pub release_ms: f32,
+}
+
+impl Default for NoiseGateSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            threshold_db: -45.0,
+            attack_ms: 5.0,
+            hold_ms: 100.0,
+            release_ms: 150.0,
+        }
+    }
+}
+
+impl NoiseGateSettings {
+    /// Repair malformed persisted or external parameters before entering DSP.
+    pub fn sanitized(self) -> Self {
+        let bound = |value: f32, low: f32, high: f32, default: f32| {
+            if value.is_finite() {
+                value.clamp(low, high)
+            } else {
+                default
+            }
+        };
+        Self {
+            enabled: self.enabled,
+            threshold_db: bound(self.threshold_db, -80.0, 0.0, -45.0),
+            attack_ms: bound(self.attack_ms, 1.0, 100.0, 5.0),
+            hold_ms: bound(self.hold_ms, 0.0, 1000.0, 100.0),
+            release_ms: bound(self.release_ms, 5.0, 2000.0, 150.0),
+        }
+    }
+}
+
 /// One enabled mixer source handed to the recorder.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RecordingAudioSource {
     /// Stable id from the settings; levels, status and gain changes use it.
     pub id: u32,
     pub target: AudioSourceTarget,
     /// 0..=[`MAX_AUDIO_GAIN_PERCENT`]; 0 is silence.
     pub gain_percent: u16,
+    pub noise_gate: NoiseGateSettings,
 }
 
 /// Audio of a recording or replay: the enabled mixer sources in mixer order.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RecordingAudioOptions {
     pub sources: Vec<RecordingAudioSource>,
     /// Also write one isolated track per source next to the mix.
@@ -190,11 +234,13 @@ impl Default for RecordingAudioOptions {
                     id: 1,
                     target: AudioSourceTarget::Desktop(None),
                     gain_percent: 100,
+                    noise_gate: NoiseGateSettings::default(),
                 },
                 RecordingAudioSource {
                     id: 2,
                     target: AudioSourceTarget::Microphone(None),
                     gain_percent: 100,
+                    noise_gate: NoiseGateSettings::default(),
                 },
             ],
             separate_tracks: true,
@@ -237,7 +283,7 @@ pub struct AudioSourceState {
 pub const REPLAY_DURATIONS_SECONDS: [u32; 5] = [15, 30, 60, 120, 300];
 
 /// Everything the recorder needs to run the instant replay buffer.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ReplayOptions {
     /// Video/audio encoding settings; `output_directory` receives saved clips.
     pub recording: RecordingOptions,
@@ -276,7 +322,7 @@ pub struct ReplayStatus {
     pub warning: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum RecorderCommand {
     RefreshSources,
     StartAudioTest {
@@ -304,6 +350,11 @@ pub enum RecorderCommand {
     SetAudioGain {
         source: u32,
         gain_percent: u16,
+    },
+    /// Update only this source's gate in the active recording, replay or test.
+    SetAudioNoiseGate {
+        source: u32,
+        settings: NoiseGateSettings,
     },
     /// Save the last seconds of the replay buffer as a clip. Never blocks the
     /// sender; the outcome arrives as a `Replay*` event.
@@ -471,6 +522,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn noise_gate_settings_bound_nonfinite_and_overflow() {
+        let settings = NoiseGateSettings {
+            enabled: true,
+            threshold_db: f32::NAN,
+            attack_ms: f32::INFINITY,
+            hold_ms: -20.0,
+            release_ms: f32::MAX,
+        }
+        .sanitized();
+        assert_eq!(
+            settings,
+            NoiseGateSettings {
+                enabled: true,
+                threshold_db: -45.0,
+                attack_ms: 5.0,
+                hold_ms: 0.0,
+                release_ms: 2000.0,
+            }
+        );
+        assert_eq!(settings.sanitized(), settings);
+    }
+
+    #[test]
     fn storage_estimate_uses_decimal_megabytes() {
         let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
         assert!(close(estimated_megabytes(16.0, 0.0, 60.0), 120.0));
@@ -510,6 +584,7 @@ mod tests {
             id,
             target: AudioSourceTarget::Application(format!("app{id}.exe")),
             gain_percent: 100,
+            noise_gate: NoiseGateSettings::default(),
         };
         for (sources, separate_tracks, expected) in [
             (0, false, 0),

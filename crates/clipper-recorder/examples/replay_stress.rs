@@ -108,11 +108,13 @@ mod stress {
                             id: 1,
                             target: AudioSourceTarget::Desktop(None),
                             gain_percent: 100,
+                            noise_gate: Default::default(),
                         },
                         RecordingAudioSource {
                             id: 2,
                             target: AudioSourceTarget::Microphone(None),
                             gain_percent: 100,
+                            noise_gate: Default::default(),
                         },
                     ],
                     separate_tracks: true,

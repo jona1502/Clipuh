@@ -11,6 +11,7 @@
 //! module and the documented spots that need it.
 #![deny(unsafe_code)]
 
+pub mod gate;
 pub mod mix;
 pub mod mixer;
 pub mod ring;

@@ -1,8 +1,8 @@
 use clipper_core::hotkey::{DEFAULT_SAVE_REPLAY, Hotkey};
 use clipper_core::recording::{
-    AudioSourceTarget, MAX_AUDIO_GAIN_PERCENT, MAX_RECORDED_AUDIO_SOURCES, QualityProfile,
-    REPLAY_DURATIONS_SECONDS, RecordingAudioOptions, RecordingAudioSource, RecordingOptions,
-    ReplayOptions, h264_supports,
+    AudioSourceTarget, MAX_AUDIO_GAIN_PERCENT, MAX_RECORDED_AUDIO_SOURCES, NoiseGateSettings,
+    QualityProfile, REPLAY_DURATIONS_SECONDS, RecordingAudioOptions, RecordingAudioSource,
+    RecordingOptions, ReplayOptions, h264_supports,
 };
 use directories::{BaseDirs, ProjectDirs, UserDirs};
 use serde::{Deserialize, Serialize};
@@ -47,7 +47,7 @@ static SAVE_LOCK: Mutex<()> = Mutex::new(());
 /// Per-user settings for the Clipper application.
 ///
 /// TOML input may omit fields; missing values are supplied from the defaults.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
     pub video: VideoSettings,
@@ -417,7 +417,7 @@ fn default_gain() -> u16 {
 }
 
 /// One `[[audio.sources]]` row.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AudioSourceSettings {
     /// Stable and unique while the row exists.
     pub id: u32,
@@ -430,6 +430,8 @@ pub struct AudioSourceSettings {
     pub enabled: bool,
     #[serde(default = "default_gain")]
     pub gain_percent: u16,
+    #[serde(default)]
+    pub noise_gate: NoiseGateSettings,
     /// Contributes silence while keeping its track and its gain setting.
     #[serde(default, skip_serializing_if = "is_false")]
     pub muted: bool,
@@ -489,7 +491,7 @@ fn lenient_sources<'de, D: serde::Deserializer<'de>>(
         .collect())
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AudioSettings {
     pub separate_tracks: bool,
@@ -525,6 +527,7 @@ impl Default for AudioSettings {
             target: None,
             enabled: true,
             gain_percent: 100,
+            noise_gate: NoiseGateSettings::default(),
             muted: false,
             solo: false,
         };
@@ -585,6 +588,7 @@ impl AudioSettings {
                         id: s.id,
                         target: s.recording_target()?,
                         gain_percent: self.effective_gain_percent(s.id),
+                        noise_gate: s.noise_gate.sanitized(),
                     })
                 })
                 .collect(),
@@ -622,6 +626,7 @@ impl AudioSettings {
                     target,
                     enabled: enabled.unwrap_or(true),
                     gain_percent: gain.unwrap_or(100),
+                    noise_gate: NoiseGateSettings::default(),
                     muted: false,
                     solo: false,
                 };
@@ -646,6 +651,7 @@ impl AudioSettings {
         let mut kept: Vec<AudioSourceSettings> = Vec::new();
         for mut row in std::mem::take(&mut self.sources) {
             row.gain_percent = row.gain_percent.min(MAX_AUDIO_GAIN_PERCENT);
+            row.noise_gate = row.noise_gate.sanitized();
             let invalid = kept.iter().any(|k| k.id == row.id)
                 || row.recording_target().is_none()
                 || find_duplicate(&kept, row.kind, row.target.as_deref()).is_some();
@@ -681,6 +687,9 @@ impl AudioSettings {
             }
             if row.gain_percent > MAX_AUDIO_GAIN_PERCENT {
                 problem("gain must be between 0 and 200 percent");
+            }
+            if row.noise_gate != row.noise_gate.sanitized() {
+                problem("noise gate parameters must be finite and within their supported ranges");
             }
             if row.recording_target().is_none() {
                 problem("an application source needs an executable name");
@@ -1265,6 +1274,49 @@ mod tests {
     }
 
     #[test]
+    fn noise_gate_persists_per_source_and_routes_to_recording() {
+        let dir = TestDir::new();
+        let path = dir.path("gate.toml");
+        let mut config = AppConfig::default();
+        config.audio.sources[1].noise_gate = NoiseGateSettings {
+            enabled: true,
+            threshold_db: -38.5,
+            attack_ms: 7.0,
+            hold_ms: 125.0,
+            release_ms: 230.0,
+        };
+        config.audio.sources[1].muted = true;
+        config.save_to(&path).unwrap();
+        let loaded = AppConfig::load_from(&path).unwrap();
+        assert_eq!(loaded.audio, config.audio);
+        let routed = loaded.audio.recording_options();
+        assert!(!routed.sources[0].noise_gate.enabled);
+        assert_eq!(
+            routed.sources[1].noise_gate,
+            config.audio.sources[1].noise_gate
+        );
+        assert_eq!(routed.sources[1].gain_percent, 0);
+    }
+
+    #[test]
+    fn noise_gate_legacy_defaults_and_malformed_config_repair() {
+        let config = load_text("[[audio.sources]]\nid = 1\nkind = \"microphone\"\n");
+        assert_eq!(
+            config.audio.sources[0].noise_gate,
+            NoiseGateSettings::default()
+        );
+        let config = load_text(
+            "[[audio.sources]]\nid = 1\nkind = \"microphone\"\n[audio.sources.noise_gate]\nenabled = true\nthreshold_db = nan\nattack_ms = inf\nhold_ms = -99\nrelease_ms = 99999\n",
+        );
+        let gate = config.audio.sources[0].noise_gate;
+        assert_eq!(gate.threshold_db, -45.0);
+        assert_eq!(gate.attack_ms, 5.0);
+        assert_eq!(gate.hold_ms, 0.0);
+        assert_eq!(gate.release_ms, 2000.0);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
     fn parse_hex_color_accepts_only_rrggbb() {
         assert_eq!(parse_hex_color("#9B5CF6"), Some(0x9B5CF6));
         assert_eq!(parse_hex_color("#9b5cf6"), Some(0x9B5CF6));
@@ -1703,6 +1755,7 @@ mod tests {
             target: target.map(str::to_owned),
             enabled: true,
             gain_percent: 100,
+            noise_gate: NoiseGateSettings::default(),
             muted: false,
             solo: false,
         }

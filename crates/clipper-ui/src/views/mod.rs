@@ -262,6 +262,9 @@ pub struct ClipperWindow {
     audio_capabilities: Option<clipper_audio::AudioCapabilities>,
     /// Open target dropdown: (mixer source id, highlighted row).
     audio_menu: Option<(u32, usize)>,
+    audio_gain_edit: Option<audio::GainEdit>,
+    audio_gate_open: Option<u32>,
+    audio_gate_dirty: bool,
     audio_loading: bool,
     /// Latest per-source peaks and engine state; empty when no session runs.
     audio_levels: Vec<clipper_core::recording::SourceLevel>,
@@ -574,6 +577,9 @@ impl ClipperWindow {
             audio_apps: Vec::new(),
             audio_capabilities: None,
             audio_menu: None,
+            audio_gain_edit: None,
+            audio_gate_open: None,
+            audio_gate_dirty: false,
             audio_loading: false,
             audio_levels: Vec::new(),
             meters: Default::default(),

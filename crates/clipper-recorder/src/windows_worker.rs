@@ -370,7 +370,7 @@ impl Worker<'_> {
                     replay.set_duration(duration);
                 }
             }
-            // Only gain is live. Enabling, disabling, adding or removing
+            // Gain and noise gate settings are live. Enabling, disabling, adding or removing
             // sources applies to the next session: the track topology of a
             // file or replay buffer cannot change while it records.
             RecorderCommand::SetAudioGain {
@@ -382,6 +382,20 @@ impl Worker<'_> {
                 }
                 if let Some(replay) = &mut self.replay {
                     replay.set_audio_gain(source, gain_percent);
+                }
+                if let Some(test) = &mut self.audio_test {
+                    test.set_gain(source, gain_percent);
+                }
+            }
+            RecorderCommand::SetAudioNoiseGate { source, settings } => {
+                if let Some(audio) = self.recording.as_mut().and_then(|r| r.audio.as_mut()) {
+                    audio.set_noise_gate(source, settings);
+                }
+                if let Some(replay) = &mut self.replay {
+                    replay.set_audio_noise_gate(source, settings);
+                }
+                if let Some(test) = &mut self.audio_test {
+                    test.set_noise_gate(source, settings);
                 }
             }
             RecorderCommand::SaveReplay => self.save_replay(),
