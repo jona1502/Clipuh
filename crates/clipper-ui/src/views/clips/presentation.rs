@@ -1,5 +1,5 @@
 use super::*;
-use crate::components::RasterIcon;
+use crate::components::{RasterIcon, SingleLine};
 
 /// Gap between cards, in pixels.
 const GAP: f32 = 16.0;
@@ -436,24 +436,6 @@ impl Render for ClipLibrary {
             .flex()
             .flex_col()
             .gap_3()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(
-                        div()
-                            .text_xl()
-                            .text_color(t.colors.text_secondary)
-                            .child("▣"),
-                    )
-                    .child(
-                        div()
-                            .text_2xl()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .child("Library"),
-                    ),
-            )
             .child(toolbar)
             .child(count);
         if let Some(message) = &self.notice {
@@ -1045,7 +1027,7 @@ impl ClipLibrary {
             .min_w_0()
             .flex()
             .flex_col()
-            .gap_0p5()
+            .gap_1()
             .child(
                 div()
                     .flex()
@@ -1056,7 +1038,7 @@ impl ClipLibrary {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .truncate()
+                            .single_line()
                             .text_xs()
                             .text_color(t.colors.text_secondary)
                             .child(origin_label(clip)),
@@ -1065,16 +1047,18 @@ impl ClipLibrary {
             )
             .child(
                 div()
-                    .truncate()
+                    .w_full()
+                    .single_line()
                     .text_base()
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .child(clip.name.clone()),
             )
             .child(
                 div()
+                    .w_full()
+                    .single_line()
                     .text_xs()
                     .text_color(t.colors.text_muted)
-                    .truncate()
                     .child(format!("{date}  •  {}", size_label(clip.size_bytes))),
             );
         let actions = div()
@@ -1193,9 +1177,9 @@ impl ClipLibrary {
                             div()
                                 .flex()
                                 .flex_col()
-                                .gap_2()
+                                .gap_2p5()
                                 .px_3()
-                                .pt_2()
+                                .pt_2p5()
                                 .pb_3()
                                 .child(details)
                                 .child(actions),

@@ -35,8 +35,11 @@ use crate::state::ReplayPhase;
 use crate::storage_status::{self, StorageStatus};
 use crate::theme::{ActiveTheme, Theme};
 
-/// Width of the Save Clip hotkey slot in the capture bar.
-const HOTKEY_SLOT_WIDTH: f32 = 168.0;
+/// The Save Clip hotkey slot in the capture bar is as wide as its keycaps,
+/// within these bounds (the recording prompt needs a little room; very long
+/// combinations are cut off with an ellipsis instead of widening the bar).
+const HOTKEY_SLOT_MIN_WIDTH: f32 = 64.0;
+const HOTKEY_SLOT_MAX_WIDTH: f32 = 168.0;
 /// RAM budgets offered for the replay buffer, in MiB.
 const REPLAY_MEMORY_PRESETS_MB: [u32; 5] = [32, 64, 128, 256, 512];
 /// Disk cache limits offered for the replay buffer, in MiB.
@@ -369,16 +372,23 @@ impl ClipperWindow {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let in_bar = host == HotkeyHost::Bar;
-        // Fixed width in the bar: whatever is recorded or shown, it keeps one row.
+        // In the bar the slot hugs its content (bounded); it always keeps one row.
         let shell = |id: &'static str, border| {
             div()
                 .id(id)
                 .flex_none()
-                .when(in_bar, |this| this.w(px(HOTKEY_SLOT_WIDTH)))
+                .when(in_bar, |this| {
+                    this.min_w(px(HOTKEY_SLOT_MIN_WIDTH))
+                        .max_w(px(HOTKEY_SLOT_MAX_WIDTH))
+                })
                 .when(!in_bar, |this| this.w_full())
                 .overflow_hidden()
                 .h(t.metrics.control_height)
-                .px(t.metrics.control_padding)
+                .px(if in_bar {
+                    px(8.)
+                } else {
+                    t.metrics.control_padding
+                })
                 .flex()
                 .items_center()
                 .gap(t.metrics.gap)
@@ -2095,26 +2105,16 @@ pub(super) fn content(
                 .map(|message| super::dashboard::error_banner(message, cx)),
         )
         .child(window.section_card(&t, win, cx));
-    div()
-        .size_full()
-        .flex()
-        .flex_col()
-        .gap_4()
-        .child(
-            div()
-                .text_3xl()
-                .font_weight(FontWeight::SEMIBOLD)
-                .child("Settings"),
-        )
-        // Categories live in the app sidebar: the content uses the full width.
-        .child(
-            scroll
-                .flex_1()
-                .min_h_0()
-                .w_full()
-                .overflow_y_scroll()
-                .child(grid.pb_4()),
-        )
+    // No page title (the sidebar names the page); categories live in the
+    // app sidebar, so the selected one uses the full width.
+    div().size_full().flex().flex_col().gap_4().child(
+        scroll
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .overflow_y_scroll()
+            .child(grid.pb_4()),
+    )
 }
 
 #[cfg(test)]
