@@ -1,0 +1,47 @@
+---
+import "@/styles/global.css";
+import { site } from "@/data/site";
+
+interface Props {
+  /** Page title; the site name is appended automatically. */
+  title?: string;
+  description?: string;
+}
+
+const { title, description = site.description } = Astro.props;
+const fullTitle = title ? `${title} · ${site.name}` : site.name;
+const canonical = Astro.site
+  ? new URL(Astro.url.pathname, Astro.site)
+  : undefined;
+const base = import.meta.env.BASE_URL.replace(/\/?$/, "/");
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" content="#0e0e11" />
+    <title>{fullTitle}</title>
+    <meta name="description" content={description} />
+    {canonical && <link rel="canonical" href={canonical} />}
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content={site.name} />
+    <meta property="og:title" content={fullTitle} />
+    <meta property="og:description" content={description} />
+    {canonical && <meta property="og:url" content={canonical} />}
+    <link rel="icon" type="image/svg+xml" href={`${base}icons/favicon.svg`} />
+  </head>
+  <body>
+    <a
+      href="#main"
+      class="bg-surface-raised text-text rounded-control sr-only px-3 py-2 focus:not-sr-only focus:absolute focus:top-3 focus:left-3 focus:z-50"
+    >
+      Skip to content
+    </a>
+    <main id="main">
+      <slot />
+    </main>
+  </body>
+</html>
