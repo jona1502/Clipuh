@@ -1,4 +1,5 @@
 mod audio;
+mod capture_bar;
 mod clips;
 mod dashboard;
 mod editor;
@@ -14,11 +15,10 @@ use gpui::{
     Task, Window, actions, div, px,
 };
 
-use crate::components::{Tone, badge, kbd, list_item, shortcut, status_dot};
+use crate::components::{kbd, list_item, shortcut};
 use crate::notifications::{Notifier, Toast};
-use crate::state::{
-    Phase, RecordingState, ReplayPhase, StorageProjectionCache, StorageProjectionRun,
-};
+use crate::state::{Phase, RecordingState, StorageProjectionCache, StorageProjectionRun};
+use crate::storage_status::{self, StorageStatus};
 use crate::theme::{ActiveTheme, Theme};
 
 actions!(
@@ -95,13 +95,15 @@ pub fn bind_keys(cx: &mut App) {
     );
 }
 
-/// The Dashboard capture dropdowns; at most one is open at a time.
+/// The capture dropdowns in the capture bar and on the Capture page; at most
+/// one is open at a time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CaptureMenu {
     Resolution,
     FrameRate,
     Quality,
     Bitrate,
+    ReplayDuration,
 }
 
 impl CaptureMenu {
@@ -111,6 +113,7 @@ impl CaptureMenu {
             Self::FrameRate => "Frame rate",
             Self::Quality => "Quality",
             Self::Bitrate => "Base bitrate",
+            Self::ReplayDuration => "Replay length",
         }
     }
 }
@@ -128,19 +131,10 @@ impl Page {
 
     fn label(self) -> &'static str {
         match self {
-            Self::Dashboard => "Dashboard",
-            Self::Clips => "Clips",
+            Self::Dashboard => "Capture",
+            Self::Clips => "Library",
             Self::Editor => "Editor",
             Self::Settings => "Settings",
-        }
-    }
-
-    fn subtitle(self) -> &'static str {
-        match self {
-            Self::Dashboard => "Record, monitor and tune capture",
-            Self::Clips => "Saved moments from your sessions",
-            Self::Editor => "Trim and export a saved clip",
-            Self::Settings => "How Clipper captures and stores",
         }
     }
 
@@ -222,7 +216,15 @@ pub struct ClipperWindow {
     replay_autostart_pending: bool,
     /// The open capture dropdown and its highlighted row.
     capture_menu: Option<(CaptureMenu, usize)>,
-    capture_focus: [FocusHandle; 4],
+    capture_focus: [FocusHandle; 5],
+    /// Video settings (width, height, fps) the running replay or recording was
+    /// started with; `None` while neither runs. Lets the capture bar mark a
+    /// changed value as pending instead of pretending it is already active.
+    active_video: Option<(u32, u32, u32)>,
+    /// Keyboard focus for the capture bar's replay switch.
+    replay_focus: FocusHandle,
+    /// Free space on the recordings volume, shown in the sidebar.
+    storage: StorageStatus,
     /// The clip open in the Editor page; its player only runs while that page is shown.
     editor: Option<Entity<editor::ClipEditor>>,
     /// Custom accent color field on the Settings page.
@@ -255,6 +257,11 @@ impl ClipperWindow {
                     _ => None,
                 };
                 let sources_listed = matches!(event, RecorderEvent::SourcesListed(_));
+                // Free space only changes when a clip or recording lands on disk.
+                let wrote_file = matches!(
+                    event,
+                    RecorderEvent::ReplaySaved { .. } | RecorderEvent::RecordingFinished { .. }
+                );
                 let updated = this.update(cx, |this, cx| {
                     this.storage_projection_run.apply_event(&event);
                     match &event {
@@ -281,6 +288,10 @@ impl ClipperWindow {
                         _ => {}
                     }
                     this.recording.apply(event);
+                    this.refresh_active_video();
+                    if wrote_file {
+                        this.refresh_storage(cx);
+                    }
                     if sources_listed {
                         this.maybe_autostart_replay();
                     }
@@ -360,19 +371,25 @@ impl ClipperWindow {
             audio_test_path: None,
             replay_autostart_pending,
             capture_menu: None,
-            // After the four sidebar items in tab order.
-            capture_focus: [4, 5, 6, 7]
+            // Indexed by `CaptureMenu` order. Tab follows the screen: the capture
+            // bar (resolution 4, fps 5, replay length 6, hotkey 7, replay switch 8)
+            // after the sidebar (0-3), then the Capture page's quality and bitrate.
+            capture_focus: [4, 5, 9, 10, 6]
                 .map(|index| cx.focus_handle().tab_index(index).tab_stop(true)),
+            replay_focus: cx.focus_handle().tab_index(8).tab_stop(true),
+            active_video: None,
+            storage: StorageStatus::Unknown,
             editor: None,
             accent_input,
-            // After the sidebar (0-3) and the capture menus (4-7).
+            // After the shell and capture controls (0-10).
             notify_focus: std::array::from_fn(|index| {
                 cx.focus_handle()
-                    .tab_index(8 + index as isize)
+                    .tab_index(11 + index as isize)
                     .tab_stop(true)
             }),
         };
         this.storage_projection_cache.refresh(&this.config);
+        this.refresh_storage(cx);
         this.send(RecorderCommand::RefreshSources);
         this.refresh_audio_devices(cx);
         this.register_hotkey(cx);
@@ -417,18 +434,6 @@ impl ClipperWindow {
         }
     }
 
-    fn status_tone(&self) -> Tone {
-        match self.recording.phase {
-            Phase::Idle => match self.recording.replay.phase {
-                ReplayPhase::Off => Tone::Neutral,
-                ReplayPhase::Running { .. } => Tone::Success,
-                ReplayPhase::Starting | ReplayPhase::Stopping => Tone::Warning,
-            },
-            Phase::Starting => Tone::Warning,
-            Phase::Recording | Phase::Stopping => Tone::Danger,
-        }
-    }
-
     /// Opens `path` in the Editor page, replacing (and releasing) any open clip.
     pub(super) fn open_in_editor(
         &mut self,
@@ -447,6 +452,30 @@ impl ClipperWindow {
             self.editor = Some(cx.new(|cx| editor::ClipEditor::new(path, window, cx)));
         }
         self.navigate(Page::Editor, window, cx);
+    }
+
+    /// Reads free space on the recordings volume off the UI thread. Runs at
+    /// startup and after each saved clip or recording; nothing polls.
+    fn refresh_storage(&mut self, cx: &mut Context<Self>) {
+        let config = self.config.clone();
+        cx.spawn(async move |this, cx| {
+            let status = cx
+                .background_spawn(async move {
+                    match config.recording_options() {
+                        Ok(options) => storage_status::load(&options.output_directory),
+                        Err(error) => StorageStatus::Unavailable(error.to_string()),
+                    }
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.storage != status {
+                    this.storage = status;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn navigate(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
@@ -580,11 +609,12 @@ impl ClipperWindow {
             });
 
         div()
-            .w(px(232.))
+            .w(px(SIDEBAR_WIDTH))
+            .flex_none()
             .h_full()
             .flex()
             .flex_col()
-            .gap_4()
+            .gap(t.metrics.section_gap)
             .px_3()
             .py_4()
             .bg(t.colors.sidebar)
@@ -596,6 +626,7 @@ impl ClipperWindow {
                     .items_center()
                     .gap_2()
                     .px_2()
+                    .h(px(28.))
                     .child(
                         div()
                             .size(px(22.))
@@ -607,82 +638,44 @@ impl ClipperWindow {
                             .text_xs()
                             .font_weight(FontWeight::BOLD)
                             .text_color(t.colors.accent_foreground)
-                            .child("C"),
+                            .child("c"),
                     )
                     .child(
                         div()
-                            .text_sm()
+                            .text_base()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child("Clipper"),
+                            .child("clipuh"),
                     ),
-            )
-            .child(
-                div()
-                    .id("open-command-palette")
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .h(px(32.))
-                    .px_2()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(t.colors.border)
-                    .bg(t.colors.surface)
-                    .cursor_pointer()
-                    .hover(|style| style.border_color(t.colors.border_strong))
-                    .text_sm()
-                    .text_color(t.colors.text_muted)
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.toggle_palette(&ToggleCommandPalette, window, cx)
-                    }))
-                    .child(div().flex_1().child("Search commands"))
-                    .child(shortcut(&t, &["Ctrl", "K"])),
             )
             .child(div().flex().flex_col().gap_0p5().children(navigation))
             .child(
                 div()
                     .mt_auto()
                     .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_2()
-                    .text_xs()
-                    .text_color(t.colors.text_muted)
-                    .child(status_dot(&t, self.status_tone()))
-                    .child(self.recording.overall_label()),
-            )
-    }
-
-    fn top_bar(&self, t: &Theme) -> Div {
-        let page = self.active_page;
-        div()
-            .h(px(56.))
-            .flex_none()
-            .px_8()
-            .flex()
-            .items_center()
-            .justify_between()
-            .border_b_1()
-            .border_color(t.colors.border)
-            .child(
-                div()
-                    .flex()
-                    .items_baseline()
+                    .flex_col()
                     .gap_3()
                     .child(
+                        // The command palette's only visible entry point.
                         div()
-                            .text_base()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(page.label()),
-                    )
-                    .child(
-                        div()
+                            .id("open-command-palette")
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .h(t.metrics.row_height)
+                            .px_2()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .hover(|style| style.bg(t.colors.surface_hover))
                             .text_xs()
                             .text_color(t.colors.text_muted)
-                            .child(page.subtitle()),
-                    ),
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.toggle_palette(&ToggleCommandPalette, window, cx)
+                            }))
+                            .child("Commands")
+                            .child(shortcut(&t, &["Ctrl", "K"])),
+                    )
+                    .child(storage_indicator(&t, &self.storage)),
             )
-            .child(badge(t, self.recording.overall_label(), self.status_tone()))
     }
 
     fn page_content(&self, window: &Window, cx: &mut Context<Self>) -> Div {
@@ -811,6 +804,64 @@ impl ClipperWindow {
     }
 }
 
+/// Sidebar width at the default density; the capture bar takes the rest.
+const SIDEBAR_WIDTH: f32 = 236.0;
+
+/// Free space on the recordings volume with a compact usage bar. Shows a
+/// neutral state until the first (background) read finishes or when the
+/// volume cannot be read; never an invented number.
+fn storage_indicator(t: &Theme, storage: &StorageStatus) -> Div {
+    let caption = div()
+        .text_xs()
+        .text_color(t.colors.text_muted)
+        .child("Storage");
+    let base = div().px_2().flex().flex_col().gap_1p5().child(caption);
+    match storage {
+        StorageStatus::Ready(usage) => base
+            .child(
+                div()
+                    .h(px(4.))
+                    .w_full()
+                    .rounded_full()
+                    .bg(t.colors.surface_active)
+                    .child(
+                        div()
+                            .h_full()
+                            .w(gpui::relative(usage.used_fraction()))
+                            .rounded_full()
+                            .bg(t.colors.accent),
+                    ),
+            )
+            .child(
+                div().flex().justify_between().gap_2().text_xs().child(
+                    div()
+                        .text_color(t.colors.text_secondary)
+                        .child(usage.free_label()),
+                ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(t.colors.text_muted)
+                    .truncate()
+                    .child(usage.used_label()),
+            ),
+        StorageStatus::Unknown => base.child(
+            div()
+                .text_xs()
+                .text_color(t.colors.text_muted)
+                .child("Checking…"),
+        ),
+        StorageStatus::Unavailable(reason) => base.child(
+            div()
+                .text_xs()
+                .text_color(t.colors.text_muted)
+                .truncate()
+                .child(format!("Unavailable: {reason}")),
+        ),
+    }
+}
+
 fn hint(t: &Theme, keys: &[&'static str], label: &'static str) -> Div {
     div()
         .flex()
@@ -881,7 +932,7 @@ impl Render for ClipperWindow {
                     .h_full()
                     .flex()
                     .flex_col()
-                    .child(self.top_bar(&t))
+                    .child(self.capture_bar(window, cx))
                     .child(
                         div().id("main-scroll").flex_1().overflow_y_scroll().child(
                             div()

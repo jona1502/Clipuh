@@ -1,5 +1,6 @@
 use clipper_core::recording::{
-    CaptureSource, QualityProfile, RecorderCommand, RecordingStats, SourceKind,
+    CaptureSource, QualityProfile, REPLAY_DURATIONS_SECONDS, RecorderCommand, RecordingStats,
+    SourceKind,
 };
 use clipper_storage::config::ReplayMode;
 use clipper_storage::storage_projection::StorageProjection;
@@ -9,7 +10,7 @@ use gpui::{AnyElement, Context, Div, FontWeight, SharedString, Window, div, px};
 
 use super::{CaptureMenu, ClipperWindow, Confirm, Dismiss, SelectNext, SelectPrevious};
 use crate::components::{
-    ButtonVariant, DropdownOption, Tone, button, dropdown, empty_state, kbd, list_item, panel,
+    ButtonVariant, DropdownOption, Tone, button, dropdown, empty_state, list_item, panel,
     property_row, section_header, stat_tile, status_dot, step, switch, value_text,
 };
 use crate::state::{
@@ -223,12 +224,7 @@ fn replay(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
         card = card.child(replay_notice(&t, error, Tone::Danger));
     }
 
-    section(
-        &t,
-        "Instant replay",
-        Some(format!("Save: {}", config.hotkey).into()),
-    )
-    .child(card)
+    section(&t, "Instant replay", None).child(card)
 }
 
 fn replay_notice(t: &Theme, message: String, tone: Tone) -> Div {
@@ -437,12 +433,8 @@ fn source_row(
 /// Base bitrates offered in the capture settings.
 const VIDEO_BITRATES_MBPS: [u32; 5] = [8, 16, 24, 32, 50];
 
-const CAPTURE_MENUS: [CaptureMenu; 4] = [
-    CaptureMenu::Resolution,
-    CaptureMenu::FrameRate,
-    CaptureMenu::Quality,
-    CaptureMenu::Bitrate,
-];
+/// Resolution, frame rate and replay length live in the capture bar.
+const CAPTURE_MENUS: [CaptureMenu; 2] = [CaptureMenu::Quality, CaptureMenu::Bitrate];
 
 fn option(label: String, detail: Option<String>, reason: Option<String>) -> DropdownOption {
     DropdownOption {
@@ -499,6 +491,34 @@ fn quality_options(base_mbps: u32) -> Vec<DropdownOption> {
         .collect()
 }
 
+fn replay_duration_options() -> Vec<DropdownOption> {
+    REPLAY_DURATIONS_SECONDS
+        .into_iter()
+        .map(|s| {
+            let label = if s >= 120 && s % 60 == 0 {
+                format!("{} min", s / 60)
+            } else {
+                format!("{s} sec")
+            };
+            option(label, None, None)
+        })
+        .collect()
+}
+
+/// True for resolution/fps when the running capture differs from config.
+fn pending_video(
+    menu: CaptureMenu,
+    active: Option<(u32, u32, u32)>,
+    config: (u32, u32, u32),
+) -> bool {
+    let Some(active) = active else { return false };
+    match menu {
+        CaptureMenu::Resolution => (active.0, active.1) != (config.0, config.1),
+        CaptureMenu::FrameRate => active.2 != config.2,
+        _ => false,
+    }
+}
+
 fn bitrate_options() -> Vec<DropdownOption> {
     VIDEO_BITRATES_MBPS
         .into_iter()
@@ -516,7 +536,8 @@ fn capture_settings(window: &ClipperWindow, win: &Window, cx: &mut Context<Clipp
     let t = *cx.theme();
     let note = (!window.recording.settings_enabled())
         .then(|| "Changes apply to the next recording.".into());
-    let cards = CAPTURE_MENUS.into_iter().enumerate().map(|(index, menu)| {
+    let cards = CAPTURE_MENUS.into_iter().map(|menu| {
+        let index = menu as usize;
         let options = window.capture_options(menu);
         let selected = window.capture_selected(menu);
         let focus = &window.capture_focus[index];
@@ -565,17 +586,18 @@ fn capture_settings(window: &ClipperWindow, win: &Window, cx: &mut Context<Clipp
 }
 
 impl ClipperWindow {
-    fn capture_options(&self, menu: CaptureMenu) -> Vec<DropdownOption> {
+    pub(super) fn capture_options(&self, menu: CaptureMenu) -> Vec<DropdownOption> {
         let video = &self.config.video;
         match menu {
             CaptureMenu::Resolution => resolution_options(video.fps),
             CaptureMenu::FrameRate => fps_options(video.width, video.height),
             CaptureMenu::Quality => quality_options(video.bitrate_mbps),
             CaptureMenu::Bitrate => bitrate_options(),
+            CaptureMenu::ReplayDuration => replay_duration_options(),
         }
     }
 
-    fn capture_selected(&self, menu: CaptureMenu) -> usize {
+    pub(super) fn capture_selected(&self, menu: CaptureMenu) -> usize {
         let video = &self.config.video;
         match menu {
             CaptureMenu::Resolution => VIDEO_RESOLUTIONS
@@ -588,11 +610,14 @@ impl ClipperWindow {
             CaptureMenu::Bitrate => VIDEO_BITRATES_MBPS
                 .iter()
                 .position(|b| *b == video.bitrate_mbps),
+            CaptureMenu::ReplayDuration => REPLAY_DURATIONS_SECONDS
+                .iter()
+                .position(|s| *s == self.config.replay.duration_seconds),
         }
         .unwrap_or(0)
     }
 
-    fn capture_toggle(&mut self, menu: CaptureMenu, cx: &mut Context<Self>) {
+    pub(super) fn capture_toggle(&mut self, menu: CaptureMenu, cx: &mut Context<Self>) {
         if matches!(self.capture_menu, Some((open, _)) if open == menu) {
             self.capture_close(cx);
         } else {
@@ -607,7 +632,12 @@ impl ClipperWindow {
         }
     }
 
-    fn capture_apply(&mut self, menu: CaptureMenu, index: usize, cx: &mut Context<Self>) {
+    pub(super) fn capture_apply(
+        &mut self,
+        menu: CaptureMenu,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) {
         self.capture_menu = None;
         let enabled = self
             .capture_options(menu)
@@ -626,18 +656,31 @@ impl ClipperWindow {
                 self.config.recording.quality = QualityProfile::ALL[index].into()
             }
             CaptureMenu::Bitrate => self.config.video.bitrate_mbps = VIDEO_BITRATES_MBPS[index],
+            CaptureMenu::ReplayDuration => {
+                let seconds = REPLAY_DURATIONS_SECONDS[index];
+                self.config.replay.duration_seconds = seconds;
+                // Applied live; the buffer keeps capturing.
+                if matches!(
+                    self.recording.replay.phase,
+                    ReplayPhase::Starting | ReplayPhase::Running { .. }
+                ) {
+                    self.send(RecorderCommand::SetReplayDuration(
+                        std::time::Duration::from_secs(u64::from(seconds)),
+                    ));
+                }
+            }
         }
         self.persist_config(cx);
     }
 
-    fn capture_confirm(&mut self, menu: CaptureMenu, cx: &mut Context<Self>) {
+    pub(super) fn capture_confirm(&mut self, menu: CaptureMenu, cx: &mut Context<Self>) {
         match self.capture_menu {
             Some((open, highlighted)) if open == menu => self.capture_apply(menu, highlighted, cx),
             _ => self.capture_toggle(menu, cx),
         }
     }
 
-    fn capture_step(&mut self, menu: CaptureMenu, delta: isize, cx: &mut Context<Self>) {
+    pub(super) fn capture_step(&mut self, menu: CaptureMenu, delta: isize, cx: &mut Context<Self>) {
         let Some((open, from)) = self.capture_menu.filter(|(open, _)| *open == menu) else {
             self.capture_toggle(menu, cx);
             return;
@@ -693,12 +736,6 @@ fn overview(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
     );
 
     let card = |tile: Div| tile.flex_grow().flex_basis(px(180.)).min_w(px(180.)).p_3();
-    let keys = window
-        .config
-        .replay
-        .hotkey
-        .split('+')
-        .map(|key| kbd(&t, key.trim().to_owned()));
 
     let storage_tile =
         if let Some(projection) = projection {
@@ -843,29 +880,23 @@ fn overview(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
                 projection.replay_duration_seconds
             },)
         ),
-        format!("{mode} · Save: {}", window.config.replay.hotkey),
+        mode,
     )
     .child(
-        div()
-            .pt_2()
-            .flex()
-            .items_center()
-            .gap_2()
-            .child(
-                button(
-                    &t,
-                    "save-replay",
-                    "Save replay",
-                    ButtonVariant::Secondary,
-                    None,
-                    true,
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.send(RecorderCommand::SaveReplay);
-                    cx.notify();
-                })),
+        div().pt_2().flex().items_center().gap_2().child(
+            button(
+                &t,
+                "save-replay",
+                "Save replay",
+                ButtonVariant::Secondary,
+                None,
+                true,
             )
-            .child(div().flex().gap_1().children(keys)),
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.send(RecorderCommand::SaveReplay);
+                cx.notify();
+            })),
+        ),
     )
     .child(replay_details);
 
@@ -1007,10 +1038,30 @@ impl ClipperWindow {
                 return;
             }
         };
+        let video = (options.width, options.height, options.fps);
         if self.send(RecorderCommand::StartRecording { source, options }) {
+            self.active_video = Some(video);
             self.storage_projection_run
                 .start_accepted(self.storage_projection_cache.snapshot());
             self.recording.begin_start();
+        }
+    }
+
+    /// Whether the menu's configured value differs from what the running
+    /// capture started with (it applies on restart).
+    pub(super) fn capture_pending(&self, menu: CaptureMenu) -> bool {
+        let video = &self.config.video;
+        pending_video(
+            menu,
+            self.active_video,
+            (video.width, video.height, video.fps),
+        )
+    }
+
+    /// Clears `active_video` once neither replay nor recording is running.
+    pub(super) fn refresh_active_video(&mut self) {
+        if self.recording.phase == Phase::Idle && self.recording.replay.phase == ReplayPhase::Off {
+            self.active_video = None;
         }
     }
 
@@ -1034,7 +1085,13 @@ impl ClipperWindow {
                 return false;
             }
         };
+        let video = (
+            options.recording.width,
+            options.recording.height,
+            options.recording.fps,
+        );
         if self.send(RecorderCommand::StartReplay { source, options }) {
+            self.active_video = Some(video);
             self.recording.replay.begin_start();
             true
         } else {
@@ -1055,12 +1112,23 @@ impl ClipperWindow {
     /// right now (no source, recording active) only the preference changes, so
     /// it starts on the next launch.
     pub(super) fn toggle_replay(&mut self, cx: &mut Context<Self>) {
+        // A command that could not be sent changes nothing, so the saved
+        // preference (autostart) only follows requests that went out.
         let enabled = match self.recording.replay.phase {
             ReplayPhase::Running { .. } => {
-                self.stop_replay();
+                if !self.stop_replay() {
+                    cx.notify();
+                    return;
+                }
                 false
             }
-            ReplayPhase::Off if self.recording.can_start_replay() => self.start_replay(),
+            ReplayPhase::Off if self.recording.can_start_replay() => {
+                if !self.start_replay() {
+                    cx.notify();
+                    return;
+                }
+                true
+            }
             ReplayPhase::Off => !self.config.replay.enabled,
             ReplayPhase::Starting | ReplayPhase::Stopping => return,
         };
@@ -1095,6 +1163,42 @@ impl ClipperWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_duration_labels() {
+        let labels: Vec<_> = replay_duration_options()
+            .into_iter()
+            .map(|o| o.label.to_string())
+            .collect();
+        assert_eq!(labels, ["15 sec", "30 sec", "60 sec", "2 min", "5 min"]);
+    }
+
+    #[test]
+    fn pending_only_when_running_video_differs() {
+        let cfg = (1920, 1080, 60);
+        assert!(!pending_video(CaptureMenu::Resolution, None, cfg));
+        assert!(!pending_video(CaptureMenu::Resolution, Some(cfg), cfg));
+        assert!(pending_video(
+            CaptureMenu::Resolution,
+            Some((2560, 1440, 60)),
+            cfg
+        ));
+        assert!(!pending_video(
+            CaptureMenu::FrameRate,
+            Some((2560, 1440, 60)),
+            cfg
+        ));
+        assert!(pending_video(
+            CaptureMenu::FrameRate,
+            Some((1920, 1080, 30)),
+            cfg
+        ));
+        assert!(!pending_video(
+            CaptureMenu::ReplayDuration,
+            Some((1, 1, 1)),
+            cfg
+        ));
+    }
 
     #[test]
     fn unsupported_resolution_is_disabled_with_reason() {

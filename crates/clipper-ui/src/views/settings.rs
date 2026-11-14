@@ -1,5 +1,5 @@
 use clipper_core::hotkey::{Hotkey, HotkeyError, Key, Modifiers};
-use clipper_core::recording::{QualityProfile, REPLAY_DURATIONS_SECONDS, RecorderCommand};
+use clipper_core::recording::QualityProfile;
 use clipper_platform::windows::hotkey::RegisterError;
 use clipper_storage::{
     ACCENT_PRESETS, AppearanceSettings, DEFAULT_ACCENT, NOTIFICATION_DURATION_SECONDS,
@@ -15,12 +15,13 @@ use gpui::{
 
 use super::{ClipperWindow, HOTKEY_CONTEXT};
 use crate::components::{
-    ButtonVariant, TextInput, TextInputEvent, button, chip, kbd, panel, property_row,
-    section_header, switch, toggle as toggle_control, tooltip, value_text,
+    TextInput, TextInputEvent, chip, kbd, panel, property_row, section_header, switch,
+    toggle as toggle_control, tooltip, value_text,
 };
-use crate::state::ReplayPhase;
 use crate::theme::{ActiveTheme, Theme};
 
+/// Width of the Save Clip hotkey slot in the capture bar.
+const HOTKEY_SLOT_WIDTH: f32 = 168.0;
 /// RAM budgets offered for the replay buffer, in MiB.
 const REPLAY_MEMORY_PRESETS_MB: [u32; 5] = [32, 64, 128, 256, 512];
 /// Disk cache limits offered for the replay buffer, in MiB.
@@ -31,14 +32,6 @@ fn size_label(megabytes: u32) -> String {
         format!("{} GB", megabytes / 1024)
     } else {
         format!("{megabytes} MB")
-    }
-}
-
-fn duration_label(seconds: u32) -> String {
-    if seconds >= 60 && seconds.is_multiple_of(60) {
-        format!("{} min", seconds / 60)
-    } else {
-        format!("{seconds} s")
     }
 }
 
@@ -186,7 +179,11 @@ impl ClipperWindow {
                     this.persist_config(cx);
                 }
                 failure => {
-                    // The old combo stays released until the user leaves recording mode.
+                    // Put the previous working combo back right away, so a failed
+                    // change never leaves Clipper without a Save Clip hotkey. The
+                    // recorder stays open for another try; the next attempt
+                    // replaces this registration again.
+                    let _ = this.hotkeys.set(Some(this.hotkey));
                     let message = match failure {
                         Ok(Err(error)) => error.to_string(),
                         _ => "The hotkey service is not running.".to_owned(),
@@ -247,72 +244,123 @@ impl ClipperWindow {
         cx.notify();
     }
 
-    fn hotkey_control(&self, cx: &mut Context<Self>) -> AnyElement {
-        let t = *cx.theme();
-        let error = |text: String| div().text_xs().text_color(t.colors.danger).child(text);
-        let column = || div().flex().flex_col().items_end().gap_1();
-        let row = || div().flex().items_center().gap_3();
+    /// The Save Clip shortcut as one compact control for the capture bar:
+    /// idle keycaps, a recording prompt, a transient "Saving…", and a danger
+    /// border plus tooltip on error (never taller than `control_height`).
+    /// The previous binding is released while recording (so its keys reach the
+    /// recorder) and registered again on cancel or after a failed attempt.
+    pub(super) fn hotkey_bar_control(
+        &self,
+        t: &Theme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        // Fixed width: whatever is recorded or shown, the bar keeps one row.
+        let shell = |id: &'static str, border| {
+            div()
+                .id(id)
+                .flex_none()
+                .w(px(HOTKEY_SLOT_WIDTH))
+                .overflow_hidden()
+                .h(t.metrics.control_height)
+                .px(t.metrics.control_padding)
+                .flex()
+                .items_center()
+                .gap(t.metrics.gap)
+                .rounded_md()
+                .border_1()
+                .border_color(border)
+                .bg(t.colors.surface_raised)
+        };
+        let line = |color, text: String| {
+            div()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .text_ellipsis()
+                .whitespace_nowrap()
+                .text_xs()
+                .text_color(color)
+                .child(text)
+        };
 
         let Some(recorder) = &self.hotkey_recorder else {
-            let change = button(
-                &t,
-                "hotkey-change",
-                "Change",
-                ButtonVariant::Secondary,
-                None,
-                true,
-            )
-            .on_click(cx.listener(|this, _, window, cx| this.begin_hotkey_recording(window, cx)));
-            return column()
-                .child(
-                    row()
-                        .child(keycaps(&t, &self.hotkey.to_string()))
-                        .child(change),
+            let focus = window
+                .use_keyed_state("hotkey-bar-focus", cx, |_, cx| {
+                    // After the bar's replay-length menu (6), before its replay switch (8).
+                    cx.focus_handle().tab_index(7).tab_stop(true)
+                })
+                .read(cx)
+                .clone();
+            let error = self.hotkey_error.clone();
+            let border = if error.is_some() {
+                t.colors.danger
+            } else if focus.is_focused(window) {
+                t.colors.focus_ring
+            } else {
+                t.colors.border
+            };
+            return shell("hotkey-bar", border)
+                .cursor_pointer()
+                .key_context("Toggle")
+                .track_focus(&focus)
+                .tooltip(tooltip(
+                    error.unwrap_or_else(|| "Change the Save Clip hotkey".to_owned()),
+                ))
+                .on_click(
+                    cx.listener(|this, _, window, cx| this.begin_hotkey_recording(window, cx)),
                 )
-                .children(self.hotkey_error.clone().map(error))
+                .on_action(
+                    cx.listener(|this, _: &crate::components::Activate, window, cx| {
+                        this.begin_hotkey_recording(window, cx)
+                    }),
+                )
+                .child(keycaps(t, &self.hotkey.to_string()))
                 .into_any_element();
         };
 
-        let prompt = if recorder.held.is_empty() {
-            div()
-                .text_sm()
-                .text_color(t.colors.text_muted)
-                .child("Press your shortcut…")
+        let error = recorder.error.clone();
+        let prompt = if recorder.pending {
+            line(t.colors.text_muted, "Saving…".to_owned())
+        } else if let Some(error) = &error {
+            line(t.colors.danger, error.clone())
+        } else if recorder.held.is_empty() {
+            line(t.colors.text_muted, "Press keys…".to_owned())
         } else {
-            keycaps(&t, &modifier_names(recorder.held))
+            keycaps(t, &modifier_names(recorder.held))
                 .child(div().text_color(t.colors.text_muted).child("+ …"))
         };
-        let enabled = !recorder.pending;
-        let reset = button(
-            &t,
-            "hotkey-reset",
-            "Reset to Default",
-            ButtonVariant::Ghost,
-            None,
-            enabled,
-        )
-        .when(enabled, |this| {
-            this.on_click(cx.listener(|this, _, window, cx| {
-                this.apply_hotkey(Hotkey::default_save_replay(), window, cx)
-            }))
-        });
-        let cancel = button(
-            &t,
-            "hotkey-cancel",
-            "Cancel",
-            ButtonVariant::Secondary,
-            None,
-            enabled,
-        )
-        .when(enabled, |this| {
-            this.on_click(
+        let border = if error.is_some() {
+            t.colors.danger
+        } else {
+            t.colors.focus_ring
+        };
+        let link = |id: &'static str, label: &'static str, hint: &'static str| {
+            div()
+                .id(id)
+                .flex_none()
+                .cursor_pointer()
+                .text_xs()
+                .text_color(t.colors.text_muted)
+                .hover(|this| this.text_color(t.colors.text))
+                .tooltip(tooltip(hint))
+                .child(label)
+        };
+        let cancel = (!recorder.pending).then(|| {
+            link("hotkey-cancel", "×", "Cancel (Esc)").on_click(
                 cx.listener(|this, _, window, cx| this.cancel_hotkey_recording(window, cx)),
             )
         });
-        let capture = div()
-            .id("hotkey-recorder")
+        let default = Hotkey::default_save_replay();
+        let reset = (!recorder.pending && self.hotkey != default).then(|| {
+            link("hotkey-default", "Default", "Use the default shortcut").on_click(
+                cx.listener(move |this, _, window, cx| this.apply_hotkey(default, window, cx)),
+            )
+        });
+        shell("hotkey-recorder", border)
             .key_context(HOTKEY_CONTEXT)
             .track_focus(&recorder.focus)
+            .when_some(error, |this, error| this.tooltip(tooltip(error)))
             .on_key_down(cx.listener(Self::hotkey_key_down))
             .on_modifiers_changed(cx.listener(|this, event: &ModifiersChangedEvent, _, cx| {
                 if let Some(recorder) = &mut this.hotkey_recorder {
@@ -320,20 +368,9 @@ impl ClipperWindow {
                     cx.notify();
                 }
             }))
-            .h(px(30.))
-            .min_w(px(180.))
-            .px_3()
-            .flex()
-            .items_center()
-            .gap_1()
-            .rounded_md()
-            .border_1()
-            .border_color(t.colors.focus_ring)
-            .bg(t.colors.surface_raised)
-            .child(prompt);
-        column()
-            .child(row().child(capture).child(reset).child(cancel))
-            .children(recorder.error.clone().map(error))
+            .child(prompt)
+            .children(reset)
+            .children(cancel)
             .into_any_element()
     }
 }
@@ -377,8 +414,8 @@ pub(super) fn accent_input(
     cx: &mut Context<ClipperWindow>,
 ) -> Entity<TextInput> {
     let input = cx.new(|cx| {
-        // After the sidebar (0-3), capture menus (4-7) and notification toggles (8-11).
-        let mut input = TextInput::new(cx).placeholder(DEFAULT_ACCENT).tab_index(12);
+        // After the shell and capture controls (0-10) and notification toggles (11-14).
+        let mut input = TextInput::new(cx).placeholder(DEFAULT_ACCENT).tab_index(15);
         input.set_text(config.appearance.accent_color.clone(), cx);
         input
     });
@@ -614,31 +651,6 @@ pub(super) fn content(
         .children(durations)
         .into_any_element();
 
-    let replay_durations = REPLAY_DURATIONS_SECONDS
-        .into_iter()
-        .map(|seconds| {
-            chip(
-                &t,
-                ("replay-duration", seconds as usize),
-                duration_label(seconds),
-                replay.duration_seconds == seconds,
-                true,
-            )
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.config.replay.duration_seconds = seconds;
-                // Applied live; the buffer keeps capturing.
-                if matches!(
-                    this.recording.replay.phase,
-                    ReplayPhase::Starting | ReplayPhase::Running { .. }
-                ) {
-                    this.send(RecorderCommand::SetReplayDuration(
-                        std::time::Duration::from_secs(u64::from(seconds)),
-                    ));
-                }
-                this.persist_config(cx);
-            }))
-        })
-        .collect::<Vec<_>>();
     let replay_memory = REPLAY_MEMORY_PRESETS_MB
         .into_iter()
         .map(|megabytes| {
@@ -673,16 +685,6 @@ pub(super) fn content(
         .collect::<Vec<_>>();
     let chips =
         |items: Vec<gpui::Stateful<Div>>| div().flex().gap_1p5().children(items).into_any_element();
-    let replay_on = matches!(
-        window.recording.replay.phase,
-        ReplayPhase::Starting | ReplayPhase::Running { .. }
-    ) || (window.recording.replay.is_off() && replay.enabled);
-    let replay_toggle = div()
-        .id("replay-enabled")
-        .cursor_pointer()
-        .on_click(cx.listener(|this, _, _, cx| this.toggle_replay(cx)))
-        .child(switch(&t, replay_on))
-        .into_any_element();
     let cache_directory = match &replay.cache_directory {
         Some(path) => path_text(&t, path.display().to_string()),
         None => match default_replay_cache_directory() {
@@ -698,7 +700,11 @@ pub(super) fn content(
         .child(group(
             &t,
             "Hotkeys",
-            vec![("Save Instant Replay", None, window.hotkey_control(cx))],
+            vec![(
+                "Save Instant Replay",
+                Some("Change it in the capture bar at the top."),
+                keycaps(&t, &window.hotkey.to_string()).into_any_element(),
+            )],
         ))
         .child(group(
             &t,
@@ -769,7 +775,7 @@ pub(super) fn content(
             vec![
                 (
                     "Resolution",
-                    Some("Resolution, frame rate and quality change on the Dashboard."),
+                    Some("Resolution and frame rate change in the capture bar, quality on the Capture page."),
                     text(&t, format!("{}×{}", video.width, video.height)),
                 ),
                 ("Frame rate", None, text(&t, format!("{} fps", video.fps))),
@@ -791,17 +797,7 @@ pub(super) fn content(
             &t,
             "Replay",
             vec![
-                (
-                    "Instant replay",
-                    Some("Starts automatically with Clipper. Needs a source on the Dashboard."),
-                    replay_toggle,
-                ),
                 ("Mode", None, text(&t, mode)),
-                (
-                    "Duration",
-                    Some("Applies immediately, even while replay is running."),
-                    chips(replay_durations),
-                ),
                 (
                     "Memory budget",
                     Some("Older footage spills to disk. Applies the next time replay starts."),

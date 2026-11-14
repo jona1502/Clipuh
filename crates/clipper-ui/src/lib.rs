@@ -4,6 +4,7 @@
 mod components;
 mod notifications;
 mod state;
+mod storage_status;
 mod theme;
 mod views;
 
