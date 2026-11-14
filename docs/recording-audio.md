@@ -12,13 +12,95 @@ packets wake the recorder. It mixes the selected render endpoint and microphone
 on a shared QPC timeline, then feeds 48 kHz stereo PCM16 to the system AAC-LC
 encoder (192 kbps) inside the same Media Foundation MP4 sink writer as video.
 
-Audio stream 0 is the playback mix. With isolated editing tracks enabled,
-additional streams contain desktop and microphone individually, in that order
-when both are enabled. These are alternatives for editing: do not sum the mix
-and its isolated tracks together. Game and Discord are already included once
-in endpoint playback; separate process routing is not integrated into recording.
-Existing `audio.game` and `audio.discord` preferences do not select processes.
-The UI explains this limitation rather than exposing functional process toggles.
+Audio stream 0 is the playback mix. With separate tracks enabled, one extra
+stream per started source follows, in source order. These are alternatives for
+editing: do not sum the mix and its isolated tracks together.
+
+## Sources, routing and overlap
+
+Sources come from `[[audio.sources]]`; only enabled ones reach the recorder
+(the settings' `recording_options` filters the rest, so a disabled source is
+never opened, metered or tracked). Kinds: Game (the executable behind the
+captured window), Application (`Discord.exe`...), Desktop (render endpoint
+loopback), Microphone. `clipper_audio::routing::plan` makes tracks disjoint so
+the mix never holds a signal twice:
+
+- Application/Game: process loopback INCLUDE of that process tree. The same
+  executable twice (any case, Game + Application) is recorded once.
+- Desktop with no application source: full endpoint mix, labelled "Desktop
+  (full mix)".
+- Desktop with exactly one application: process loopback EXCLUDE of that
+  application ("Desktop (without X)"). It is system-wide, so the chosen output
+  device is ignored for this stream.
+- Desktop with two or more applications: no desktop track (Windows can exclude
+  only one tree) and the source shows "Desktop audio is off: ...". Signals are
+  never subtracted.
+- Microphones: one track per distinct device. A device chosen explicitly that
+  is also the Windows default counts as the default when a source follows the
+  default, and is reported as a duplicate.
+- Known residue: an application started by another selected application (an
+  Application source on a launcher that parents the game) is inside both
+  trees. While the excluded application is not running, the desktop track is
+  the full mix and switches to exclusion within ~250 ms plus activation after
+  it starts; its audio can be in both tracks for that moment.
+
+Every requested source gets an `AudioSources` status: `Capturing`,
+`Waiting(reason)`, `Starting`, `Failed(message)` or `Skipped(reason)`.
+`Skipped` carries the routing warning (unsupported Windows, duplicate, desktop
+dropped, whole display captured for Game, more than four sources).
+
+## Capability fallback
+
+Process loopback needs Windows 10 build 20348+ / Windows 11.
+`clipper_audio::windows::process_loopback_supported()` (or `capabilities()`)
+tells the UI up front. Without it, Game/Application sources are `Skipped`
+("Per-app audio needs Windows 11 ...") and Desktop becomes the plain full mix,
+so tracks are never silently missing and never collapsed: the encoder's track
+count and labels are derived from the planned tracks (`AudioPlan`), and the
+capture engine refuses a hand-made plan that needs process loopback.
+`clipper_recorder::planned_audio_tracks(&options)` returns the track count a
+session is expected to encode on this machine (a Game source is assumed to
+resolve), for storage estimates; `RecordingAudioOptions::encoded_track_count()`
+stays the platform-neutral upper bound.
+
+## Recording and replay do not overlap
+
+The recorder worker is single-threaded and refuses `StartRecording`,
+`StartAudioTest` and `StartReplay` while any of the other two is active
+("Stop instant replay first." / "stop the current recording first"), so at most
+one `RecordingAudio` (one set of capture threads) exists. The replay buffer's
+audio also serves clips saved from it; a manual recording is not possible
+while the replay runs.
+
+## Source loss mid-session
+
+- Application exits: the stream's exit handle fires, the thread reopens, finds
+  no process and reports `SourceLost`; the source shows `Waiting("X is not
+  running")`, its track stays in the file as silence, and capture resumes by
+  itself when the executable runs again (it is re-resolved by name). Other
+  sources continue. Neither recording nor replay fails or hangs: waits for
+  activation are interruptible by stop.
+- Desktop remainder (EXCLUDE) of an exiting application: reopens as the full
+  mix; a loss there is routine and never fails the session.
+- Device unplugged (microphone, explicit desktop device): a manual recording
+  fails (strict, no half-recorded file reported as good); a replay keeps
+  running with silence and `Waiting`, and the source returns on its own. A
+  stream that cannot be opened at all (`Failed`) fails either mode. The check
+  is per track, so a running application track cannot mask a lost microphone.
+- A device or full-mix track that delivered no sample at all fails a finished
+  clip; application tracks and desktop remainders may legitimately be silent.
+
+## Levels, gain and limiter
+
+Meters emit at most 10 times per second and only when a peak changed since the
+last one sent. Gain is 0 to 200 %, clamped in the settings, the recorder and
+the mixer, ramped over one 480-frame block. Each isolated track and the sum go
+through a soft limiter (identity up to 0.9, then approaching full scale) so
+gain above 100 % or several loud sources cannot clip hard or wrap.
+
+Process loopback streams are requested at 48 kHz stereo f32 with shared-mode
+conversion like every other stream; packets carry QPC positions and use the
+same placement, drift and jitter rules as the device streams.
 
 WGC can stop delivering frames on a static scene. The worker sends video stream
 ticks for those real gaps so synchronous muxer throttling does not block the
