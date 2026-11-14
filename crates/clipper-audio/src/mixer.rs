@@ -32,6 +32,11 @@ pub struct TimelineMixer {
     isolated: Vec<f32>,
 }
 
+/// Highest per-track gain accepted by [`TimelineMixer::set_gain`] (200 %).
+/// Larger requests are clamped, so a bad caller cannot overdrive the limiter
+/// into a permanently flat-topped mix.
+pub const MAX_GAIN: f32 = 2.0;
+
 /// Output limiter: identity up to [`KNEE`], then a smooth curve that
 /// approaches (never reaches) full scale, so gain above 100 % cannot wrap or
 /// clip hard. Slope is continuous at the knee.
@@ -49,6 +54,16 @@ fn soft_limit(x: f32) -> f32 {
 impl TimelineMixer {
     pub fn new(origin: i64, gains: Vec<f32>, separate: bool) -> Self {
         let count = gains.len();
+        let gains: Vec<f32> = gains
+            .into_iter()
+            .map(|gain| {
+                if gain.is_finite() {
+                    gain.clamp(0.0, MAX_GAIN)
+                } else {
+                    1.0
+                }
+            })
+            .collect();
         Self {
             origin,
             position: 0,
@@ -72,13 +87,14 @@ impl TimelineMixer {
         }
     }
 
-    /// Ramps track `index` linearly to `gain` over one 480-frame block (no
-    /// click). Out-of-range indexes and non-finite gains are ignored.
+    /// Ramps track `index` linearly to `gain` (clamped to `0..=`[`MAX_GAIN`])
+    /// over one 480-frame block (no click). Out-of-range indexes and
+    /// non-finite gains are ignored.
     pub fn set_gain(&mut self, index: usize, gain: f32) {
         if let Some(track) = self.tracks.get_mut(index)
             && gain.is_finite()
         {
-            track.target = gain.max(0.0);
+            track.target = gain.clamp(0.0, MAX_GAIN);
             track.step = (track.target - track.gain) / BLOCK as f32;
         }
     }
@@ -284,6 +300,31 @@ mod tests {
         loud.push(1, 0, 1, &[1.0; 480]);
         let blocks = render(&mut loud, 100_000);
         assert!(blocks[0].1.iter().all(|v| *v > 0.99 && *v <= 1.0));
+    }
+
+    #[test]
+    fn gain_is_clamped_to_two_and_never_negative() {
+        let mut mixer = TimelineMixer::new(0, vec![50.0, -3.0, f32::NAN], false);
+        assert_eq!(mixer.tracks[0].gain, MAX_GAIN);
+        assert_eq!(mixer.tracks[1].gain, 0.0);
+        assert_eq!(mixer.tracks[2].gain, 1.0);
+        mixer.set_gain(1, 10.0);
+        assert_eq!(mixer.tracks[1].target, MAX_GAIN);
+        mixer.set_gain(1, -1.0);
+        assert_eq!(mixer.tracks[1].target, 0.0);
+        mixer.set_gain(1, f32::INFINITY);
+        assert_eq!(mixer.tracks[1].target, 0.0);
+    }
+
+    #[test]
+    fn many_loud_sources_stay_inside_full_scale() {
+        let mut mixer = TimelineMixer::new(0, vec![2.0; 4], true);
+        for track in 0..4 {
+            mixer.push(track, 0, 1, &[1.0; 480]);
+        }
+        for (_, block) in render(&mut mixer, 100_000) {
+            assert!(block.iter().all(|v| v.abs() <= 1.0 && v.is_finite()));
+        }
     }
 
     #[test]

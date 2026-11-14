@@ -35,6 +35,30 @@ pub struct AudioCapture {
     started_at: i64,
 }
 
+/// Refuses a hand-made plan that needs process loopback on a Windows build
+/// without it, instead of starting a thread that can only fail later. Plans
+/// from [`routing::plan`] never trigger this (they drop such sources with a
+/// warning).
+fn check_supported(
+    plan: &RoutingPlan,
+    caps: crate::types::AudioCapabilities,
+) -> Result<(), AudioError> {
+    let needs_process = plan.tracks.iter().any(|t| {
+        matches!(
+            t.stream,
+            StreamPlan::ProcessInclude(_) | StreamPlan::ProcessExclude(_)
+        )
+    });
+    if needs_process && !caps.process_loopback {
+        return Err(AudioError::Unsupported(
+            RoutingWarning::ProcessLoopbackUnsupported
+                .message()
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Current QPC time in 100 ns units.
 pub fn qpc_now_ticks() -> i64 {
     let mut freq = 0i64;
@@ -69,6 +93,7 @@ impl AudioCapture {
         if plan.tracks.is_empty() {
             return Err(AudioError::NothingToCapture);
         }
+        check_supported(plan, process::capabilities())?;
         // Taken before the threads spawn so no packet predates the origin.
         let started_at = qpc_now_ticks();
         let (events_tx, events_rx) = sync_channel(config.event_capacity.max(1));
@@ -205,6 +230,14 @@ impl AudioCapture {
         self.levels.iter().any(|levels| levels.source_failed())
     }
 
+    /// Whether `track` ever lost its source or failed (latched, independent of
+    /// the lossy event channel). `false` for an unknown track.
+    pub fn track_failed(&self, track: usize) -> bool {
+        self.levels
+            .get(track)
+            .is_some_and(|levels| levels.source_failed())
+    }
+
     /// Persistent counters do not depend on delivery of lossy/throttled events.
     pub fn dropped_frames(&self) -> u64 {
         self.stats
@@ -249,6 +282,42 @@ impl Drop for AudioCapture {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{AudioCapabilities, ProcessTarget, TrackContent};
+
+    fn process_plan() -> RoutingPlan {
+        RoutingPlan {
+            tracks: vec![routing::PlannedTrack {
+                source: 1,
+                content: TrackContent::Application("a.exe".into()),
+                stream: StreamPlan::ProcessInclude(ProcessTarget::Executable("a.exe".into())),
+            }],
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn process_plan_is_refused_without_process_loopback() {
+        let legacy = AudioCapabilities {
+            process_loopback: false,
+        };
+        let modern = AudioCapabilities {
+            process_loopback: true,
+        };
+        assert!(matches!(
+            check_supported(&process_plan(), legacy),
+            Err(AudioError::Unsupported(_))
+        ));
+        assert!(check_supported(&process_plan(), modern).is_ok());
+        let endpoint = RoutingPlan {
+            tracks: vec![routing::PlannedTrack {
+                source: 1,
+                content: TrackContent::DesktopFull,
+                stream: StreamPlan::EndpointLoopback(None),
+            }],
+            warnings: Vec::new(),
+        };
+        assert!(check_supported(&endpoint, legacy).is_ok());
+    }
 
     #[test]
     fn unavailable_endpoint_failure_stays_latched_without_consuming_notifications() {

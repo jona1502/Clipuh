@@ -43,8 +43,8 @@ impl AudioSink for PacketEncoder {
     }
 }
 
-/// Meter events go out at most this often (about 15 Hz).
-const METER_INTERVAL: Duration = Duration::from_millis(66);
+/// Meter events go out at most this often (10 Hz).
+const METER_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Mixer sources resolved against the session's capture source and the
 /// Windows version.
@@ -114,13 +114,102 @@ pub fn resolve_selection(
     (selection, skipped)
 }
 
+/// Endpoint ids of the current Windows default devices.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DefaultDevices {
+    pub render: Option<String>,
+    pub capture: Option<String>,
+}
+
+impl DefaultDevices {
+    fn query() -> Self {
+        let default_of = |flow| {
+            list_devices(flow)
+                .ok()
+                .and_then(|devices| devices.into_iter().find(|d| d.is_default))
+                .map(|d| d.id)
+        };
+        Self {
+            render: default_of(DeviceFlow::Render),
+            capture: default_of(DeviceFlow::Capture),
+        }
+    }
+}
+
+/// A device chosen explicitly that is also the Windows default is the same
+/// signal as a source following the default. When both are selected the
+/// explicit one becomes "default" too, so routing reports it as a duplicate
+/// instead of recording (and mixing) the device twice.
+fn alias_default_devices(selection: &mut AudioSelection, defaults: &DefaultDevices) {
+    let follows_default_render = selection
+        .sources
+        .iter()
+        .any(|s| matches!(&s.kind, SourceRequestKind::Desktop { device: None }));
+    let follows_default_capture = selection.sources.iter().any(|s| {
+        matches!(
+            &s.kind,
+            SourceRequestKind::Microphone(MicrophoneChoice::Default)
+        )
+    });
+    for source in &mut selection.sources {
+        match &mut source.kind {
+            SourceRequestKind::Desktop { device } if follows_default_render => {
+                if device.is_some() && *device == defaults.render {
+                    *device = None;
+                }
+            }
+            SourceRequestKind::Microphone(choice) if follows_default_capture => {
+                let is_default = matches!(
+                    &*choice,
+                    MicrophoneChoice::Device(id) if Some(id) == defaults.capture.as_ref()
+                );
+                if is_default {
+                    *choice = MicrophoneChoice::Default;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Audio tracks a session with `options` is expected to encode on this
+/// Windows version (mix plus isolated tracks), for storage estimates. A
+/// `Game` source is assumed to resolve (a display capture, known only at
+/// start, would skip it). Never exceeds
+/// [`RecordingAudioOptions::encoded_track_count`].
+pub fn planned_audio_tracks(options: &RecordingAudioOptions) -> u32 {
+    planned_audio_tracks_with(options, capabilities(), &DefaultDevices::default())
+}
+
+fn planned_audio_tracks_with(
+    options: &RecordingAudioOptions,
+    caps: AudioCapabilities,
+    defaults: &DefaultDevices,
+) -> u32 {
+    AudioPlan::build(
+        options,
+        Some(1),
+        // Stand-in executable that cannot collide with a configured one.
+        |_| Some("<captured window>".to_owned()),
+        caps,
+        defaults,
+    )
+    .encoder_tracks() as u32
+}
+
 impl AudioPlan {
     /// Plans the audio of a session capturing `source` (`None`: audio test).
     pub fn for_session(options: &RecordingAudioOptions, source: Option<&CaptureSource>) -> Self {
         let window = source
             .filter(|source| source.kind == SourceKind::Window)
             .map(|source| source.id);
-        Self::build(options, window, executable_of_window, capabilities())
+        Self::build(
+            options,
+            window,
+            executable_of_window,
+            capabilities(),
+            &DefaultDevices::query(),
+        )
     }
 
     fn build(
@@ -128,8 +217,10 @@ impl AudioPlan {
         window: Option<u64>,
         exe_of: impl Fn(u64) -> Option<String>,
         caps: AudioCapabilities,
+        defaults: &DefaultDevices,
     ) -> Self {
-        let (selection, mut skipped) = resolve_selection(options, window, exe_of);
+        let (mut selection, mut skipped) = resolve_selection(options, window, exe_of);
+        alias_default_devices(&mut selection, defaults);
         let mut routing = routing::plan(&selection, caps);
         for (id, warning) in &routing.warnings {
             skipped.push((*id, warning.message().to_owned()));
@@ -228,8 +319,45 @@ struct TrackRt {
     /// Executable of an application track. These may be absent without
     /// failing the session.
     process: Option<String>,
+    /// May legitimately deliver no packet at all (a desktop remainder behind
+    /// process loopback, which Windows may not feed while nothing plays).
+    quiet_ok: bool,
     live: Live,
     gain: f32,
+}
+
+impl TrackRt {
+    /// Losing this track is routine and the capture thread recovers by
+    /// itself: an application that exits, or the desktop remainder that
+    /// reopens as the full mix when its excluded application exits. Never
+    /// fails a session.
+    fn loss_is_routine(&self) -> bool {
+        self.process.is_some() || self.quiet_ok
+    }
+}
+
+/// What one capture event does to a track. `Err` only for failures that must
+/// end the session (see [`RecordingAudio::start`]); `Ok(None)`: no change.
+/// Application tracks only ever become `Waiting`/`Failed`; device tracks end
+/// a manual recording when lost, but only turn `Waiting` in a tolerant
+/// (replay) session.
+fn transition(rt: &TrackRt, tolerant: bool, event: AudioEvent) -> Result<Option<Live>, String> {
+    Ok(match event {
+        AudioEvent::TrackStarted { .. } => Some(Live::Capturing),
+        AudioEvent::SourceLost { reason, .. } => match &rt.process {
+            Some(exe) => Some(Live::Waiting(format!("{exe} is not running"))),
+            None if tolerant || rt.loss_is_routine() => Some(Live::Waiting(reason)),
+            None => return Err(format!("Audio source lost: {reason}")),
+        },
+        AudioEvent::Failed { message, .. } => {
+            if rt.process.is_none() {
+                return Err(format!("Audio capture failed: {message}"));
+            }
+            Some(Live::Failed(message))
+        }
+        // Persistent counters cover even throttled or lost events.
+        AudioEvent::Overflow { .. } | AudioEvent::DeviceChanged { .. } => None,
+    })
 }
 
 pub struct RecordingAudio {
@@ -296,6 +424,7 @@ impl RecordingAudio {
                     TrackContent::Application(exe) => Some(exe.clone()),
                     _ => None,
                 },
+                quiet_ok: matches!(t.content, TrackContent::DesktopExcluding(_)),
                 live: Live::Starting,
                 gain: f32::from(plan.gain_percent(t.source)) / 100.0,
             })
@@ -350,31 +479,17 @@ impl RecordingAudio {
     /// Updates track state from one capture event. `Err` only for failures
     /// that must end the session (see [`Self::start`]).
     fn apply(&mut self, event: AudioEvent) -> Result<(), String> {
-        let (index, live) = match event {
-            AudioEvent::TrackStarted { track } => (track, Live::Capturing),
-            AudioEvent::SourceLost { track, reason } => {
-                let Some(rt) = self.tracks.get(track) else {
-                    return Ok(());
-                };
-                match &rt.process {
-                    Some(exe) => (track, Live::Waiting(format!("{exe} is not running"))),
-                    None if self.tolerant => (track, Live::Waiting(reason)),
-                    None => return Err(format!("Audio source lost: {reason}")),
-                }
-            }
-            AudioEvent::Failed { track, message } => {
-                let Some(rt) = self.tracks.get(track) else {
-                    return Ok(());
-                };
-                if rt.process.is_none() {
-                    return Err(format!("Audio capture failed: {message}"));
-                }
-                (track, Live::Failed(message))
-            }
-            // Persistent counters cover even throttled or lost events.
-            AudioEvent::Overflow { .. } | AudioEvent::DeviceChanged { .. } => return Ok(()),
+        let index = match &event {
+            AudioEvent::TrackStarted { track }
+            | AudioEvent::SourceLost { track, .. }
+            | AudioEvent::DeviceChanged { track, .. }
+            | AudioEvent::Overflow { track, .. }
+            | AudioEvent::Failed { track, .. } => *track,
         };
-        if let Some(rt) = self.tracks.get_mut(index)
+        let Some(rt) = self.tracks.get_mut(index) else {
+            return Ok(());
+        };
+        if let Some(live) = transition(rt, self.tolerant, event)?
             && rt.live != live
         {
             rt.live = live;
@@ -458,11 +573,19 @@ impl RecordingAudio {
         self.check_latched_failure()
     }
 
-    /// The capture engine latches any source loss, which is only a failure
-    /// when every track must stay alive (manual recording, no applications).
+    /// The capture engine latches any source loss per track, which fails a
+    /// manual recording for every device track (application tracks and
+    /// desktop remainders may come and go). Checked per track so an unrelated application track cannot
+    /// mask a lost microphone when its event was dropped by the bounded
+    /// event channel.
     fn check_latched_failure(&self) -> Result<(), String> {
-        let strict = !self.tolerant && self.tracks.iter().all(|t| t.process.is_none());
-        if strict && self.capture.had_source_failure() {
+        if !self.tolerant
+            && self
+                .tracks
+                .iter()
+                .enumerate()
+                .any(|(i, t)| !t.loss_is_routine() && self.capture.track_failed(i))
+        {
             return Err("An audio source failed; recording is incomplete.".into());
         }
         Ok(())
@@ -500,12 +623,13 @@ impl RecordingAudio {
     }
 
     /// A device track that never delivered a sample fails a finished clip;
-    /// application tracks may legitimately have stayed silent.
+    /// application tracks and desktop remainders may legitimately have stayed
+    /// silent.
     fn missing_device_audio(&self) -> bool {
         self.tracks
             .iter()
             .enumerate()
-            .any(|(i, t)| t.process.is_none() && !self.mixer.has_received(i))
+            .any(|(i, t)| t.process.is_none() && !t.quiet_ok && !self.mixer.has_received(i))
     }
 
     pub fn pump(
@@ -546,6 +670,15 @@ pub struct AudioReporter {
     idle: Vec<AudioSourceState>,
     started: bool,
     last_meter: Instant,
+    /// Levels of the last meter event, so an unchanged meter (all silent, or
+    /// frozen sources) sends nothing and the UI never repaints for it.
+    last_levels: Vec<SourceLevel>,
+}
+
+/// Whether a meter update must be sent: only when it differs from the last
+/// one sent. The first update is always sent, so the UI sees every source.
+fn levels_changed(last: &[SourceLevel], now: &[SourceLevel]) -> bool {
+    last != now
 }
 
 impl AudioReporter {
@@ -555,6 +688,7 @@ impl AudioReporter {
             idle,
             started: false,
             last_meter: Instant::now(),
+            last_levels: Vec::new(),
         }
     }
 
@@ -575,9 +709,15 @@ impl AudioReporter {
         }
         if self.last_meter.elapsed() >= METER_INTERVAL {
             self.last_meter = Instant::now();
-            let _ = endpoint
-                .events
-                .try_send(RecorderEvent::AudioLevels(audio.levels()));
+            let levels = audio.levels();
+            if levels_changed(&self.last_levels, &levels)
+                && endpoint
+                    .events
+                    .try_send(RecorderEvent::AudioLevels(levels.clone()))
+                    .is_ok()
+            {
+                self.last_levels = levels;
+            }
         }
     }
 
@@ -811,22 +951,304 @@ mod tests {
             source(1, AudioSourceTarget::Game),
             source(2, AudioSourceTarget::Microphone(None)),
         ]);
-        let plan = AudioPlan::build(&sources, None, |_| None, caps);
+        let plan = AudioPlan::build(&sources, None, |_| None, caps, &DefaultDevices::default());
         assert_eq!(plan.encoder_tracks(), 2);
         assert_eq!(plan.labels(), ["Mix", "Microphone"]);
         let states = plan.idle_states();
         assert!(matches!(states[0].status, AudioSourceStatus::Skipped(_)));
         let mut no_separate = sources.clone();
         no_separate.separate_tracks = false;
-        let plan = AudioPlan::build(&no_separate, None, |_| None, caps);
+        let plan = AudioPlan::build(
+            &no_separate,
+            None,
+            |_| None,
+            caps,
+            &DefaultDevices::default(),
+        );
         assert_eq!(
             (plan.encoder_tracks(), plan.labels()),
             (1, vec![String::from("Mix")])
         );
         let none = options(vec![source(1, AudioSourceTarget::Game)]);
-        let plan = AudioPlan::build(&none, None, |_| None, caps);
+        let plan = AudioPlan::build(&none, None, |_| None, caps, &DefaultDevices::default());
         assert_eq!(plan.encoder_tracks(), 0);
         assert!(plan.labels().is_empty());
+    }
+
+    const MODERN: AudioCapabilities = AudioCapabilities {
+        process_loopback: true,
+    };
+    const LEGACY: AudioCapabilities = AudioCapabilities {
+        process_loopback: false,
+    };
+
+    fn plan_for(
+        sources: Vec<RecordingAudioSource>,
+        caps: AudioCapabilities,
+        defaults: &DefaultDevices,
+    ) -> AudioPlan {
+        AudioPlan::build(
+            &options(sources),
+            Some(1),
+            |_| Some("game.exe".into()),
+            caps,
+            defaults,
+        )
+    }
+
+    fn status_of(plan: &AudioPlan, id: u32) -> AudioSourceStatus {
+        plan.idle_states()
+            .into_iter()
+            .find(|s| s.source == id)
+            .unwrap()
+            .status
+    }
+
+    #[test]
+    fn legacy_windows_reports_apps_unavailable_and_tracks_match() {
+        let plan = plan_for(
+            vec![
+                source(1, AudioSourceTarget::Game),
+                source(2, AudioSourceTarget::Application("Discord.exe".into())),
+                source(3, AudioSourceTarget::Desktop(None)),
+                source(4, AudioSourceTarget::Microphone(None)),
+            ],
+            LEGACY,
+            &DefaultDevices::default(),
+        );
+        // Mix + desktop (full mix) + microphone: nothing silently collapsed.
+        assert_eq!(plan.encoder_tracks(), 3);
+        assert_eq!(plan.labels(), ["Mix", "Desktop (full mix)", "Microphone"]);
+        assert_eq!(plan.routing.tracks.len() + 1, plan.encoder_tracks());
+        for id in [1, 2] {
+            assert!(
+                matches!(status_of(&plan, id), AudioSourceStatus::Skipped(m) if m.contains("Windows 11")),
+                "source {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_source_has_a_track_or_a_reason() {
+        let plan = plan_for(
+            vec![
+                source(1, AudioSourceTarget::Game),
+                source(2, AudioSourceTarget::Application("Discord.exe".into())),
+                source(3, AudioSourceTarget::Desktop(None)),
+                source(4, AudioSourceTarget::Microphone(None)),
+            ],
+            MODERN,
+            &DefaultDevices::default(),
+        );
+        // Two apps: the desktop remainder cannot exist and says why.
+        assert_eq!(
+            plan.labels(),
+            ["Mix", "game.exe", "Discord.exe", "Microphone"]
+        );
+        assert_eq!(plan.encoder_tracks(), 4);
+        assert!(matches!(
+            status_of(&plan, 3),
+            AudioSourceStatus::Skipped(m) if m.contains("Desktop audio is off")
+        ));
+        let planned: Vec<u32> = plan.routing.tracks.iter().map(|t| t.source).collect();
+        assert_eq!(planned, [1, 2, 4]);
+    }
+
+    #[test]
+    fn one_app_makes_the_desktop_track_exclude_it() {
+        let plan = plan_for(
+            vec![
+                source(1, AudioSourceTarget::Application("Discord.exe".into())),
+                source(2, AudioSourceTarget::Desktop(None)),
+            ],
+            MODERN,
+            &DefaultDevices::default(),
+        );
+        assert_eq!(
+            plan.labels(),
+            ["Mix", "Discord.exe", "Desktop (without Discord.exe)"]
+        );
+    }
+
+    #[test]
+    fn game_and_same_application_are_recorded_once() {
+        let plan = plan_for(
+            vec![
+                source(1, AudioSourceTarget::Game),
+                source(2, AudioSourceTarget::Application("GAME.EXE".into())),
+            ],
+            MODERN,
+            &DefaultDevices::default(),
+        );
+        assert_eq!(plan.encoder_tracks(), 2);
+        assert!(matches!(
+            status_of(&plan, 2),
+            AudioSourceStatus::Skipped(m) if m.contains("already recorded")
+        ));
+    }
+
+    #[test]
+    fn explicit_default_device_is_not_recorded_twice() {
+        let defaults = DefaultDevices {
+            render: Some("render-default".into()),
+            capture: Some("mic-default".into()),
+        };
+        let plan = plan_for(
+            vec![
+                source(1, AudioSourceTarget::Desktop(None)),
+                source(2, AudioSourceTarget::Desktop(Some("render-default".into()))),
+                source(3, AudioSourceTarget::Microphone(None)),
+                source(4, AudioSourceTarget::Microphone(Some("mic-default".into()))),
+            ],
+            MODERN,
+            &defaults,
+        );
+        assert_eq!(plan.labels(), ["Mix", "Desktop (full mix)", "Microphone"]);
+        for id in [2, 4] {
+            assert!(matches!(
+                status_of(&plan, id),
+                AudioSourceStatus::Skipped(_)
+            ));
+        }
+        // A genuinely different device is kept.
+        let plan = plan_for(
+            vec![
+                source(1, AudioSourceTarget::Desktop(None)),
+                source(2, AudioSourceTarget::Desktop(Some("headset".into()))),
+            ],
+            MODERN,
+            &defaults,
+        );
+        assert_eq!(plan.encoder_tracks(), 3);
+        // Alone, an explicit device stays pinned (it does not follow the default).
+        let plan = plan_for(
+            vec![source(
+                1,
+                AudioSourceTarget::Desktop(Some("render-default".into())),
+            )],
+            MODERN,
+            &defaults,
+        );
+        assert_eq!(
+            plan.routing.tracks[0].stream,
+            clipper_audio::routing::StreamPlan::EndpointLoopback(Some("render-default".into()))
+        );
+    }
+
+    #[test]
+    fn planned_tracks_follow_capabilities_and_stay_below_the_upper_bound() {
+        let opts = options(vec![
+            source(1, AudioSourceTarget::Game),
+            source(2, AudioSourceTarget::Application("Discord.exe".into())),
+            source(3, AudioSourceTarget::Desktop(None)),
+            source(4, AudioSourceTarget::Microphone(None)),
+        ]);
+        let defaults = DefaultDevices::default();
+        assert_eq!(planned_audio_tracks_with(&opts, MODERN, &defaults), 4);
+        // Legacy: apps dropped, desktop becomes the full mix again.
+        assert_eq!(planned_audio_tracks_with(&opts, LEGACY, &defaults), 3);
+        for caps in [MODERN, LEGACY] {
+            assert!(
+                planned_audio_tracks_with(&opts, caps, &defaults) <= opts.encoded_track_count()
+            );
+        }
+        let mut mixed_only = opts;
+        mixed_only.separate_tracks = false;
+        assert_eq!(planned_audio_tracks_with(&mixed_only, MODERN, &defaults), 1);
+    }
+
+    fn track(process: Option<&str>, quiet_ok: bool) -> TrackRt {
+        TrackRt {
+            source: 1,
+            process: process.map(str::to_owned),
+            quiet_ok,
+            live: Live::Capturing,
+            gain: 1.0,
+        }
+    }
+
+    fn lost(reason: &str) -> AudioEvent {
+        AudioEvent::SourceLost {
+            track: 0,
+            reason: reason.into(),
+        }
+    }
+
+    fn failed(message: &str) -> AudioEvent {
+        AudioEvent::Failed {
+            track: 0,
+            message: message.into(),
+        }
+    }
+
+    #[test]
+    fn lost_application_waits_and_never_fails_the_session() {
+        for tolerant in [false, true] {
+            let rt = track(Some("game.exe"), false);
+            assert_eq!(
+                transition(&rt, tolerant, lost("process 5 has exited")),
+                Ok(Some(Live::Waiting("game.exe is not running".into())))
+            );
+            assert_eq!(
+                transition(&rt, tolerant, failed("boom")),
+                Ok(Some(Live::Failed("boom".into())))
+            );
+            assert_eq!(
+                transition(&rt, tolerant, AudioEvent::TrackStarted { track: 0 }),
+                Ok(Some(Live::Capturing))
+            );
+        }
+    }
+
+    #[test]
+    fn lost_device_fails_a_manual_recording_but_not_a_replay() {
+        let rt = track(None, false);
+        assert!(transition(&rt, false, lost("unplugged")).is_err());
+        assert_eq!(
+            transition(&rt, true, lost("unplugged")),
+            Ok(Some(Live::Waiting("unplugged".into())))
+        );
+        // A dead stream fails either way.
+        assert!(transition(&rt, false, failed("gone")).is_err());
+        assert!(transition(&rt, true, failed("gone")).is_err());
+    }
+
+    #[test]
+    fn desktop_remainder_loss_is_routine() {
+        let rt = track(None, true);
+        assert!(rt.loss_is_routine());
+        assert_eq!(
+            transition(&rt, false, lost("target exited")),
+            Ok(Some(Live::Waiting("target exited".into())))
+        );
+        assert!(!track(None, false).loss_is_routine());
+    }
+
+    #[test]
+    fn counter_events_do_not_change_state() {
+        let rt = track(None, false);
+        for event in [
+            AudioEvent::Overflow {
+                track: 0,
+                frames: 9,
+            },
+            AudioEvent::DeviceChanged {
+                track: 0,
+                device: "x".into(),
+            },
+        ] {
+            assert_eq!(transition(&rt, false, event), Ok(None));
+        }
+    }
+
+    #[test]
+    fn meter_is_sent_only_when_levels_change() {
+        let level = |peak| vec![SourceLevel { source: 1, peak }];
+        assert!(levels_changed(&[], &level(0.0)));
+        assert!(!levels_changed(&level(0.0), &level(0.0)));
+        assert!(!levels_changed(&level(0.4), &level(0.4)));
+        assert!(levels_changed(&level(0.4), &level(0.0)));
+        assert!(METER_INTERVAL >= Duration::from_millis(100));
     }
 
     #[test]

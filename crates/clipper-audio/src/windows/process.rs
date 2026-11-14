@@ -38,7 +38,7 @@ use windows::Win32::System::Variant::VT_BLOB;
 use windows_core::{HRESULT, Interface, implement};
 
 use super::endpoint::loopback_source;
-use super::stream::{OpenedStream, OwnedHandle, StreamSource, init_capture_client};
+use super::stream::{OpenedStream, OwnedHandle, RETRY_POLL, StreamSource, init_capture_client};
 use crate::types::{AudioCapabilities, AudioError, ProcessTarget};
 
 /// First Windows build with process loopback (Windows 11 / Server 2022).
@@ -47,6 +47,10 @@ const MIN_PROCESS_LOOPBACK_BUILD: u32 = 20_348;
 const ACTIVATION_TIMEOUT_MS: u32 = 5_000;
 /// Minimum spacing of process-table scans in `needs_reopen`.
 const RESCAN_INTERVAL: Duration = Duration::from_secs(1);
+/// Poll spacing while an exclude stream still captures the full mix because
+/// its target is not running: short, so the switch to exclusion (and with it
+/// the end of any overlap with the target's own track) comes quickly.
+const FALLBACK_POLL: Duration = Duration::from_millis(250);
 
 /// OS build number from `RtlGetVersion` (not subject to manifest shimming,
 /// unlike `GetVersionEx`). Cached. `0` when the call fails.
@@ -73,6 +77,13 @@ pub fn capabilities() -> AudioCapabilities {
     AudioCapabilities {
         process_loopback: os_build() >= MIN_PROCESS_LOOPBACK_BUILD,
     }
+}
+
+/// Whether per-application capture (process loopback) works on this Windows
+/// build. When `false`, application sources are reported as unavailable and
+/// never planned (see [`crate::routing::RoutingWarning`]).
+pub fn process_loopback_supported() -> bool {
+    capabilities().process_loopback
 }
 
 /// Root process id of `target` (for executables: the instance whose parent
@@ -446,29 +457,40 @@ struct ExcludeSource {
     watch: LivenessWatch,
 }
 
+impl ExcludeSource {
+    /// Full mix through endpoint loopback (the target is not running).
+    fn open_fallback(&mut self, channels: u16) -> Result<OpenedStream, AudioError> {
+        self.watch = LivenessWatch::default();
+        self.fallback
+            .get_or_insert_with(loopback_source)
+            .open(channels)
+    }
+}
+
 impl StreamSource for ExcludeSource {
     fn open(&mut self, channels: u16) -> Result<OpenedStream, AudioError> {
         self.last_scan = Some(Instant::now());
-        match find_process(&self.target) {
-            Some(pid) => {
-                // Drops the endpoint follower (on this COM thread) if any.
-                self.fallback = None;
-                let stream = open_process_stream(
-                    &self.target,
-                    pid,
-                    PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
-                    channels,
-                    self.stop.as_ref(),
-                )?;
+        let Some(pid) = find_process(&self.target) else {
+            return self.open_fallback(channels);
+        };
+        // Drops the endpoint follower (on this COM thread) if any.
+        self.fallback = None;
+        match open_process_stream(
+            &self.target,
+            pid,
+            PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
+            channels,
+            self.stop.as_ref(),
+        ) {
+            Ok(stream) => {
                 self.watch.arm(pid, stream.reopen.is_some());
                 Ok(stream)
             }
-            None => {
-                self.watch = LivenessWatch::default();
-                self.fallback
-                    .get_or_insert_with(loopback_source)
-                    .open(channels)
-            }
+            // The target exited between the scan and the activation: the
+            // remainder is the full mix again. Reporting the track as lost
+            // would fail a manual recording over a normal game exit.
+            Err(AudioError::SourceUnavailable(_)) => self.open_fallback(channels),
+            Err(error) => Err(error),
         }
     }
 
@@ -479,12 +501,20 @@ impl StreamSource for ExcludeSource {
         let now = Instant::now();
         if self
             .last_scan
-            .is_some_and(|t| now.duration_since(t) < RESCAN_INTERVAL)
+            .is_some_and(|t| now.duration_since(t) < FALLBACK_POLL)
         {
             return false;
         }
         self.last_scan = Some(now);
         find_process(&self.target).is_some()
+    }
+
+    fn poll_interval(&self) -> Duration {
+        if self.fallback.is_some() {
+            FALLBACK_POLL
+        } else {
+            RETRY_POLL
+        }
     }
 
     fn set_stop_handle(&mut self, stop: OwnedHandle) {
@@ -506,9 +536,9 @@ pub(crate) fn include_source(target: ProcessTarget) -> Box<dyn StreamSource> {
 /// not running this is exactly the full mix, so it uses endpoint loopback and
 /// switches to exclude mode once the target appears.
 ///
-/// Known window: the switch happens within about 1 s of the target starting
-/// (poll interval plus reopen); during it the target's audio is still in this
-/// track while the game track is also starting, so it can be briefly doubled.
+/// Known window: the switch happens within about 250 ms (poll interval) plus
+/// the activation time after the target starts; if the target's own track
+/// opens first, its audio is in both tracks (and the mix) for that moment.
 pub(crate) fn exclude_source(target: ProcessTarget) -> Box<dyn StreamSource> {
     Box::new(ExcludeSource {
         target,
