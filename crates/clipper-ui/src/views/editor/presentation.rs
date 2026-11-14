@@ -391,12 +391,14 @@ impl Render for ClipEditor {
             )
             .child(
                 panel(&t)
+                    .relative()
                     .p_3()
                     .flex()
                     .flex_col()
                     .gap_2()
                     .child(toolbar)
-                    .child(timeline),
+                    .child(timeline)
+                    .child(self.wheel_zoom_area(cx)),
             )
             .children(
                 self.notice
@@ -627,7 +629,6 @@ impl ClipEditor {
             }));
         }
         let viewport_out = self.timeline_viewport.clone();
-        let editor = cx.entity().downgrade();
         let scroller = div()
             .relative()
             .flex_1()
@@ -647,38 +648,11 @@ impl ClipEditor {
                             .child(tracks),
                     ),
             )
-            // Measures the viewport and zooms on Ctrl+wheel before the
-            // scroll area sees the wheel (capture phase), around the pointer.
+            // Measures the visible track area (zoom anchor, ruler range).
             .child(
                 canvas(
                     move |bounds, _, _| viewport_out.set(bounds),
-                    move |bounds, _, window, _| {
-                        let editor = editor.clone();
-                        window.on_mouse_event(
-                            move |event: &gpui::ScrollWheelEvent, phase, window, cx| {
-                                if phase != gpui::DispatchPhase::Capture
-                                    || !event.modifiers.control
-                                    || !bounds.contains(&event.position)
-                                {
-                                    return;
-                                }
-                                let notches =
-                                    f32::from(event.delta.pixel_delta(window.line_height()).y)
-                                        / f32::from(window.line_height())
-                                        / 3.;
-                                if notches == 0. || !notches.is_finite() {
-                                    return;
-                                }
-                                cx.stop_propagation();
-                                let factor = clipper_editor::timeline::ZOOM_STEP
-                                    .powf(notches.clamp(-3., 3.));
-                                let anchor = f32::from(event.position.x - bounds.origin.x);
-                                editor
-                                    .update(cx, |this, cx| this.zoom_by(factor, Some(anchor), cx))
-                                    .ok();
-                            },
-                        );
-                    },
+                    |_, _, _, _| {},
                 )
                 .absolute()
                 .size_full(),
@@ -881,6 +855,46 @@ impl ClipEditor {
                     cx.notify();
                 }),
             )
+    }
+
+    /// Ctrl+wheel zoom anywhere over the timeline panel (toolbar, track
+    /// headers and tracks). Registered for the capture phase, so the wheel
+    /// never also scrolls the timeline or the page; a plain wheel still
+    /// scrolls. Zooms around the pointer when it is over the tracks,
+    /// otherwise around the playhead (or the viewport centre).
+    fn wheel_zoom_area(&self, cx: &mut Context<Self>) -> gpui::Canvas<()> {
+        let editor = cx.entity().downgrade();
+        let viewport = self.timeline_viewport.clone();
+        canvas(
+            |_, _, _| {},
+            move |panel, _, window, _| {
+                let editor = editor.clone();
+                let viewport = viewport.clone();
+                window.on_mouse_event(move |event: &gpui::ScrollWheelEvent, phase, window, cx| {
+                    if phase != gpui::DispatchPhase::Capture
+                        || !event.modifiers.control
+                        || !panel.contains(&event.position)
+                    {
+                        return;
+                    }
+                    let line = window.line_height();
+                    let lines = f32::from(event.delta.pixel_delta(line).y) / f32::from(line);
+                    let Some(factor) = clipper_editor::timeline::wheel_zoom_factor(lines) else {
+                        return;
+                    };
+                    cx.stop_propagation();
+                    let tracks = viewport.get();
+                    let anchor = tracks
+                        .contains(&event.position)
+                        .then(|| f32::from(event.position.x - tracks.origin.x));
+                    editor
+                        .update(cx, |this, cx| this.zoom_by(factor, anchor, cx))
+                        .ok();
+                });
+            },
+        )
+        .absolute()
+        .size_full()
     }
 
     /// Zoom out, slider, zoom in and Fit, plus the current level.
