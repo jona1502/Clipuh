@@ -4,4 +4,6 @@
 #[cfg(windows)]
 pub mod player;
 #[cfg(windows)]
+pub mod thumbnail;
+#[cfg(windows)]
 pub mod trim;
