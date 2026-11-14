@@ -252,6 +252,9 @@ pub(crate) fn init_capture_client(
 pub(crate) struct LevelCell {
     peak: AtomicU32,
     rms: AtomicU32,
+    /// Highest peak since the last [`LevelCell::take_peak`], so a meter read
+    /// a few times per second still sees every transient and clip.
+    held: AtomicU32,
     source_failed: AtomicU32,
 }
 
@@ -259,6 +262,19 @@ impl LevelCell {
     pub fn store(&self, levels: AudioLevels) {
         self.peak.store(levels.peak.to_bits(), Ordering::Relaxed);
         self.rms.store(levels.rms.to_bits(), Ordering::Relaxed);
+        // Non-negative f32 bit patterns order like the values, so an integer
+        // max is a float max (NaN or negative peaks are dropped).
+        let peak = if levels.peak.is_finite() {
+            levels.peak.max(0.0)
+        } else {
+            0.0
+        };
+        self.held.fetch_max(peak.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Highest peak since the previous call; resets it.
+    pub fn take_peak(&self) -> f32 {
+        f32::from_bits(self.held.swap(0, Ordering::Relaxed))
     }
 
     pub fn source_failed(&self) -> bool {
@@ -701,6 +717,20 @@ mod tests {
     use crate::ring::audio_ring;
     use crate::types::MicrophoneChoice;
     use crate::windows::endpoint::{loopback_source, microphone_channels, microphone_source};
+
+    #[test]
+    fn held_peak_keeps_the_loudest_packet_until_read() {
+        let cell = LevelCell::default();
+        let packet = |peak| AudioLevels { peak, rms: 0.0 };
+        for peak in [0.2, 0.9, 0.1, f32::NAN, -1.0] {
+            cell.store(packet(peak));
+        }
+        // The last packet is quiet, but the meter still sees the 0.9 transient.
+        assert_eq!(cell.take_peak(), 0.9);
+        assert_eq!(cell.take_peak(), 0.0);
+        cell.store(packet(1.4));
+        assert_eq!(cell.take_peak(), 1.4); // float clipping survives for detection
+    }
 
     /// Drains `consumer` for up to `max`, returning (packets, frames, peak).
     fn collect(

@@ -202,6 +202,12 @@ impl AudioCapture {
             .unwrap_or_default()
     }
 
+    /// Highest peak of `track` since the previous call (lock-free); 0 when
+    /// no audio arrived meanwhile. One reader per track (the meter).
+    pub fn take_peak(&self, track: usize) -> f32 {
+        self.levels.get(track).map_or(0.0, |cell| cell.take_peak())
+    }
+
     pub fn events(&self) -> &Receiver<AudioEvent> {
         &self.events
     }

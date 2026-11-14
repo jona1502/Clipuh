@@ -259,7 +259,10 @@ pub struct ClipperWindow {
     audio_loading: bool,
     /// Latest per-source peaks and engine state; empty when no session runs.
     audio_levels: Vec<clipper_core::recording::SourceLevel>,
-    audio_levels_drawn_at: Option<std::time::Instant>,
+    /// Smoothed mixer meters by source id (Capture page only).
+    meters: std::collections::HashMap<u32, crate::meter::Ballistics>,
+    /// Animates `meters` while the mixer is visible and a meter moves.
+    meter_ticker: Option<Task<()>>,
     audio_sources: Vec<clipper_core::recording::AudioSourceState>,
     /// Add Source popup step; `None` is closed.
     audio_add: Option<audio::AddStep>,
@@ -358,29 +361,24 @@ impl ClipperWindow {
                     this.storage_projection_run.apply_event(&event);
                     match &event {
                         RecorderEvent::AudioLevels(levels) => {
-                            // Meters only exist on the Capture page, and only visible
-                            // change (>= 10 Hz apart) is worth a redraw.
-                            let since = this.audio_levels_drawn_at.map(|t| t.elapsed());
-                            let redraw = this.active_page == Page::Dashboard
-                                && audio::levels_need_redraw(&this.audio_levels, levels, since);
-                            if redraw {
-                                this.audio_levels_drawn_at = Some(std::time::Instant::now());
-                                this.audio_levels = levels.clone();
-                            } else if this.active_page != Page::Dashboard {
-                                this.audio_levels = levels.clone();
-                            }
-                            quiet = !redraw && !levels.is_empty();
+                            // Readings only set meter targets; the meter ticker
+                            // redraws while the mixer is visible and moving.
+                            this.audio_levels = levels.clone();
+                            this.apply_meter_levels(levels, window, cx);
+                            quiet = !levels.is_empty();
                         }
                         RecorderEvent::AudioSources(states) => {
                             this.audio_sources = states.clone();
                             if states.is_empty() {
                                 this.audio_levels.clear();
+                                this.meters.clear();
                             }
                         }
                         RecorderEvent::AudioTestStarted => this.audio_testing = true,
                         RecorderEvent::AudioTestFinished { path, error } => {
                             this.audio_testing = false;
                             this.audio_levels.clear();
+                            this.meters.clear();
                             this.audio_sources.clear();
                             this.audio_test_path =
                                 path.as_ref().map(|path| path.display().to_string());
@@ -389,9 +387,13 @@ impl ClipperWindow {
                             }
                         }
                         RecorderEvent::RecordingFinished { .. }
-                        | RecorderEvent::RecordingFailed { .. } => this.audio_levels.clear(),
+                        | RecorderEvent::RecordingFailed { .. } => {
+                            this.audio_levels.clear();
+                            this.meters.clear();
+                        }
                         RecorderEvent::Stopped => {
                             this.audio_levels.clear();
+                            this.meters.clear();
                             this.audio_sources.clear();
                             this.audio_testing = false;
                         }
@@ -435,6 +437,7 @@ impl ClipperWindow {
             let _ = this.update(cx, |this, cx| {
                 this.audio_testing = false;
                 this.audio_levels.clear();
+                this.meters.clear();
                 this.audio_sources.clear();
                 this.storage_projection_run.clear();
                 if this.recording.phase != Phase::Idle || !this.recording.replay.is_off() {
@@ -564,7 +567,8 @@ impl ClipperWindow {
             audio_menu: None,
             audio_loading: false,
             audio_levels: Vec::new(),
-            audio_levels_drawn_at: None,
+            meters: Default::default(),
+            meter_ticker: None,
             audio_sources: Vec::new(),
             audio_add: None,
             audio_add_focus: cx.focus_handle(),
