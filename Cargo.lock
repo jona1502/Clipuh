@@ -739,6 +739,7 @@ name = "clipper-media"
 version = "0.1.0"
 dependencies = [
  "async-channel 2.5.0",
+ "clipper-editor",
  "clipper-encoder",
  "clipper-platform",
  "windows",

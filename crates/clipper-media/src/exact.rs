@@ -43,6 +43,31 @@ pub fn export(
     progress: &mut dyn FnMut(f32),
     cancel: &AtomicBool,
 ) -> Result<TrimOutcome, TrimError> {
+    export_inner(source, destination, ranges, None, progress, cancel)
+}
+
+/// Exports the video selection with the editor's shared source-time audio mix.
+/// Sources with audio produce one stereo 48 kHz AAC track, including silence
+/// when every source track is muted. Video-only sources remain video-only.
+pub fn export_audio(
+    source: &Path,
+    destination: &Path,
+    ranges: &[(Duration, Duration)],
+    tracks: &[clipper_editor::AudioTrack],
+    progress: &mut dyn FnMut(f32),
+    cancel: &AtomicBool,
+) -> Result<TrimOutcome, TrimError> {
+    export_inner(source, destination, ranges, Some(tracks), progress, cancel)
+}
+
+fn export_inner(
+    source: &Path,
+    destination: &Path,
+    ranges: &[(Duration, Duration)],
+    audio_tracks: Option<&[clipper_editor::AudioTrack]>,
+    progress: &mut dyn FnMut(f32),
+    cancel: &AtomicBool,
+) -> Result<TrimOutcome, TrimError> {
     if !source.is_file() {
         return Err(TrimError::SourceMissing);
     }
@@ -93,11 +118,25 @@ pub fn export(
             Err(error) => return Err(error.into()),
         }
     };
-    let result = encode(source, &partial, ranges, total, progress, cancel).and_then(|()| {
+    let expected_audio = if audio_tracks.is_some() && info.audio_tracks > 0 {
+        1
+    } else {
+        info.audio_tracks
+    };
+    let result = encode(
+        source,
+        &partial,
+        ranges,
+        total,
+        audio_tracks,
+        progress,
+        cancel,
+    )
+    .and_then(|()| {
         let output = trim::probe(&partial)?;
         if output.width != info.width
             || output.height != info.height
-            || output.audio_tracks != info.audio_tracks
+            || output.audio_tracks != expected_audio
             || output.duration.abs_diff(total) > Duration::from_millis(100)
         {
             return Err(media_error(
@@ -218,7 +257,11 @@ fn validate_type_change(expected: &IMFMediaType, current: &IMFMediaType) -> Resu
     Ok(())
 }
 
-fn configure(reader: &IMFSourceReader, writer: &IMFSinkWriter) -> Result<Vec<Track>, TrimError> {
+fn configure(
+    reader: &IMFSourceReader,
+    writer: &IMFSinkWriter,
+    mixed: bool,
+) -> Result<Vec<Track>, TrimError> {
     let mut tracks = Vec::new();
     // SAFETY: COM objects belong to this worker. Every stream index is obtained
     // from this reader; unsupported types fail before any samples are written.
@@ -271,6 +314,9 @@ fn configure(reader: &IMFSourceReader, writer: &IMFSinkWriter) -> Result<Vec<Tra
                 output.SetUINT32(&MF_MT_AVG_BITRATE, bitrate)?;
                 (output, None, SECOND * denominator / numerator)
             } else if major == MFMediaType_Audio {
+                if mixed {
+                    continue;
+                }
                 let input = type_with(&MFMediaType_Audio, &MFAudioFormat_PCM)?;
                 input.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16)?;
                 reader.SetCurrentMediaType(source, None, &input)?;
@@ -327,6 +373,7 @@ fn encode(
     partial: &Path,
     ranges: &[(Duration, Duration)],
     total: Duration,
+    audio_tracks: Option<&[clipper_editor::AudioTrack]>,
     progress: &mut dyn FnMut(f32),
     cancel: &AtomicBool,
 ) -> Result<(), TrimError> {
@@ -352,13 +399,23 @@ fn encode(
             )?,
         )
     };
-    let tracks = configure(&reader, &writer)?;
+    let tracks = configure(&reader, &writer, audio_tracks.is_some())?;
+    let mut mixed = if let Some(audio_tracks) = audio_tracks
+        && trim::probe(source)?.audio_tracks > 0
+    {
+        Some(MixedAudio::open(source, audio_tracks, &writer)?)
+    } else {
+        None
+    };
     // SAFETY: writer is configured for every selected source stream.
     unsafe { writer.BeginWriting()? };
     let mut offset = 0i64;
     let total = ticks(total)?;
     let mut percent = -1;
     for &(start, end) in ranges {
+        if let Some(mixed) = &mut mixed {
+            mixed.seek(start)?;
+        }
         let (start, end) = (ticks(start)?, ticks(end)?);
         let mut done = vec![false; tracks.len()];
         let mut written = vec![false; tracks.len()];
@@ -428,6 +485,13 @@ fn encode(
                     }
                     writer.WriteSample(track.sink, &sample)?;
                 }
+                if let Some(mixed) = &mut mixed {
+                    // SAFETY: timestamps belong to the just-clipped sample.
+                    let target = unsafe {
+                        start + sample.GetSampleTime()? + sample.GetSampleDuration()? - offset
+                    };
+                    mixed.write_until(&writer, target.min(end), start, end, offset, cancel)?;
+                }
                 written[slot] = true;
                 let current =
                     (((offset + (time - start).max(0)) as f64 / total as f64) * 100.0) as i32;
@@ -442,11 +506,143 @@ fn encode(
                 "a selected segment contains no samples for one of its tracks",
             ));
         }
+        if let Some(mixed) = &mut mixed {
+            mixed.write_until(&writer, end, start, end, offset, cancel)?;
+        }
         offset += end - start;
     }
     // SAFETY: every stream has been written with monotonically increasing times.
     unsafe { writer.Finalize()? };
     Ok(())
+}
+
+struct MixedAudio {
+    decoder: crate::audio::MixDecoder,
+    sink: u32,
+    input: IMFMediaType,
+    position: i64,
+}
+
+impl MixedAudio {
+    fn open(
+        source: &Path,
+        tracks: &[clipper_editor::AudioTrack],
+        writer: &IMFSinkWriter,
+    ) -> Result<Self, TrimError> {
+        let decoder = crate::audio::MixDecoder::open(source, tracks).map_err(TrimError::Media)?;
+        let output = type_with(&MFMediaType_Audio, &MFAudioFormat_AAC)?;
+        let input = type_with(&MFMediaType_Audio, &MFAudioFormat_PCM)?;
+        // SAFETY: fresh media types and a valid sink writer on this worker.
+        let sink = unsafe {
+            for media in [&input, &output] {
+                media.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, 2)?;
+                media.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, 48_000)?;
+                media.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16)?;
+            }
+            input.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, 4)?;
+            input.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 192_000)?;
+            output.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 24_000)?;
+            output.SetUINT32(&MF_MT_AAC_PAYLOAD_TYPE, 0)?;
+            output.SetUINT32(&MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0x29)?;
+            let sink = writer.AddStream(&output)?;
+            writer.SetInputMediaType(sink, &input, None::<&IMFAttributes>)?;
+            sink
+        };
+        Ok(Self {
+            decoder,
+            sink,
+            input,
+            position: 0,
+        })
+    }
+
+    fn seek(&mut self, position: Duration) -> Result<(), TrimError> {
+        self.decoder.seek(position).map_err(TrimError::Media)?;
+        self.position = ticks(position)?;
+        Ok(())
+    }
+
+    fn write_until(
+        &mut self,
+        writer: &IMFSinkWriter,
+        target: i64,
+        start: i64,
+        end: i64,
+        offset: i64,
+        cancel: &AtomicBool,
+    ) -> Result<(), TrimError> {
+        while self.position < target {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(TrimError::Cancelled);
+            }
+            let frames = (((i128::from(target - self.position) * 48_000 + i128::from(SECOND) - 1)
+                / i128::from(SECOND)) as usize)
+                .clamp(1, 1024);
+            let chunk = self
+                .decoder
+                .next(frames, cancel)
+                .map_err(|message| {
+                    if cancel.load(Ordering::Relaxed) {
+                        TrimError::Cancelled
+                    } else {
+                        TrimError::Media(message)
+                    }
+                })?
+                .ok_or_else(|| {
+                    media_error("the audio mixer ended before the selected video range")
+                })?;
+            if chunk.samples.is_empty() || !chunk.samples.len().is_multiple_of(2) {
+                return Err(media_error(
+                    "the audio mixer returned an invalid stereo block",
+                ));
+            }
+            let time = ticks(chunk.timestamp)?;
+            let duration = (chunk.samples.len() as i64 / 2) * SECOND / 48_000;
+            let next = time + duration;
+            if next <= self.position {
+                return Err(media_error("the audio mixer did not advance"));
+            }
+            self.position = next;
+            let length =
+                u32::try_from(chunk.samples.len() * 2).map_err(|_| TrimError::InvalidRange)?;
+            // SAFETY: allocated buffer has exactly two bytes per sample; the
+            // lock is paired before the initialized bytes become an MF sample.
+            let sample = unsafe {
+                let buffer = MFCreateMemoryBuffer(length)?;
+                let mut data = std::ptr::null_mut();
+                buffer.Lock(&mut data, None, None)?;
+                for (index, value) in chunk.samples.iter().enumerate() {
+                    let pcm = (value.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16;
+                    std::ptr::copy_nonoverlapping(
+                        pcm.to_le_bytes().as_ptr(),
+                        data.add(index * 2),
+                        2,
+                    );
+                }
+                buffer.Unlock()?;
+                buffer.SetCurrentLength(length)?;
+                let sample = MFCreateSample()?;
+                sample.AddBuffer(&buffer)?;
+                sample.SetSampleTime(time)?;
+                sample.SetSampleDuration(duration)?;
+                sample
+            };
+            let track = Track {
+                source: 0,
+                sink: self.sink,
+                audio: Some((48_000, 4)),
+                frame_duration: 0,
+                input: self.input.clone(),
+            };
+            if let Some(sample) = clip_sample(&sample, &track, time, start, end, offset)? {
+                // SAFETY: clipped PCM16 stereo matches the configured input.
+                unsafe {
+                    writer.WriteSample(self.sink, &sample)?;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 fn clip_sample(
@@ -478,6 +674,13 @@ fn clip_sample(
             let duration = ((last - first) * SECOND / i64::from(rate)).min(end - clipped_time);
             if duration <= 0 {
                 return Ok(None);
+            }
+            if first == 0 && last == frames {
+                // Interior PCM blocks need only timestamp rebasing. Keep their
+                // existing buffer; allocate/copy only at source cut boundaries.
+                sample.SetSampleTime(offset + clipped_time - start)?;
+                sample.SetSampleDuration(duration)?;
+                return Ok(Some(sample.clone()));
             }
             let bytes = u32::try_from((last - first) * i64::from(alignment))
                 .map_err(|_| TrimError::InvalidRange)?;
@@ -642,6 +845,205 @@ mod tests {
         );
         assert!(output.duration.abs_diff(expected) < Duration::from_millis(100));
         assert_eq!(std::fs::read(&source).unwrap(), original);
+    }
+
+    #[test]
+    fn mixed_export_preserves_video_source_and_produces_one_stereo_track() {
+        let dir = temp_dir("mixed-export");
+        let source = dir.join("source.mp4");
+        let destination = dir.join("mixed.mp4");
+        write_test_clip(&source, 3, 2);
+        let original = std::fs::read(&source).unwrap();
+        let tracks = test_audio_tracks(&source);
+        let ranges = [
+            (Duration::from_millis(250), Duration::from_millis(1250)),
+            (Duration::from_millis(1750), Duration::from_millis(2250)),
+        ];
+        let output = export_audio(
+            &source,
+            &destination,
+            &ranges,
+            &tracks,
+            &mut |_| {},
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(output.duration, Duration::from_millis(1500));
+        let info = trim::probe(&destination).unwrap();
+        assert_eq!(info.audio_tracks, 1);
+        assert!(info.duration.abs_diff(output.duration) < Duration::from_millis(60));
+        assert_eq!(std::fs::read(&source).unwrap(), original);
+        assert_decodes_with_synced_timestamps(&destination, 2, 1.5);
+    }
+
+    #[test]
+    fn mixed_export_applies_mute_solo_gain_and_source_selection() {
+        let dir = temp_dir("mixed-gain");
+        let source = dir.join("source.mp4");
+        write_test_clip(&source, 3, 2);
+        let mut tracks = test_audio_tracks(&source);
+        tracks[1].muted = true;
+        let ranges = [(Duration::from_millis(250), Duration::from_millis(1750))];
+        let run = |name: &str, tracks: &[clipper_editor::AudioTrack]| {
+            let destination = dir.join(format!("{name}.mp4"));
+            export_audio(
+                &source,
+                &destination,
+                &ranges,
+                tracks,
+                &mut |_| {},
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            destination
+        };
+        let single = run("single", &tracks);
+        let baseline = mixed_rms(&single, 0.2, 1.3);
+        assert!(baseline > 0.05, "source tone missing: {baseline}");
+        tracks[1].muted = false;
+        let double = run("double", &tracks);
+        let ratio = mixed_rms(&double, 0.2, 1.3) / baseline;
+        assert!((1.85..2.15).contains(&ratio), "two-track mix ratio {ratio}");
+        tracks[1].solo = true;
+        let solo = run("solo", &tracks);
+        let ratio = mixed_rms(&solo, 0.2, 1.3) / baseline;
+        assert!((0.9..1.1).contains(&ratio), "solo ratio {ratio}");
+        tracks[1].solo = false;
+        tracks[1].muted = true;
+        tracks[0].gain_percent = 200;
+        let gain = run("gain", &tracks);
+        let ratio = mixed_rms(&gain, 0.2, 1.3) / baseline;
+        assert!((1.85..2.15).contains(&ratio), "gain ratio {ratio}");
+        tracks[0].muted = true;
+        let silent = run("silent", &tracks);
+        assert!(mixed_rms(&silent, 0.2, 1.3) < 0.0001);
+        tracks[0].muted = false;
+        tracks[0].gain_percent = 100;
+        tracks[0].segments = vec![clipper_editor::Segment {
+            start: Duration::from_millis(750),
+            end: Duration::from_millis(1250),
+        }];
+        let trimmed = run("trimmed-audio", &tracks);
+        assert!(mixed_rms(&trimmed, 0.1, 0.35) < 0.0001);
+        assert!(mixed_rms(&trimmed, 0.6, 0.85) > 0.05);
+        assert!(mixed_rms(&trimmed, 1.2, 1.4) < 0.0001);
+    }
+
+    #[test]
+    fn mixed_export_keeps_video_only_sources_without_fabricated_audio() {
+        let dir = temp_dir("mixed-no-audio");
+        let source = dir.join("source.mp4");
+        let destination = dir.join("result.mp4");
+        write_test_clip(&source, 2, 0);
+        export_audio(
+            &source,
+            &destination,
+            &[(Duration::from_millis(250), Duration::from_millis(1250))],
+            &[],
+            &mut |_| {},
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(trim::probe(&destination).unwrap().audio_tracks, 0);
+    }
+
+    #[test]
+    fn mixed_export_full_duration_and_cancellation() {
+        let dir = temp_dir("mixed-full-cancel");
+        let source = dir.join("source.mp4");
+        write_test_clip(&source, 2, 2);
+        let original = std::fs::read(&source).unwrap();
+        let duration = trim::probe(&source).unwrap().duration;
+        let destination = dir.join("full.mp4");
+        // Empty editor selections intentionally mix silence, not source audio.
+        export_audio(
+            &source,
+            &destination,
+            &[(Duration::ZERO, duration)],
+            &[],
+            &mut |_| {},
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(
+            trim::probe(&destination)
+                .unwrap()
+                .duration
+                .abs_diff(duration)
+                < Duration::from_millis(60)
+        );
+        assert!(mixed_rms(&destination, 0.2, 1.8) < 0.0001);
+        let cancelled_destination = dir.join("cancelled.mp4");
+        let cancel = AtomicBool::new(false);
+        let tracks = test_audio_tracks(&source);
+        let result = export_audio(
+            &source,
+            &cancelled_destination,
+            &[(Duration::ZERO, duration)],
+            &tracks,
+            &mut |_| {
+                cancel.store(true, Ordering::Relaxed);
+            },
+            &cancel,
+        );
+        assert!(matches!(result, Err(TrimError::Cancelled)), "{result:?}");
+        assert!(!cancelled_destination.exists());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+        assert_eq!(std::fs::read(&source).unwrap(), original);
+    }
+
+    fn mixed_rms(path: &Path, from: f64, until: f64) -> f64 {
+        let tracks = test_audio_tracks(path);
+        assert_eq!(tracks.len(), 1);
+        assert_eq!((tracks[0].channels, tracks[0].sample_rate), (2, 48_000));
+        let mut decoder = crate::audio::Decoder::open(path, &[tracks[0].stream_index]).unwrap();
+        let mut sum = 0.0;
+        let mut count = 0;
+        while let Some(chunk) = decoder.next(&AtomicBool::new(false)).unwrap() {
+            for (index, frame) in chunk.samples.chunks_exact(2).enumerate() {
+                let time = chunk.timestamp.as_secs_f64() + index as f64 / 48_000.0;
+                if time >= from && time < until {
+                    sum += f64::from(frame[0]).powi(2);
+                    count += 1;
+                }
+            }
+        }
+        assert!(count > 1000);
+        (sum / f64::from(count)).sqrt()
+    }
+
+    fn test_audio_tracks(path: &Path) -> Vec<clipper_editor::AudioTrack> {
+        let _init = init().unwrap();
+        let reader = trim::open_reader(path).unwrap();
+        let mut tracks = Vec::new();
+        // SAFETY: native types and scalar attributes read from a valid reader.
+        unsafe {
+            for index in 0.. {
+                let media = match reader.GetNativeMediaType(index, 0) {
+                    Ok(media) => media,
+                    Err(error) if error.code() == MF_E_INVALIDSTREAMNUMBER => break,
+                    Err(error) => panic!("{error}"),
+                };
+                if media.GetMajorType().unwrap() == MFMediaType_Audio {
+                    tracks.push(clipper_editor::AudioTrack {
+                        stream_index: index,
+                        label: format!("Audio {}", tracks.len() + 1),
+                        channels: media.GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS).unwrap() as u16,
+                        sample_rate: media.GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND).unwrap(),
+                        enabled: true,
+                        muted: false,
+                        solo: false,
+                        gain_percent: 100,
+                        segments: vec![clipper_editor::Segment {
+                            start: Duration::ZERO,
+                            end: trim::probe(path).unwrap().duration,
+                        }],
+                        selected_segment: Some(0),
+                    });
+                }
+            }
+        }
+        tracks
     }
 
     #[test]

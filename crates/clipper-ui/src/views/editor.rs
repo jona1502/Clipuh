@@ -8,7 +8,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use clipper_editor::{EditSession, format_timestamp, parse_timestamp};
+use clipper_editor::{AudioTrack, EditSession, format_timestamp, parse_timestamp};
+use clipper_media::audio::WaveformSet;
 use clipper_media::player::{Player, PlayerEvent, PlayerFrame};
 use clipper_media::trim::{self, TrimOutcome};
 use clipper_platform::windows::shell;
@@ -117,6 +118,14 @@ pub struct ClipEditor {
     thumbnails: Vec<Arc<RenderImage>>,
     thumbnail_task: Option<Task<()>>,
     audio_tracks: usize,
+    audio_metadata: Option<Vec<AudioTrack>>,
+    last_audio_mix: Option<Vec<AudioTrack>>,
+    waveforms: Option<Arc<WaveformSet>>,
+    waveform_task: Option<Task<()>>,
+    waveform_error: Option<String>,
+    audio_start_input: Entity<TextInput>,
+    audio_end_input: Entity<TextInput>,
+    audio_slider_focus: Vec<(FocusHandle, FocusHandle)>,
     pending_seek: Option<Duration>,
     media_duration: Option<Duration>,
     pub(super) preview_fullscreen: bool,
@@ -166,6 +175,48 @@ impl ClipEditor {
             )
             .detach();
         }
+        let audio_start_input =
+            cx.new(|cx| TextInput::new(cx).placeholder("00:00.000").tab_index(32));
+        let audio_end_input =
+            cx.new(|cx| TextInput::new(cx).placeholder("00:00.000").tab_index(33));
+        for (input, start) in [(&audio_start_input, true), (&audio_end_input, false)] {
+            cx.subscribe_in(
+                input,
+                window,
+                move |this, input, event, window, cx| match event {
+                    TextInputEvent::Submitted(text) => {
+                        let result = parse_timestamp(text).and_then(|at| {
+                            let edits = this.edits.as_mut().ok_or("Clip is loading.")?;
+                            let track = edits
+                                .selected_audio()
+                                .and_then(|i| edits.audio_tracks().get(i))
+                                .ok_or("Select an audio track first.")?;
+                            let segment = track
+                                .selected_segment
+                                .and_then(|i| track.segments.get(i))
+                                .copied()
+                                .ok_or("Select an audio segment first.")?;
+                            edits.trim_audio(
+                                if start { at } else { segment.start },
+                                if start { segment.end } else { at },
+                            )
+                        });
+                        if let Err(error) = result {
+                            input.update(cx, |input, cx| input.set_error(Some(error.into()), cx));
+                        } else {
+                            this.sync_audio(cx);
+                            window.focus(&this.focus);
+                        }
+                    }
+                    TextInputEvent::Dismissed => {
+                        this.sync_audio(cx);
+                        window.focus(&this.focus);
+                    }
+                    _ => {}
+                },
+            )
+            .detach();
+        }
         let mut this = Self {
             path,
             focus,
@@ -193,6 +244,14 @@ impl ClipEditor {
             thumbnails: Vec::new(),
             thumbnail_task: None,
             audio_tracks: 0,
+            audio_metadata: None,
+            last_audio_mix: None,
+            waveforms: None,
+            waveform_task: None,
+            waveform_error: None,
+            audio_start_input,
+            audio_end_input,
+            audio_slider_focus: Vec::new(),
             pending_seek: None,
             media_duration: None,
             preview_fullscreen: false,
@@ -201,10 +260,32 @@ impl ClipEditor {
         this.resume(window, cx);
         let path = this.path.clone();
         cx.spawn(async move |this, cx| {
-            let info = cx.background_spawn(async move { trim::probe(&path) }).await;
+            let info = cx
+                .background_spawn(async move {
+                    let info = trim::probe(&path)?;
+                    let tracks =
+                        clipper_media::audio::discover(&path).map_err(trim::TrimError::Media)?;
+                    Ok::<_, trim::TrimError>((info, tracks))
+                })
+                .await;
             let _ = this.update(cx, |this, cx| {
                 match info {
-                    Ok(info) => {
+                    Ok((info, tracks)) => {
+                        this.audio_slider_focus = tracks
+                            .iter()
+                            .enumerate()
+                            .map(|(i, _)| {
+                                (
+                                    cx.focus_handle()
+                                        .tab_stop(true)
+                                        .tab_index(40 + i as isize * 2),
+                                    cx.focus_handle()
+                                        .tab_stop(true)
+                                        .tab_index(41 + i as isize * 2),
+                                )
+                            })
+                            .collect();
+                        this.audio_metadata = Some(tracks);
                         this.audio_tracks = info.audio_tracks;
                         this.media_duration = Some(info.duration);
                         if let Some(duration) = this.duration {
@@ -242,6 +323,31 @@ impl ClipEditor {
         self.error = None;
         self.ended = false;
         self.pending_seek = None;
+        self.last_audio_mix = None;
+        self.sync_audio(cx);
+        if self.waveforms.is_none() && self.waveform_task.is_none() {
+            let receiver = clipper_media::audio::waveform(&self.path);
+            self.waveform_task = Some(cx.spawn(async move |this, cx| {
+                while let Ok(result) = receiver.recv().await {
+                    if this
+                        .update(cx, |this, cx| {
+                            match result {
+                                Ok(waveforms) => this.waveforms = Some(waveforms),
+                                Err(error) => {
+                                    this.waveform_error = Some(error.clone());
+                                    this.notice =
+                                        Some(format!("Waveform extraction failed: {error}").into());
+                                }
+                            }
+                            cx.notify();
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }));
+        }
         if self.thumbnails.is_empty() && self.thumbnail_task.is_none() {
             let frames = clipper_media::thumbnail::strip(&self.path, 12, 160);
             self.thumbnail_task = Some(cx.spawn_in(window, async move |this, cx| {
@@ -296,6 +402,7 @@ impl ClipEditor {
     pub fn suspend(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self._player_events = None;
         self.thumbnail_task = None;
+        self.waveform_task = None;
         release(self.player.take());
         self.ready = false;
         self.playing = false;
@@ -393,6 +500,9 @@ impl ClipEditor {
             PlayerEvent::Ended => {
                 self.playing = false;
                 self.ended = true;
+            }
+            PlayerEvent::AudioError(message) => {
+                self.notice = Some(format!("Audio preview: {message}").into());
             }
             PlayerEvent::Error(message) => {
                 self.ready = false;
@@ -527,6 +637,11 @@ impl ClipEditor {
             cx.notify();
             return;
         }
+        let audio_tracks = self
+            .edits
+            .as_ref()
+            .map(|e| e.audio_tracks().to_vec())
+            .unwrap_or_default();
         let source = self.path.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         let (sender, receiver) = async_channel::bounded(4);
@@ -539,10 +654,11 @@ impl ClipEditor {
                     // Dropped when the UI is behind; the next update catches up.
                     let _ = progress_sender.try_send(ExportMessage::Progress(value));
                 };
-                let result = clipper_media::exact::export(
+                let result = clipper_media::exact::export_audio(
                     &source,
                     &destination,
                     &ranges,
+                    &audio_tracks,
                     &mut progress,
                     &thread_cancel,
                 )
@@ -692,6 +808,7 @@ pub(super) fn empty(t: &Theme) -> Div {
     ))
 }
 
+mod audio;
 mod presentation;
 impl ClipEditor {
     fn export_status(&self, cx: &mut Context<Self>) -> Option<Div> {

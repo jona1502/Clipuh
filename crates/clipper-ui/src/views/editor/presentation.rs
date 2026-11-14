@@ -280,20 +280,12 @@ impl Render for ClipEditor {
                         .as_ref()
                         .map_or(Duration::ZERO, |edits| edits.duration()),
                 );
-                inspector.child(div().text_sm().child("MP4 · H.264 video · AAC audio"))
-                    .child(muted(&t).child("Selected ranges in segment order. All source audio streams preserved. Original unchanged."))
+                inspector.child(div().text_sm().child("MP4 · H.264 video · Stereo AAC mix"))
+                    .child(muted(&t).child("Selected video ranges with the enabled audio mix. Mute, Solo, gain and source audio cuts are included. Original unchanged."))
                     .child(muted(&t).child("AAC container duration may include encoder padding; cuts never snap to earlier keyframes."))
                     .child(muted(&t).child(format!("Output length: {length}"))).child(save)
             }
-            2 => {
-                let details = if self.media_duration.is_some() {
-                    format!("{} audio stream(s) in source", self.audio_tracks)
-                } else {
-                    "Reading audio tracks…".into()
-                };
-                inspector.child(muted(&t).child(details))
-                    .child(muted(&t).child("Audio plays with the preview and is preserved on export. Track gain, mute, solo and waveforms arrive in Phase 7."))
-            }
+            2 => inspector.child(self.audio_inspector(window, cx)),
             _ => inspector
                 .child(muted(&t).child("Coming later. This feature is not available in Phase 6.")),
         };
@@ -373,7 +365,7 @@ impl Render for ClipEditor {
                     cx.notify();
                 })),
             );
-        let timeline = self.timeline(duration, loaded, cx);
+        let timeline = self.timeline(duration, loaded, window, cx);
         div()
             .id("clip-editor")
             .key_context(CONTEXT)
@@ -451,7 +443,13 @@ impl ClipEditor {
         cx.notify();
     }
 
-    fn timeline(&self, duration: Duration, loaded: bool, cx: &mut Context<Self>) -> Div {
+    fn timeline(
+        &self,
+        duration: Duration,
+        loaded: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Div {
         let t = *cx.theme();
         let bounds_out = self.timeline.clone();
         let mut ruler = div().relative().h(px(26.)).w_full();
@@ -578,20 +576,7 @@ impl ClipEditor {
             .child(ruler)
             .child(video);
         for i in 0..self.audio_tracks {
-            tracks = tracks.child(
-                div()
-                    .h(px(32.))
-                    .rounded_md()
-                    .bg(t.colors.accent_subtle)
-                    .border_1()
-                    .border_color(t.colors.border)
-                    .text_xs()
-                    .text_color(t.colors.text_muted)
-                    .px_3()
-                    .flex()
-                    .items_center()
-                    .child(format!("Audio {} · waveform available in Phase 7", i + 1)),
-            );
+            tracks = tracks.child(self.audio_waveform(i, duration, cx));
         }
         tracks = tracks.child(
             div()
@@ -603,7 +588,7 @@ impl ClipEditor {
                 .bg(t.colors.text),
         );
         let mut labels = div()
-            .w(px(110.))
+            .w(px(224.))
             .flex_shrink_0()
             .flex()
             .flex_col()
@@ -611,7 +596,7 @@ impl ClipEditor {
             .pt(px(34.))
             .child(muted(&t).h(px(52.)).child("Video"));
         for i in 0..self.audio_tracks {
-            labels = labels.child(muted(&t).h(px(32.)).child(format!("Audio {}", i + 1)));
+            labels = labels.child(self.audio_header(i, window, cx));
         }
         if self.audio_tracks == 0 {
             labels = labels.child(muted(&t).child(if self.media_duration.is_some() {
@@ -694,6 +679,20 @@ impl ClipEditor {
         self.drag_origin = None;
     }
     pub(super) fn sync_trim(&mut self, cx: &mut Context<Self>) {
+        if let Some(edits) = &mut self.edits
+            && edits.audio_tracks().is_empty()
+            && let Some(metadata) = &self.audio_metadata
+        {
+            let duration = edits.source_duration();
+            let mut tracks = metadata.clone();
+            for track in &mut tracks {
+                for segment in &mut track.segments {
+                    segment.end = segment.end.min(duration);
+                }
+            }
+            edits.set_audio_tracks(tracks);
+        }
+        self.sync_audio(cx);
         self.trim = self
             .edits
             .as_ref()
@@ -746,7 +745,7 @@ fn ruler_timestamp(at: Duration, duration: Duration) -> String {
     }
 }
 
-fn timestamp_row(theme: &Theme, label: &'static str, input: Entity<TextInput>) -> Div {
+pub(super) fn timestamp_row(theme: &Theme, label: &'static str, input: Entity<TextInput>) -> Div {
     div()
         .flex()
         .items_center()

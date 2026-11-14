@@ -94,6 +94,9 @@ mod tests {
     }
 }
 
+mod audio;
+pub use audio::{AudioTrack, effective_gain};
+
 use std::collections::VecDeque;
 use std::time::Duration;
 
@@ -117,6 +120,8 @@ impl Segment {
 struct Snapshot {
     segments: Vec<Segment>,
     selected: Option<usize>,
+    audio_tracks: Vec<AudioTrack>,
+    selected_audio: Option<usize>,
 }
 
 /// Video edits reference the source without modifying it. Track-specific edits
@@ -127,6 +132,7 @@ pub struct EditSession {
     state: Snapshot,
     undo: VecDeque<Snapshot>,
     redo: VecDeque<Snapshot>,
+    audio_gesture: Option<Snapshot>,
 }
 
 impl EditSession {
@@ -142,9 +148,15 @@ impl EditSession {
         let selected = (!segments.is_empty()).then_some(0);
         Self {
             source_duration: duration,
-            state: Snapshot { segments, selected },
+            state: Snapshot {
+                segments,
+                selected,
+                audio_tracks: Vec::new(),
+                selected_audio: None,
+            },
             undo: VecDeque::new(),
             redo: VecDeque::new(),
+            audio_gesture: None,
         }
     }
 
@@ -192,6 +204,9 @@ impl EditSession {
     }
 
     fn checkpoint(&mut self) {
+        if self.audio_gesture.is_some() {
+            return;
+        }
         if self.undo.len() == HISTORY_LIMIT {
             self.undo.pop_front();
         }
@@ -258,6 +273,7 @@ impl EditSession {
         true
     }
     pub fn undo(&mut self) -> bool {
+        self.finish_audio_gesture();
         let Some(previous) = self.undo.pop_back() else {
             return false;
         };
@@ -266,6 +282,7 @@ impl EditSession {
         true
     }
     pub fn redo(&mut self) -> bool {
+        self.finish_audio_gesture();
         let Some(next) = self.redo.pop_back() else {
             return false;
         };
