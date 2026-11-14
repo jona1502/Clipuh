@@ -123,6 +123,8 @@ pub fn status_dot(t: &Theme, tone: Tone) -> Div {
 }
 
 /// Minimal pill: colored dot plus muted label.
+// shortcut: no caller since the capture bar replaced the page header; drop the allow when a page uses it.
+#[allow(dead_code)]
 pub fn badge(t: &Theme, label: impl Into<SharedString>, tone: Tone) -> Div {
     div()
         .flex()

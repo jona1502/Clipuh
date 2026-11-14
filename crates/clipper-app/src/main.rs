@@ -83,9 +83,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let result = cx.open_window(
             WindowOptions {
                 window_bounds: Some(bounds),
-                window_min_size: Some(size(px(900.), px(620.))),
+                window_min_size: Some(size(px(1080.), px(640.))),
                 titlebar: Some(TitlebarOptions {
-                    title: Some("Clipper".into()),
+                    title: Some("clipuh".into()),
                     ..Default::default()
                 }),
                 ..Default::default()

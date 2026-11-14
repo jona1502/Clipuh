@@ -496,19 +496,9 @@ impl RecordingState {
             return Some("Stop the recording to use instant replay.");
         }
         if self.replay.is_off() && self.selected_source().is_none() {
-            return Some("Select a source below to start instant replay.");
+            return Some("Select a source on the Capture page to start instant replay.");
         }
         None
-    }
-
-    /// Status for the sidebar and top bar: recording first, then replay.
-    pub fn overall_label(&self) -> &'static str {
-        match (self.phase, &self.replay.phase) {
-            (Phase::Idle, ReplayPhase::Starting) => "Replay starting\u{2026}",
-            (Phase::Idle, ReplayPhase::Running { .. }) => "Replay on",
-            (Phase::Idle, ReplayPhase::Stopping) => "Replay stopping\u{2026}",
-            _ => self.status_label(),
-        }
     }
 
     pub fn status_label(&self) -> &'static str {
@@ -920,7 +910,6 @@ mod tests {
             encoder: "hw".into(),
         };
         assert!(!s.can_start());
-        assert_eq!(s.overall_label(), "Replay on");
     }
 
     #[test]

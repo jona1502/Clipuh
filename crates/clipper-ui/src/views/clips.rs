@@ -52,7 +52,7 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
         list = list.child(empty_state(&t,
             "▤",
             "No clips yet",
-            "Replays you save during this session appear here. Turn on instant replay on the Dashboard, then press your save hotkey.",
+            "Replays you save during this session appear here. Turn on instant replay in the capture bar, then press your save hotkey.",
         ));
     } else {
         list = list.children(
