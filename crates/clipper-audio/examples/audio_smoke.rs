@@ -32,6 +32,7 @@ mod imp {
     use clipper_audio::windows::{AudioCapture, capabilities, list_devices};
     use clipper_audio::{
         AudioConfig, AudioSelection, DeviceFlow, MicrophoneChoice, ProcessTarget, SAMPLE_RATE,
+        SourceRequest, SourceRequestKind,
     };
 
     type Res<T> = Result<T, Box<dyn std::error::Error>>;
@@ -208,12 +209,27 @@ mod imp {
         }
         println!("capabilities: {:?}", capabilities());
 
-        let selection = AudioSelection {
-            game,
-            discord: discord.then(ProcessTarget::discord),
-            desktop,
-            microphone: have_mic.then_some(MicrophoneChoice::Default),
-        };
+        let mut sources = Vec::new();
+        let mut kinds = Vec::new();
+        kinds.extend(game.map(SourceRequestKind::Process));
+        if discord {
+            kinds.push(SourceRequestKind::Process(ProcessTarget::Executable(
+                "Discord.exe".to_owned(),
+            )));
+        }
+        if desktop {
+            kinds.push(SourceRequestKind::Desktop { device: None });
+        }
+        if have_mic {
+            kinds.push(SourceRequestKind::Microphone(MicrophoneChoice::Default));
+        }
+        for (id, kind) in kinds.into_iter().enumerate() {
+            sources.push(SourceRequest {
+                id: id as u32,
+                kind,
+            });
+        }
+        let selection = AudioSelection { sources };
         println!("selection: {selection:?}");
 
         let dir = std::env::temp_dir().join("clipper-audio-smoke");
@@ -221,7 +237,7 @@ mod imp {
 
         let mut capture = AudioCapture::start(&selection, AudioConfig::default())?;
         for w in capture.warnings() {
-            println!("warning: {}", w.message());
+            println!("warning: {}", w.1.message());
         }
         let mut outs = Vec::new();
         for t in capture.tracks() {

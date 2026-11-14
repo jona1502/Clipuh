@@ -3,6 +3,7 @@
 
 mod components;
 mod notifications;
+mod recent_clips;
 mod state;
 mod storage_status;
 mod theme;

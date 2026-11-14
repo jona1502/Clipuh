@@ -19,10 +19,6 @@ pub enum ProcessTarget {
 }
 
 impl ProcessTarget {
-    pub fn discord() -> Self {
-        Self::Executable("Discord.exe".to_owned())
-    }
-
     /// Whether both targets certainly name the same process. Executable names
     /// compare ASCII case-insensitively, pids exactly. A `Pid` and an
     /// `Executable` are never equal here: the platform-independent planner
@@ -46,15 +42,29 @@ pub enum MicrophoneChoice {
     Device(String),
 }
 
-/// What the user wants to record.
+/// One user-selected source; `id` is the mixer source id from settings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceRequest {
+    pub id: u32,
+    pub kind: SourceRequestKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SourceRequestKind {
+    /// Application / game process tree (process loopback INCLUDE).
+    Process(ProcessTarget),
+    /// Render endpoint loopback; `None` = default device.
+    Desktop {
+        device: Option<String>,
+    },
+    Microphone(MicrophoneChoice),
+}
+
+/// What the user wants to record, in order. Routed so tracks never overlap
+/// (see [`crate::routing`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AudioSelection {
-    pub game: Option<ProcessTarget>,
-    pub discord: Option<ProcessTarget>,
-    /// Other desktop playback. Routed so it never contains a separately
-    /// captured game or Discord signal (see [`crate::routing`]).
-    pub desktop: bool,
-    pub microphone: Option<MicrophoneChoice>,
+    pub sources: Vec<SourceRequest>,
 }
 
 /// What the running Windows version supports.
@@ -70,42 +80,33 @@ pub struct AudioCapabilities {
 /// presented as a cleaned remainder.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TrackContent {
-    Game,
-    Discord,
-    /// Everything the default render device plays (includes game/Discord;
-    /// only planned when those are not captured separately).
+    /// Executable name, or `"pid N"`.
+    Application(String),
+    /// Everything the render device plays (only planned when no process is
+    /// captured separately).
     DesktopFull,
-    /// Desktop playback without the process tree of `excluded`.
-    DesktopExcluding(AudioSourceKind),
+    /// Desktop playback without the process tree of this executable.
+    DesktopExcluding(String),
     Microphone,
 }
 
 impl TrackContent {
-    pub fn label(&self) -> &'static str {
+    pub fn label(&self) -> String {
         match self {
-            Self::Game => "Game",
-            Self::Discord => "Discord",
-            Self::DesktopFull => "Desktop (full mix)",
-            Self::DesktopExcluding(AudioSourceKind::Game) => "Desktop (without game)",
-            Self::DesktopExcluding(AudioSourceKind::Discord) => "Desktop (without Discord)",
-            Self::DesktopExcluding(_) => "Desktop",
-            Self::Microphone => "Microphone",
+            Self::Application(name) => name.clone(),
+            Self::DesktopFull => "Desktop (full mix)".to_owned(),
+            Self::DesktopExcluding(name) => format!("Desktop (without {name})"),
+            Self::Microphone => "Microphone".to_owned(),
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum AudioSourceKind {
-    Game,
-    Discord,
-    Desktop,
-    Microphone,
 }
 
 /// A running output track.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TrackInfo {
     pub index: usize,
+    /// Mixer source id this track was planned for.
+    pub source: u32,
     pub content: TrackContent,
     /// 2 for playback sources; device-dependent (1 or 2) for microphones.
     pub channels: u16,

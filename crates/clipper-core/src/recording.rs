@@ -117,52 +117,120 @@ pub fn h264_supports(width: u32, height: u32, fps: u32) -> bool {
     macroblocks <= 36_864 && macroblocks * u64::from(fps) <= 2_073_600
 }
 
-/// Recording uses one endpoint playback mix plus an optional microphone.
-/// Process-isolated game/Discord capture is not wired into the recorder yet.
+/// What one mixer source captures. Platform-neutral; the recorder resolves it
+/// to a concrete capture stream when a session starts.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum AudioSourceTarget {
+    /// The application behind the capture window; follows the capture source.
+    /// Unavailable while a whole display is captured.
+    Game,
+    /// A running application by executable file name, e.g. `Discord.exe`.
+    /// Survives restarts and pid changes.
+    Application(String),
+    /// Loopback of an output device (endpoint id); `None` is the Windows default.
+    Desktop(Option<String>),
+    /// An input device (endpoint id); `None` is the Windows default.
+    Microphone(Option<String>),
+}
+
+/// Highest per-source gain, in percent. Above 100 % the recorder limits the
+/// output instead of letting it clip.
+pub const MAX_AUDIO_GAIN_PERCENT: u16 = 200;
+
+/// Most sources recorded at once: the MP4 writer takes one mix plus four
+/// isolated AAC tracks.
+pub const MAX_RECORDED_AUDIO_SOURCES: usize = 4;
+
+/// One enabled mixer source handed to the recorder.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordingAudioSource {
+    /// Stable id from the settings; levels, status and gain changes use it.
+    pub id: u32,
+    pub target: AudioSourceTarget,
+    /// 0..=[`MAX_AUDIO_GAIN_PERCENT`]; 0 is silence.
+    pub gain_percent: u16,
+}
+
+/// Audio of a recording or replay: the enabled mixer sources in mixer order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecordingAudioOptions {
-    pub desktop: bool,
-    pub microphone: bool,
-    pub input_device: Option<String>,
-    pub output_device: Option<String>,
-    pub microphone_gain_percent: u16,
-    pub desktop_gain_percent: u16,
+    pub sources: Vec<RecordingAudioSource>,
+    /// Also write one isolated track per source next to the mix.
     pub separate_tracks: bool,
 }
 
 impl RecordingAudioOptions {
-    /// Audio tracks in the file: the mix, plus one isolated track per enabled
-    /// source when `separate_tracks` is on; none when no source is enabled.
+    /// Upper bound of audio tracks in the file: the mix, plus one isolated
+    /// track per source when `separate_tracks` is on; none without sources.
+    /// The recorder may drop a source it cannot capture (unsupported Windows
+    /// version, overlapping desktop audio), so the real count can be lower.
     pub fn track_count(&self) -> usize {
-        if !(self.desktop || self.microphone) {
+        if self.sources.is_empty() {
             return 0;
         }
-        let isolated = if self.separate_tracks {
-            usize::from(self.desktop) + usize::from(self.microphone)
+        1 + if self.separate_tracks {
+            self.sources.len()
         } else {
             0
-        };
-        1 + isolated
+        }
     }
 
-    /// Number of AAC tracks the current desktop/microphone recorder creates.
+    /// AAC tracks used for storage estimates (see [`Self::track_count`]).
     pub fn encoded_track_count(&self) -> u32 {
         self.track_count() as u32
     }
 }
 
 impl Default for RecordingAudioOptions {
+    /// Desktop playback and the default microphone, as before the mixer.
     fn default() -> Self {
         Self {
-            desktop: true,
-            microphone: true,
-            input_device: None,
-            output_device: None,
-            microphone_gain_percent: 100,
-            desktop_gain_percent: 100,
+            sources: vec![
+                RecordingAudioSource {
+                    id: 1,
+                    target: AudioSourceTarget::Desktop(None),
+                    gain_percent: 100,
+                },
+                RecordingAudioSource {
+                    id: 2,
+                    target: AudioSourceTarget::Microphone(None),
+                    gain_percent: 100,
+                },
+            ],
             separate_tracks: true,
         }
     }
+}
+
+/// Live peak of one mixer source.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SourceLevel {
+    pub source: u32,
+    /// Linear peak after gain, 0.0..=1.0.
+    pub peak: f32,
+}
+
+/// What the recorder is doing with one mixer source.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AudioSourceStatus {
+    Starting,
+    /// Captured into the session; `track` is its isolated track, if any.
+    Capturing {
+        track: Option<usize>,
+    },
+    /// Kept in the session but silent right now (application not running,
+    /// device gone); capture resumes on its own when it comes back.
+    Waiting(String),
+    /// Not part of this session, with the reason (unsupported on this
+    /// Windows version, would duplicate other audio, no game window).
+    Skipped(String),
+    Failed(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AudioSourceState {
+    pub source: u32,
+    pub status: AudioSourceStatus,
 }
 
 /// Allowed replay lengths offered in settings, in seconds.
@@ -231,6 +299,12 @@ pub enum RecorderCommand {
     StopReplay,
     /// Change the replay length live, without restarting capture.
     SetReplayDuration(Duration),
+    /// Change one source's recorded gain live (ramped, no restart). Ignored
+    /// when no session records that source.
+    SetAudioGain {
+        source: u32,
+        gain_percent: u16,
+    },
     /// Save the last seconds of the replay buffer as a clip. Never blocks the
     /// sender; the outcome arrives as a `Replay*` event.
     SaveReplay,
@@ -264,10 +338,12 @@ pub enum StopReason {
 #[derive(Clone, Debug, PartialEq)]
 pub enum RecorderEvent {
     SourcesListed(Vec<CaptureSource>),
-    AudioLevels {
-        desktop: f32,
-        microphone: f32,
-    },
+    /// Peaks of the captured sources, about 15 times per second while a
+    /// session or audio test runs; an empty list when capture stops.
+    AudioLevels(Vec<SourceLevel>),
+    /// Per-source capture state at session start and whenever it changes;
+    /// an empty list when the session ends.
+    AudioSources(Vec<AudioSourceState>),
     AudioTestStarted,
     AudioTestFinished {
         path: Option<PathBuf>,
@@ -408,8 +484,7 @@ mod tests {
         assert_eq!(audio.track_count(), 3);
         audio.separate_tracks = false;
         assert_eq!(audio.track_count(), 1);
-        audio.desktop = false;
-        audio.microphone = false;
+        audio.sources.clear();
         assert_eq!(audio.track_count(), 0);
     }
 
@@ -430,30 +505,29 @@ mod tests {
     }
 
     #[test]
-    fn encoded_track_count_matches_enabled_sources_and_separation() {
-        for (desktop, microphone, separate_tracks, expected) in [
-            (false, false, false, 0),
-            (false, false, true, 0),
-            (true, false, false, 1),
-            (false, true, false, 1),
-            (true, true, false, 1),
-            (true, false, true, 2),
-            (false, true, true, 2),
-            (true, true, true, 3),
+    fn encoded_track_count_is_one_mix_plus_one_per_source() {
+        let source = |id| RecordingAudioSource {
+            id,
+            target: AudioSourceTarget::Application(format!("app{id}.exe")),
+            gain_percent: 100,
+        };
+        for (sources, separate_tracks, expected) in [
+            (0, false, 0),
+            (0, true, 0),
+            (1, false, 1),
+            (3, false, 1),
+            (1, true, 2),
+            (4, true, 5),
         ] {
             let options = RecordingAudioOptions {
-                desktop,
-                microphone,
+                sources: (1..=sources).map(source).collect(),
                 separate_tracks,
-                ..Default::default()
             };
-
             assert_eq!(
                 options.encoded_track_count(),
                 expected,
-                "desktop={desktop}, microphone={microphone}, separate_tracks={separate_tracks}"
+                "{sources} {separate_tracks}"
             );
-            assert_eq!(options.track_count(), expected as usize);
         }
     }
 

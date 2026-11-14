@@ -31,8 +31,8 @@ mod smoke {
     use std::time::{Duration, Instant};
 
     use clipper_core::recording::{
-        QualityProfile, RecorderCommand, RecorderEvent, RecordingAudioOptions, RecordingOptions,
-        ReplayOptions, SourceKind,
+        AudioSourceTarget, QualityProfile, RecorderCommand, RecorderEvent, RecordingAudioOptions,
+        RecordingAudioSource, RecordingOptions, ReplayOptions, SourceKind,
     };
     use clipper_recorder::Recorder;
     use windows::Win32::Foundation::FILETIME;
@@ -164,10 +164,20 @@ mod smoke {
                 options: ReplayOptions {
                     recording: RecordingOptions {
                         audio: RecordingAudioOptions {
-                            desktop,
-                            microphone: mic,
+                            sources: [
+                                (desktop, AudioSourceTarget::Desktop(None)),
+                                (mic, AudioSourceTarget::Microphone(None)),
+                            ]
+                            .into_iter()
+                            .filter(|(enabled, _)| *enabled)
+                            .zip(1..)
+                            .map(|((_, target), id)| RecordingAudioSource {
+                                id,
+                                target,
+                                gain_percent: 100,
+                            })
+                            .collect(),
                             separate_tracks: false,
-                            ..Default::default()
                         },
                         width: 1920,
                         height: 1080,

@@ -79,17 +79,17 @@ fn duration_of(ticks: i64) -> Duration {
 }
 
 /// COM + Media Foundation for the current thread (both are ref-counted).
-fn init() -> Result<(ComApartment, MediaFoundation), TrimError> {
+pub(crate) fn init() -> Result<(ComApartment, MediaFoundation), TrimError> {
     let com = ComApartment::init_multithreaded().map_err(TrimError::from)?;
     let mf = MediaFoundation::start().map_err(|e| TrimError::Media(e.to_string()))?;
     Ok((com, mf))
 }
 
-fn wide(path: &Path) -> Vec<u16> {
+pub(crate) fn wide(path: &Path) -> Vec<u16> {
     path.as_os_str().encode_wide().chain(Some(0)).collect()
 }
 
-fn open_reader(path: &Path) -> Result<IMFSourceReader, TrimError> {
+pub(crate) fn open_reader(path: &Path) -> Result<IMFSourceReader, TrimError> {
     let wide = wide(path);
     // SAFETY: `wide` is NUL-terminated and outlives the call.
     Ok(unsafe { MFCreateSourceReaderFromURL(PCWSTR(wide.as_ptr()), None) }?)
@@ -378,7 +378,7 @@ fn copy_range(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     const FPS: u32 = 30;
@@ -504,7 +504,7 @@ mod tests {
         }
     }
 
-    fn temp_dir(name: &str) -> PathBuf {
+    pub(crate) fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("clipper-trim-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

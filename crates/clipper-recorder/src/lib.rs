@@ -236,10 +236,12 @@ mod tests {
         handle
             .send(RecorderCommand::StartAudioTest {
                 options: clipper_core::recording::RecordingAudioOptions {
-                    desktop: false,
-                    microphone: true,
+                    sources: vec![clipper_core::recording::RecordingAudioSource {
+                        id: 1,
+                        target: clipper_core::recording::AudioSourceTarget::Microphone(None),
+                        gain_percent: 100,
+                    }],
                     separate_tracks: false,
-                    ..Default::default()
                 },
                 output_directory,
             })
@@ -250,7 +252,10 @@ mod tests {
         let mut stopped = false;
         let path = loop {
             match next(&handle) {
-                RecorderEvent::AudioLevels { microphone, .. } => peak = peak.max(microphone),
+                RecorderEvent::AudioLevels(levels) => {
+                    peak = levels.iter().fold(peak, |peak, level| peak.max(level.peak));
+                }
+                RecorderEvent::AudioSources(_) => {}
                 RecorderEvent::AudioTestFinished { path, error } => {
                     assert!(error.is_none(), "{error:?}");
                     break path.unwrap();

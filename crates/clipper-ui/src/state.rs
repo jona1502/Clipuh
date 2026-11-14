@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clipper_core::recording::{
-    CaptureSource, RecorderEvent, RecordingStats, ReplayStatus, ReplayTier, SourceKind, StopReason,
+    CaptureSource, RecorderEvent, RecordingStats, ReplayStatus, SourceKind, StopReason,
 };
 use clipper_storage::{AppConfig, config::VideoCodec, storage_projection::StorageProjection};
 
@@ -27,9 +27,8 @@ pub(crate) struct StorageProjectionKey {
     codec: VideoCodec,
     quality: clipper_storage::config::QualityPreset,
     bitrate_mbps: u32,
-    desktop_audio: bool,
-    microphone_audio: bool,
-    separate_tracks: bool,
+    /// Encoded audio tracks (enabled sources plus the mix); the only audio input.
+    audio_tracks: u32,
     replay_duration_seconds: u32,
     replay_memory_limit_megabytes: u32,
 }
@@ -43,9 +42,7 @@ impl From<&AppConfig> for StorageProjectionKey {
             codec: config.video.codec,
             quality: config.recording.quality,
             bitrate_mbps: config.video.bitrate_mbps,
-            desktop_audio: config.audio.desktop,
-            microphone_audio: config.audio.microphone,
-            separate_tracks: config.audio.separate_tracks,
+            audio_tracks: config.audio.recording_options().encoded_track_count(),
             replay_duration_seconds: config.replay.duration_seconds,
             replay_memory_limit_megabytes: config.replay.memory_limit_megabytes,
         }
@@ -161,27 +158,6 @@ impl StorageProjectionRun {
 
     pub(crate) fn displayed(&self) -> Option<StorageProjectionSnapshot> {
         self.active.or(self.pending)
-    }
-}
-
-/// Formats a decimal byte count for human-readable storage estimates.
-pub(crate) fn format_decimal_size(bytes: u64) -> String {
-    const MB: f64 = 1_000_000.0;
-    const GB: f64 = 1_000_000_000.0;
-    if bytes >= 1_000_000_000 {
-        format!("~{:.2} GB", bytes as f64 / GB)
-    } else {
-        format!("~{:.2} MB", bytes as f64 / MB)
-    }
-}
-
-/// Formats an exact byte count as a binary mebibyte budget.
-pub(crate) fn format_mib(bytes: u64) -> String {
-    const MIB: u64 = 1_048_576;
-    if bytes.is_multiple_of(MIB) {
-        format!("{} MiB", bytes / MIB)
-    } else {
-        format!("{:.1} MiB", bytes as f64 / MIB as f64)
     }
 }
 
@@ -313,24 +289,6 @@ pub fn replay_stop_message(raw: &str) -> String {
     message
 }
 
-pub fn tier_label(tier: ReplayTier) -> &'static str {
-    match tier {
-        ReplayTier::Ram => "RAM",
-        ReplayTier::Hybrid => "Hybrid RAM + SSD",
-        ReplayTier::RamOnlyDegraded => "RAM only - SSD unavailable",
-    }
-}
-
-/// Formats a byte count as whole megabytes, or gigabytes from 1 GB up.
-pub fn format_megabytes(bytes: u64) -> String {
-    const MB: u64 = 1024 * 1024;
-    if bytes >= 1024 * MB {
-        format!("{:.1} GB", bytes as f64 / (1024 * MB) as f64)
-    } else {
-        format!("{} MB", bytes / MB)
-    }
-}
-
 #[derive(Debug, Default)]
 pub struct RecordingState {
     pub replay: ReplayState,
@@ -349,7 +307,9 @@ pub struct RecordingState {
 impl RecordingState {
     pub fn apply(&mut self, event: RecorderEvent) {
         match event {
-            RecorderEvent::AudioLevels { .. }
+            // Mixer meters and source status live in `ClipperWindow`, not here.
+            RecorderEvent::AudioLevels(_)
+            | RecorderEvent::AudioSources(_)
             | RecorderEvent::AudioTestStarted
             | RecorderEvent::AudioTestFinished { .. } => {}
             RecorderEvent::SourcesListed(sources) => {
@@ -666,7 +626,7 @@ mod tests {
             Ok(projection)
         }));
 
-        config.audio.microphone_gain_percent = 50;
+        config.audio.sources[1].gain_percent = 50;
         config.notifications.enabled = false;
         assert_eq!(StorageProjectionKey::from(&config), key);
         assert!(
@@ -779,14 +739,6 @@ mod tests {
         assert!(!snapshot.matches_key(cache.key()));
     }
 
-    #[test]
-    fn storage_sizes_use_decimal_units_and_preserve_precision() {
-        assert_eq!(format_decimal_size(1_100_000), "~1.10 MB");
-        assert_eq!(format_decimal_size(12_345_678), "~12.35 MB");
-        assert_eq!(format_decimal_size(1_250_000_000), "~1.25 GB");
-        assert_eq!(format_decimal_size(12_345_678_901), "~12.35 GB");
-        assert_eq!(format_mib(67_108_864), "64 MiB");
-    }
     #[test]
     fn newer_failed_save_still_prevents_an_older_snapshot_from_writing() {
         let order = SettingsSaveOrder::default();
@@ -951,8 +903,5 @@ mod tests {
             replay_stop_message("Replay is already running."),
             "Replay is already running."
         );
-        assert_eq!(format_megabytes(5 * 1024 * 1024), "5 MB");
-        assert_eq!(format_megabytes(3 * 1024 * 1024 * 1024 / 2), "1.5 GB");
-        assert_eq!(tier_label(ReplayTier::Hybrid), "Hybrid RAM + SSD");
     }
 }

@@ -3,7 +3,10 @@ mod capture_bar;
 mod clips;
 mod dashboard;
 mod editor;
+mod recent_card;
 mod settings;
+mod source_card;
+mod storage_card;
 
 use clipper_core::hotkey::Hotkey;
 use clipper_core::recording::{RecorderCommand, RecorderEvent, RecorderHandle};
@@ -70,6 +73,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("enter", Confirm, dropdown),
         KeyBinding::new("space", Confirm, dropdown),
         KeyBinding::new("escape", Dismiss, dropdown),
+        KeyBinding::new("escape", Dismiss, Some(audio::ADD_CONTEXT)),
         KeyBinding::new("space", editor::TogglePlayback, Some(editor::CONTEXT)),
         KeyBinding::new("i", editor::SetIn, Some(editor::CONTEXT)),
         KeyBinding::new("o", editor::SetOut, Some(editor::CONTEXT)),
@@ -207,9 +211,25 @@ pub struct ClipperWindow {
     palette: Option<CommandPalette>,
     config_persistence: std::sync::Arc<crate::state::SettingsSaveOrder>,
     audio_devices: Vec<clipper_audio::AudioDevice>,
-    audio_menu: Option<clipper_audio::DeviceFlow>,
+    audio_apps: Vec<clipper_audio::windows::AudioApplication>,
+    audio_capabilities: Option<clipper_audio::AudioCapabilities>,
+    /// Open target dropdown: (mixer source id, highlighted row).
+    audio_menu: Option<(u32, usize)>,
     audio_loading: bool,
-    audio_levels: (f32, f32),
+    /// Latest per-source peaks and engine state; empty when no session runs.
+    audio_levels: Vec<clipper_core::recording::SourceLevel>,
+    audio_sources: Vec<clipper_core::recording::AudioSourceState>,
+    /// Add Source popup step; `None` is closed.
+    audio_add: Option<audio::AddStep>,
+    audio_add_focus: FocusHandle,
+    audio_add_note: Option<String>,
+    audio_notice: Option<String>,
+    /// A gain changed and is not saved yet (saved when the drag or key press ends).
+    audio_gain_dirty: bool,
+    audio_focus: std::cell::RefCell<std::collections::HashMap<u32, audio::RowFocus>>,
+    /// Audio handles that held focus at the last render (components get no `Window`),
+    /// as (row id, slot); see `ClipperWindow::is_focused` in `audio.rs`.
+    audio_focused: std::cell::RefCell<std::collections::HashSet<(u32, u8)>>,
     audio_testing: bool,
     audio_test_path: Option<String>,
     /// Replay was enabled in the config and has not been auto-started yet.
@@ -225,6 +245,13 @@ pub struct ClipperWindow {
     replay_focus: FocusHandle,
     /// Free space on the recordings volume, shown in the sidebar.
     storage: StorageStatus,
+    /// Highlighted row while the Capture page's source menu is open.
+    source_menu: Option<usize>,
+    source_focus: FocusHandle,
+    /// Latest clips in the recordings folder for the Capture page.
+    recent_clips: crate::recent_clips::RecentClips,
+    /// Bumped per refresh so only the newest scan's result is applied.
+    recent_clips_generation: u64,
     /// The clip open in the Editor page; its player only runs while that page is shown.
     editor: Option<Entity<editor::ClipEditor>>,
     /// Custom accent color field on the Settings page.
@@ -243,7 +270,7 @@ impl ClipperWindow {
         cx: &mut Context<Self>,
     ) -> Self {
         let events = handle.events();
-        let task = cx.spawn(async move |this, cx| {
+        let task = cx.spawn_in(window, async move |this, cx| {
             while let Ok(event) = events.recv().await {
                 let toast = match &event {
                     RecorderEvent::ReplaySaving => Some(Toast::Saving),
@@ -262,17 +289,26 @@ impl ClipperWindow {
                     event,
                     RecorderEvent::ReplaySaved { .. } | RecorderEvent::RecordingFinished { .. }
                 );
-                let updated = this.update(cx, |this, cx| {
+                let updated = this.update_in(cx, |this, window, cx| {
+                    let mut quiet = false;
                     this.storage_projection_run.apply_event(&event);
                     match &event {
-                        RecorderEvent::AudioLevels {
-                            desktop,
-                            microphone,
-                        } => this.audio_levels = (*desktop, *microphone),
+                        RecorderEvent::AudioLevels(levels) => {
+                            this.audio_levels = levels.clone();
+                            // Meters only exist on the Capture page: store, don't redraw.
+                            quiet = !levels.is_empty() && this.active_page != Page::Dashboard;
+                        }
+                        RecorderEvent::AudioSources(states) => {
+                            this.audio_sources = states.clone();
+                            if states.is_empty() {
+                                this.audio_levels.clear();
+                            }
+                        }
                         RecorderEvent::AudioTestStarted => this.audio_testing = true,
                         RecorderEvent::AudioTestFinished { path, error } => {
                             this.audio_testing = false;
-                            this.audio_levels = (0.0, 0.0);
+                            this.audio_levels.clear();
+                            this.audio_sources.clear();
                             this.audio_test_path =
                                 path.as_ref().map(|path| path.display().to_string());
                             if let Some(error) = error {
@@ -280,17 +316,24 @@ impl ClipperWindow {
                             }
                         }
                         RecorderEvent::RecordingFinished { .. }
-                        | RecorderEvent::RecordingFailed { .. } => this.audio_levels = (0.0, 0.0),
+                        | RecorderEvent::RecordingFailed { .. } => this.audio_levels.clear(),
                         RecorderEvent::Stopped => {
-                            this.audio_levels = (0.0, 0.0);
+                            this.audio_levels.clear();
+                            this.audio_sources.clear();
                             this.audio_testing = false;
                         }
                         _ => {}
                     }
                     this.recording.apply(event);
                     this.refresh_active_video();
+                    // Rows of an open source menu are list indexes; a new list or
+                    // a started session makes them meaningless.
+                    if sources_listed || !this.recording.settings_enabled() {
+                        this.source_menu = None;
+                    }
                     if wrote_file {
                         this.refresh_storage(cx);
+                        this.refresh_recent_clips(window, cx);
                     }
                     if sources_listed {
                         this.maybe_autostart_replay();
@@ -298,7 +341,9 @@ impl ClipperWindow {
                     if let Some(toast) = toast {
                         this.notifier.show(toast, &this.config.notifications, cx);
                     }
-                    cx.notify();
+                    if !quiet {
+                        cx.notify();
+                    }
                 });
                 if updated.is_err() {
                     return;
@@ -307,7 +352,8 @@ impl ClipperWindow {
             // Channel closed without a final event: the worker is gone.
             let _ = this.update(cx, |this, cx| {
                 this.audio_testing = false;
-                this.audio_levels = (0.0, 0.0);
+                this.audio_levels.clear();
+                this.audio_sources.clear();
                 this.storage_projection_run.clear();
                 if this.recording.phase != Phase::Idle || !this.recording.replay.is_off() {
                     this.recording.apply(RecorderEvent::Stopped);
@@ -364,34 +410,51 @@ impl ClipperWindow {
             palette: None,
             config_persistence: Default::default(),
             audio_devices: Vec::new(),
+            audio_apps: Vec::new(),
+            audio_capabilities: None,
             audio_menu: None,
             audio_loading: false,
-            audio_levels: (0.0, 0.0),
+            audio_levels: Vec::new(),
+            audio_sources: Vec::new(),
+            audio_add: None,
+            audio_add_focus: cx.focus_handle(),
+            audio_add_note: None,
+            audio_notice: None,
+            audio_gain_dirty: false,
+            audio_focus: Default::default(),
+            audio_focused: Default::default(),
             audio_testing: false,
             audio_test_path: None,
             replay_autostart_pending,
             capture_menu: None,
             // Indexed by `CaptureMenu` order. Tab follows the screen: the capture
             // bar (resolution 4, fps 5, replay length 6, hotkey 7, replay switch 8)
-            // after the sidebar (0-3), then the Capture page's quality and bitrate.
-            capture_focus: [4, 5, 9, 10, 6]
+            // after the sidebar (0-3), then the Capture page: source 9, quality 10,
+            // bitrate 11. Settings controls follow from 12.
+            capture_focus: [4, 5, 10, 11, 6]
                 .map(|index| cx.focus_handle().tab_index(index).tab_stop(true)),
             replay_focus: cx.focus_handle().tab_index(8).tab_stop(true),
             active_video: None,
             storage: StorageStatus::Unknown,
+            source_menu: None,
+            // First control of the Capture page, after the capture bar (4-8).
+            source_focus: cx.focus_handle().tab_index(9).tab_stop(true),
+            recent_clips: Default::default(),
+            recent_clips_generation: 0,
             editor: None,
             accent_input,
-            // After the shell and capture controls (0-10).
+            // Settings page, after every Capture page control (0-11).
             notify_focus: std::array::from_fn(|index| {
                 cx.focus_handle()
-                    .tab_index(11 + index as isize)
+                    .tab_index(12 + index as isize)
                     .tab_stop(true)
             }),
         };
         this.storage_projection_cache.refresh(&this.config);
         this.refresh_storage(cx);
+        this.refresh_recent_clips(window, cx);
         this.send(RecorderCommand::RefreshSources);
-        this.refresh_audio_devices(cx);
+        this.refresh_audio_lists(cx);
         this.register_hotkey(cx);
         this
     }
@@ -874,6 +937,7 @@ fn hint(t: &Theme, keys: &[&'static str], label: &'static str) -> Div {
 impl Render for ClipperWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = *cx.theme();
+        self.snapshot_audio_focus(window);
         let palette = self
             .palette
             .as_ref()

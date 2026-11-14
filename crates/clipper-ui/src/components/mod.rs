@@ -2,10 +2,12 @@
 //! spacing and states stay consistent across pages.
 
 mod dropdown;
+mod slider;
 mod text_input;
 mod toggle;
 mod tooltip;
 pub use dropdown::{DropdownOption, dropdown, step};
+pub use slider::slider;
 pub use text_input::{TextInput, TextInputEvent};
 pub use toggle::toggle;
 pub use tooltip::tooltip;
@@ -29,6 +31,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("enter", Activate, Some("Toggle")),
         KeyBinding::new("enter", Submit, Some("TextInput")),
         KeyBinding::new("escape", Dismiss, Some("TextInput")),
+        KeyBinding::new("left", slider::SlideDown, Some("Slider")),
+        KeyBinding::new("right", slider::SlideUp, Some("Slider")),
     ]);
 }
 
@@ -311,6 +315,8 @@ pub fn switch(t: &Theme, on: bool) -> Div {
 }
 
 /// Label, large value and one line of context.
+// shortcut: no caller since the Phase 3 dashboard; drop the allow when a page uses it.
+#[allow(dead_code)]
 pub fn stat_tile(
     t: &Theme,
     label: impl Into<SharedString>,

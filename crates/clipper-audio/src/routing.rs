@@ -7,35 +7,38 @@
 //!
 //! Tracks must be disjoint so separate tracks and the mixed output never
 //! contain a signal twice. Hence:
-//! - game / Discord: INCLUDE streams (need process loopback),
+//! - process sources: INCLUDE streams (need process loopback),
 //! - desktop with no separately captured process: endpoint loopback, labelled
 //!   "full mix",
 //! - desktop with exactly one separately captured process: EXCLUDE that one,
-//! - desktop with both game and Discord separate: impossible with a single
-//!   exclusion, so no desktop track is planned and a warning explains why.
-//!   Subtracting signals is not attempted: loopback copies are not
-//!   sample-aligned, so subtraction would leave phase artefacts.
+//! - desktop with two or more: impossible with a single exclusion, so no
+//!   desktop track is planned and a warning explains why. Subtracting signals
+//!   is not attempted: loopback copies are not sample-aligned.
+//! - microphones are independent devices, one track per distinct choice.
 
 use crate::types::{
-    AudioCapabilities, AudioSelection, AudioSourceKind, MicrophoneChoice, ProcessTarget,
+    AudioCapabilities, AudioSelection, MicrophoneChoice, ProcessTarget, SourceRequestKind,
     TrackContent,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StreamPlan {
-    /// Loopback of the default render device (follows default changes).
-    EndpointLoopback,
+    /// Loopback of a render device (`None` = default, follows default changes).
+    EndpointLoopback(Option<String>),
     /// Only this process tree.
     ProcessInclude(ProcessTarget),
-    /// Everything except this process tree. While the target is not running
-    /// the remainder equals the full mix, so backends may capture endpoint
-    /// loopback until the target appears.
+    /// Everything except this process tree. Process loopback EXCLUDE is
+    /// system-wide, so the chosen output device is ignored for this stream.
+    /// While the target is not running the remainder equals the full mix, so
+    /// backends may capture endpoint loopback until the target appears.
     ProcessExclude(ProcessTarget),
     Microphone(MicrophoneChoice),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlannedTrack {
+    /// Mixer source id this track serves.
+    pub source: u32,
     pub content: TrackContent,
     pub stream: StreamPlan,
 }
@@ -43,29 +46,24 @@ pub struct PlannedTrack {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RoutingWarning {
     /// Process loopback needs Windows 10 build 20348+ / Windows 11.
-    ProcessLoopbackUnsupported(AudioSourceKind),
-    /// Desktop remainder without both game and Discord cannot be captured.
+    ProcessLoopbackUnsupported,
+    /// Desktop remainder with two or more separate apps cannot be captured.
     DesktopRemainderUnavailable,
-    /// The same process was selected as game and Discord.
-    DuplicateProcess,
+    /// Same source selected more than once; recorded only once.
+    Duplicate,
 }
 
 impl RoutingWarning {
     pub fn message(&self) -> &'static str {
         match self {
-            Self::ProcessLoopbackUnsupported(AudioSourceKind::Game) => {
-                "Separate game audio needs Windows 11 (or Windows 10 build 20348+)."
-            }
-            Self::ProcessLoopbackUnsupported(_) => {
-                "Separate Discord audio needs Windows 11 (or Windows 10 build 20348+)."
+            Self::ProcessLoopbackUnsupported => {
+                "Per-app audio needs Windows 11 (or Windows 10 build 20348+)."
             }
             Self::DesktopRemainderUnavailable => {
                 "Desktop audio is off: Windows can exclude only one app from desktop capture, \
-                 so other desktop sounds cannot be separated from both game and Discord."
+                 so other desktop sounds cannot be separated from several apps."
             }
-            Self::DuplicateProcess => {
-                "Game and Discord point to the same app; recorded once as game."
-            }
+            Self::Duplicate => "This source is already recorded by another entry.",
         }
     }
 }
@@ -73,73 +71,87 @@ impl RoutingWarning {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RoutingPlan {
     pub tracks: Vec<PlannedTrack>,
-    pub warnings: Vec<RoutingWarning>,
+    /// `(source id, warning)`.
+    pub warnings: Vec<(u32, RoutingWarning)>,
+}
+
+fn app_name(target: &ProcessTarget) -> String {
+    match target {
+        ProcessTarget::Executable(name) => name.clone(),
+        ProcessTarget::Pid(pid) => format!("pid {pid}"),
+    }
 }
 
 pub fn plan(selection: &AudioSelection, caps: AudioCapabilities) -> RoutingPlan {
     let mut out = RoutingPlan::default();
 
-    let mut game = selection.game.clone();
-    let mut discord = selection.discord.clone();
-    if let (Some(g), Some(d)) = (&game, &discord)
-        && g.same_as(d)
-    {
-        out.warnings.push(RoutingWarning::DuplicateProcess);
-        discord = None;
-    }
-    if !caps.process_loopback {
-        if game.take().is_some() {
-            out.warnings
-                .push(RoutingWarning::ProcessLoopbackUnsupported(
-                    AudioSourceKind::Game,
-                ));
-        }
-        if discord.take().is_some() {
-            out.warnings
-                .push(RoutingWarning::ProcessLoopbackUnsupported(
-                    AudioSourceKind::Discord,
-                ));
+    // Pass 1: which process sources survive (they decide the desktop shape).
+    let mut includes: Vec<&ProcessTarget> = Vec::new();
+    let mut dropped: Vec<Option<RoutingWarning>> = vec![None; selection.sources.len()];
+    for (i, source) in selection.sources.iter().enumerate() {
+        if let SourceRequestKind::Process(target) = &source.kind {
+            if !caps.process_loopback {
+                dropped[i] = Some(RoutingWarning::ProcessLoopbackUnsupported);
+            } else if includes.iter().any(|t| t.same_as(target)) {
+                dropped[i] = Some(RoutingWarning::Duplicate);
+            } else {
+                includes.push(target);
+            }
         }
     }
 
-    if let Some(target) = &game {
-        out.tracks.push(PlannedTrack {
-            content: TrackContent::Game,
-            stream: StreamPlan::ProcessInclude(target.clone()),
-        });
-    }
-    if let Some(target) = &discord {
-        out.tracks.push(PlannedTrack {
-            content: TrackContent::Discord,
-            stream: StreamPlan::ProcessInclude(target.clone()),
-        });
-    }
-
-    if selection.desktop {
-        match (&game, &discord) {
-            (None, None) => out.tracks.push(PlannedTrack {
-                content: TrackContent::DesktopFull,
-                stream: StreamPlan::EndpointLoopback,
-            }),
-            (Some(target), None) => out.tracks.push(PlannedTrack {
-                content: TrackContent::DesktopExcluding(AudioSourceKind::Game),
-                stream: StreamPlan::ProcessExclude(target.clone()),
-            }),
-            (None, Some(target)) => out.tracks.push(PlannedTrack {
-                content: TrackContent::DesktopExcluding(AudioSourceKind::Discord),
-                stream: StreamPlan::ProcessExclude(target.clone()),
-            }),
-            (Some(_), Some(_)) => out
-                .warnings
-                .push(RoutingWarning::DesktopRemainderUnavailable),
+    // Pass 2: emit in selection order.
+    let mut mics: Vec<&MicrophoneChoice> = Vec::new();
+    let mut desktops: Vec<&Option<String>> = Vec::new();
+    for (i, source) in selection.sources.iter().enumerate() {
+        let id = source.id;
+        if let Some(warning) = dropped[i].take() {
+            out.warnings.push((id, warning));
+            continue;
         }
-    }
-
-    if let Some(choice) = &selection.microphone {
-        out.tracks.push(PlannedTrack {
-            content: TrackContent::Microphone,
-            stream: StreamPlan::Microphone(choice.clone()),
-        });
+        match &source.kind {
+            SourceRequestKind::Process(target) => out.tracks.push(PlannedTrack {
+                source: id,
+                content: TrackContent::Application(app_name(target)),
+                stream: StreamPlan::ProcessInclude(target.clone()),
+            }),
+            SourceRequestKind::Microphone(choice) => {
+                if mics.contains(&choice) {
+                    out.warnings.push((id, RoutingWarning::Duplicate));
+                } else {
+                    mics.push(choice);
+                    out.tracks.push(PlannedTrack {
+                        source: id,
+                        content: TrackContent::Microphone,
+                        stream: StreamPlan::Microphone(choice.clone()),
+                    });
+                }
+            }
+            SourceRequestKind::Desktop { device } => {
+                // With includes present all desktops share one remainder, so
+                // only the first counts; otherwise duplicates are same-device.
+                if desktops.contains(&device) || (!desktops.is_empty() && !includes.is_empty()) {
+                    out.warnings.push((id, RoutingWarning::Duplicate));
+                    continue;
+                }
+                desktops.push(device);
+                match includes.as_slice() {
+                    [] => out.tracks.push(PlannedTrack {
+                        source: id,
+                        content: TrackContent::DesktopFull,
+                        stream: StreamPlan::EndpointLoopback(device.clone()),
+                    }),
+                    [target] => out.tracks.push(PlannedTrack {
+                        source: id,
+                        content: TrackContent::DesktopExcluding(app_name(target)),
+                        stream: StreamPlan::ProcessExclude((*target).clone()),
+                    }),
+                    _ => out
+                        .warnings
+                        .push((id, RoutingWarning::DesktopRemainderUnavailable)),
+                }
+            }
+        }
     }
     out
 }
@@ -147,6 +159,7 @@ pub fn plan(selection: &AudioSelection, caps: AudioCapabilities) -> RoutingPlan 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::SourceRequest;
 
     const SUPPORTED: AudioCapabilities = AudioCapabilities {
         process_loopback: true,
@@ -155,8 +168,35 @@ mod tests {
         process_loopback: false,
     };
 
-    fn game() -> ProcessTarget {
-        ProcessTarget::Executable("game.exe".into())
+    fn exe(name: &str) -> ProcessTarget {
+        ProcessTarget::Executable(name.into())
+    }
+
+    fn app(id: u32, name: &str) -> SourceRequest {
+        SourceRequest {
+            id,
+            kind: SourceRequestKind::Process(exe(name)),
+        }
+    }
+
+    fn desktop(id: u32, device: Option<&str>) -> SourceRequest {
+        SourceRequest {
+            id,
+            kind: SourceRequestKind::Desktop {
+                device: device.map(str::to_owned),
+            },
+        }
+    }
+
+    fn mic(id: u32, choice: MicrophoneChoice) -> SourceRequest {
+        SourceRequest {
+            id,
+            kind: SourceRequestKind::Microphone(choice),
+        }
+    }
+
+    fn sel(sources: Vec<SourceRequest>) -> AudioSelection {
+        AudioSelection { sources }
     }
 
     fn contents(plan: &RoutingPlan) -> Vec<TrackContent> {
@@ -164,7 +204,8 @@ mod tests {
     }
 
     /// No two tracks may capture the same process: an INCLUDE target must not
-    /// also be audible in a desktop track.
+    /// also be audible in a desktop track, and at most one desktop remainder
+    /// exists when processes are included.
     fn assert_disjoint(plan: &RoutingPlan) {
         let includes: Vec<&ProcessTarget> = plan
             .tracks
@@ -174,12 +215,15 @@ mod tests {
                 _ => None,
             })
             .collect();
+        let mut remainders = 0;
         for track in &plan.tracks {
             match &track.stream {
-                StreamPlan::EndpointLoopback => {
+                StreamPlan::EndpointLoopback(_) => {
+                    remainders += 1;
                     assert!(includes.is_empty(), "full mix overlaps {includes:?}")
                 }
                 StreamPlan::ProcessExclude(excluded) => {
+                    remainders += 1;
                     assert!(
                         includes.iter().all(|i| *i == excluded),
                         "remainder excluding {excluded:?} overlaps {includes:?}"
@@ -188,147 +232,202 @@ mod tests {
                 _ => {}
             }
         }
+        assert!(includes.is_empty() || remainders <= 1);
     }
 
     #[test]
-    fn everything_selected_drops_desktop_with_warning() {
-        let selection = AudioSelection {
-            game: Some(game()),
-            discord: Some(ProcessTarget::discord()),
-            desktop: true,
-            microphone: Some(MicrophoneChoice::Default),
-        };
-        let plan = plan(&selection, SUPPORTED);
+    fn n_apps_keep_order_and_ids() {
+        let plan = plan(
+            &sel(vec![app(7, "a.exe"), app(3, "b.exe"), app(9, "c.exe")]),
+            SUPPORTED,
+        );
         assert_eq!(
             contents(&plan),
             [
-                TrackContent::Game,
-                TrackContent::Discord,
-                TrackContent::Microphone
+                TrackContent::Application("a.exe".into()),
+                TrackContent::Application("b.exe".into()),
+                TrackContent::Application("c.exe".into())
             ]
         );
-        assert_eq!(plan.warnings, [RoutingWarning::DesktopRemainderUnavailable]);
-        assert_disjoint(&plan);
-    }
-
-    #[test]
-    fn game_and_desktop_use_exclusion_for_the_remainder() {
-        let selection = AudioSelection {
-            game: Some(game()),
-            desktop: true,
-            ..Default::default()
-        };
-        let plan = plan(&selection, SUPPORTED);
         assert_eq!(
-            plan.tracks[1],
-            PlannedTrack {
-                content: TrackContent::DesktopExcluding(AudioSourceKind::Game),
-                stream: StreamPlan::ProcessExclude(game()),
-            }
+            plan.tracks.iter().map(|t| t.source).collect::<Vec<_>>(),
+            [7, 3, 9]
         );
         assert!(plan.warnings.is_empty());
         assert_disjoint(&plan);
     }
 
     #[test]
-    fn discord_and_desktop_use_exclusion_for_the_remainder() {
-        let selection = AudioSelection {
-            discord: Some(ProcessTarget::discord()),
-            desktop: true,
-            ..Default::default()
-        };
-        let plan = plan(&selection, SUPPORTED);
-        assert_eq!(
-            contents(&plan),
-            [
-                TrackContent::Discord,
-                TrackContent::DesktopExcluding(AudioSourceKind::Discord)
-            ]
+    fn multiple_distinct_mics_are_separate_tracks() {
+        let plan = plan(
+            &sel(vec![
+                mic(1, MicrophoneChoice::Default),
+                mic(2, MicrophoneChoice::Device("usb".into())),
+            ]),
+            SUPPORTED,
         );
-        assert_disjoint(&plan);
+        assert_eq!(plan.tracks.len(), 2);
+        assert!(plan.warnings.is_empty());
+    }
+
+    #[test]
+    fn duplicate_mic_warns_with_id() {
+        let plan = plan(
+            &sel(vec![
+                mic(1, MicrophoneChoice::Default),
+                mic(2, MicrophoneChoice::Default),
+            ]),
+            SUPPORTED,
+        );
+        assert_eq!(plan.tracks.len(), 1);
+        assert_eq!(plan.warnings, [(2, RoutingWarning::Duplicate)]);
     }
 
     #[test]
     fn desktop_alone_is_an_honestly_labelled_full_mix() {
-        let selection = AudioSelection {
-            desktop: true,
-            ..Default::default()
-        };
-        let plan = plan(&selection, SUPPORTED);
+        let plan = plan(&sel(vec![desktop(4, Some("dev"))]), SUPPORTED);
         assert_eq!(
             plan.tracks,
             [PlannedTrack {
+                source: 4,
                 content: TrackContent::DesktopFull,
-                stream: StreamPlan::EndpointLoopback,
+                stream: StreamPlan::EndpointLoopback(Some("dev".into())),
             }]
         );
         assert_eq!(TrackContent::DesktopFull.label(), "Desktop (full mix)");
     }
 
     #[test]
-    fn legacy_windows_falls_back_to_full_mix_and_warns() {
-        let selection = AudioSelection {
-            game: Some(game()),
-            discord: Some(ProcessTarget::discord()),
-            desktop: true,
-            microphone: None,
-        };
-        let plan = plan(&selection, LEGACY);
+    fn desktop_and_one_app_use_exclusion() {
+        let plan = plan(
+            &sel(vec![desktop(1, None), app(2, "Discord.exe")]),
+            SUPPORTED,
+        );
+        assert_eq!(
+            contents(&plan),
+            [
+                TrackContent::DesktopExcluding("Discord.exe".into()),
+                TrackContent::Application("Discord.exe".into())
+            ]
+        );
+        assert_eq!(
+            plan.tracks[0].stream,
+            StreamPlan::ProcessExclude(exe("Discord.exe"))
+        );
+        assert_eq!(contents(&plan)[0].label(), "Desktop (without Discord.exe)");
+        assert!(plan.warnings.is_empty());
+        assert_disjoint(&plan);
+    }
+
+    #[test]
+    fn desktop_and_two_apps_drops_desktop_with_warning() {
+        let plan = plan(
+            &sel(vec![app(1, "a.exe"), desktop(2, None), app(3, "b.exe")]),
+            SUPPORTED,
+        );
+        assert_eq!(plan.tracks.len(), 2);
+        assert_eq!(
+            plan.warnings,
+            [(2, RoutingWarning::DesktopRemainderUnavailable)]
+        );
+        assert_disjoint(&plan);
+    }
+
+    #[test]
+    fn second_desktop_with_includes_is_duplicate() {
+        let plan = plan(
+            &sel(vec![
+                app(1, "a.exe"),
+                desktop(2, None),
+                desktop(3, Some("x")),
+            ]),
+            SUPPORTED,
+        );
+        assert_eq!(plan.tracks.len(), 2);
+        assert_eq!(plan.warnings, [(3, RoutingWarning::Duplicate)]);
+        assert_disjoint(&plan);
+    }
+
+    #[test]
+    fn desktops_on_different_devices_without_apps_are_both_kept() {
+        let plan = plan(
+            &sel(vec![desktop(1, None), desktop(2, Some("x"))]),
+            SUPPORTED,
+        );
+        assert_eq!(plan.tracks.len(), 2);
+    }
+
+    #[test]
+    fn same_device_desktop_twice_is_duplicate() {
+        let plan = plan(&sel(vec![desktop(1, None), desktop(2, None)]), SUPPORTED);
+        assert_eq!(plan.tracks.len(), 1);
+        assert_eq!(plan.warnings, [(2, RoutingWarning::Duplicate)]);
+    }
+
+    #[test]
+    fn legacy_windows_drops_apps_and_keeps_full_mix() {
+        let plan = plan(
+            &sel(vec![app(1, "a.exe"), desktop(2, None), app(3, "b.exe")]),
+            LEGACY,
+        );
         assert_eq!(contents(&plan), [TrackContent::DesktopFull]);
         assert_eq!(
             plan.warnings,
             [
-                RoutingWarning::ProcessLoopbackUnsupported(AudioSourceKind::Game),
-                RoutingWarning::ProcessLoopbackUnsupported(AudioSourceKind::Discord),
+                (1, RoutingWarning::ProcessLoopbackUnsupported),
+                (3, RoutingWarning::ProcessLoopbackUnsupported)
             ]
         );
         assert_disjoint(&plan);
     }
 
     #[test]
-    fn same_process_for_game_and_discord_is_captured_once() {
-        let selection = AudioSelection {
-            game: Some(ProcessTarget::discord()),
-            discord: Some(ProcessTarget::discord()),
-            desktop: true,
-            microphone: None,
-        };
-        let plan = plan(&selection, SUPPORTED);
+    fn duplicate_app_ignores_exe_case_and_keeps_first() {
+        let plan = plan(
+            &sel(vec![app(1, "Discord.exe"), app(2, "discord.exe")]),
+            SUPPORTED,
+        );
+        assert_eq!(plan.tracks.len(), 1);
+        assert_eq!(plan.tracks[0].source, 1);
+        assert_eq!(plan.warnings, [(2, RoutingWarning::Duplicate)]);
+    }
+
+    #[test]
+    fn pid_target_is_labelled_pid() {
+        let plan = plan(
+            &sel(vec![SourceRequest {
+                id: 1,
+                kind: SourceRequestKind::Process(ProcessTarget::Pid(42)),
+            }]),
+            SUPPORTED,
+        );
         assert_eq!(
             contents(&plan),
-            [
-                TrackContent::Game,
-                TrackContent::DesktopExcluding(AudioSourceKind::Game)
-            ]
+            [TrackContent::Application("pid 42".into())]
         );
-        assert_eq!(plan.warnings, [RoutingWarning::DuplicateProcess]);
-        assert_disjoint(&plan);
-    }
-
-    #[test]
-    fn duplicate_detection_ignores_exe_name_case() {
-        let selection = AudioSelection {
-            game: Some(ProcessTarget::Executable("Discord.exe".into())),
-            discord: Some(ProcessTarget::Executable("discord.exe".into())),
-            desktop: false,
-            microphone: None,
-        };
-        let plan = plan(&selection, SUPPORTED);
-        assert_eq!(contents(&plan), [TrackContent::Game]);
-        assert_eq!(plan.warnings, [RoutingWarning::DuplicateProcess]);
     }
 
     #[test]
     fn every_combination_is_disjoint() {
         for caps in [SUPPORTED, LEGACY] {
-            for mask in 0..16u8 {
-                let selection = AudioSelection {
-                    game: (mask & 1 != 0).then(game),
-                    discord: (mask & 2 != 0).then(ProcessTarget::discord),
-                    desktop: mask & 4 != 0,
-                    microphone: (mask & 8 != 0).then_some(MicrophoneChoice::Default),
-                };
-                assert_disjoint(&plan(&selection, caps));
+            for mask in 0..32u8 {
+                let mut sources = Vec::new();
+                if mask & 1 != 0 {
+                    sources.push(app(1, "a.exe"));
+                }
+                if mask & 2 != 0 {
+                    sources.push(app(2, "b.exe"));
+                }
+                if mask & 4 != 0 {
+                    sources.push(desktop(3, None));
+                }
+                if mask & 8 != 0 {
+                    sources.push(desktop(4, Some("x")));
+                }
+                if mask & 16 != 0 {
+                    sources.push(mic(5, MicrophoneChoice::Default));
+                }
+                assert_disjoint(&plan(&sel(sources), caps));
             }
         }
     }
