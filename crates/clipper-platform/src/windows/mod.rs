@@ -6,6 +6,7 @@ pub mod hotkey;
 pub mod notify;
 pub mod shell;
 pub mod startup;
+pub mod tray;
 pub mod watch;
 
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;

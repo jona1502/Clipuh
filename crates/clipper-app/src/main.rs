@@ -27,6 +27,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     use clipper_core::recording::RecorderCommand;
     use clipper_platform::windows::hotkey::GlobalHotkey;
+    use clipper_platform::windows::tray::{Tray, TrayCommand};
     use clipper_recorder::Recorder;
     use clipper_storage::AppConfig;
     use clipper_ui::ClipperWindow;
@@ -56,6 +57,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     })?;
     let hotkeys = hotkey.handle();
+
+    // Tray icon on its own thread; picks arrive on the UI thread through this
+    // channel. A tray failure (e.g. no shell) never blocks startup.
+    let tray = if config.app.tray_icon {
+        let (tray_tx, tray_rx) = async_channel::bounded::<TrayCommand>(8);
+        match Tray::spawn(move |command| {
+            let _ = tray_tx.try_send(command);
+        }) {
+            Ok(tray) => Some((tray, tray_rx)),
+            Err(error) => {
+                eprintln!("clipuh: tray icon unavailable: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let tray_link = tray
+        .as_ref()
+        .map(|(tray, commands)| (tray.handle(), commands.clone()));
     let window_opened = Rc::new(Cell::new(false));
     let window_opened_in_callback = Rc::clone(&window_opened);
 
@@ -96,6 +117,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         handle.clone(),
                         hotkeys.clone(),
                         hotkey_failures.clone(),
+                        tray_link.clone(),
                         config.clone(),
                         window,
                         cx,
@@ -117,8 +139,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Release the global hotkey first so no save is queued during shutdown,
-    // then join the recorder worker (finalizing any active recording).
+    // Remove the tray icon and release the global hotkey first so no save is
+    // queued during shutdown, then join the recorder worker (finalizing any
+    // active recording).
+    drop(tray);
     drop(hotkey);
     drop(recorder);
 

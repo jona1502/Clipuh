@@ -112,7 +112,7 @@ impl Notifier {
     }
 }
 
-fn hwnd_of(window: &Window) -> Option<isize> {
+pub(crate) fn hwnd_of(window: &Window) -> Option<isize> {
     match HasWindowHandle::window_handle(window).map(|h| h.as_raw()) {
         Ok(RawWindowHandle::Win32(h)) => Some(h.hwnd.get()),
         _ => None,
@@ -378,6 +378,8 @@ mod tests {
             sound: true,
             open_clip_action: true,
             notify_on_failure: true,
+            in_app: true,
+            native: true,
         }
     }
     fn saved() -> Toast {
