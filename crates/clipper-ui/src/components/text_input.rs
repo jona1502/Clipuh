@@ -5,6 +5,7 @@
 //! Ctrl+V pastes the first clipboard line. Enter emits `Submitted` and Escape blurs, both via
 //! actions in the "TextInput" key context (`components::bind_keys`) because bindings run
 //! before `on_key_down`.
+//! Compact numeric editors additionally support select-all replacement (Ctrl+A).
 
 use gpui::prelude::*;
 use gpui::{
@@ -33,6 +34,8 @@ pub struct TextInput {
     allowed: fn(char) -> bool,
     focus: FocusHandle,
     leading_icon: Option<super::RasterIcon>,
+    selected_all: bool,
+    compact: bool,
 }
 
 impl EventEmitter<TextInputEvent> for TextInput {}
@@ -72,6 +75,22 @@ fn paste(text: &mut String, clip: &str, max: usize, allowed: fn(char) -> bool) -
     push_str(text, clip.lines().next().unwrap_or(""), max, allowed)
 }
 
+fn replace_selection(
+    text: &mut String,
+    selected: &mut bool,
+    typed: &str,
+    max: usize,
+    allowed: fn(char) -> bool,
+) -> bool {
+    if !typed.chars().any(|c| !c.is_control() && allowed(c)) {
+        return false;
+    }
+    if std::mem::take(selected) {
+        text.clear();
+    }
+    paste(text, typed, max, allowed)
+}
+
 impl TextInput {
     pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
@@ -83,6 +102,8 @@ impl TextInput {
             allowed: any_char,
             focus: cx.focus_handle().tab_stop(true),
             leading_icon: None,
+            selected_all: false,
+            compact: false,
         }
     }
 
@@ -90,6 +111,17 @@ impl TextInput {
     pub fn leading_icon(mut self, icon: super::RasterIcon) -> Self {
         self.leading_icon = Some(icon);
         self
+    }
+
+    /// Fixed-height inline numeric field, without the regular form padding.
+    pub fn compact(mut self) -> Self {
+        self.compact = true;
+        self
+    }
+
+    pub fn select_all(&mut self, cx: &mut Context<Self>) {
+        self.selected_all = !self.text.is_empty();
+        cx.notify();
     }
 
     /// Allows longer file names without changing the default for other fields.
@@ -126,6 +158,7 @@ impl TextInput {
     /// the caller supplies a known value.
     pub fn set_text(&mut self, text: String, cx: &mut Context<Self>) {
         self.text = text.chars().take(self.max_len).collect();
+        self.selected_all = false;
         self.error = None;
         cx.notify();
     }
@@ -159,13 +192,26 @@ impl TextInput {
         }
         let k = &event.keystroke;
         let m = k.modifiers;
-        if m.control && k.key == "v" {
+        if m.control && k.key == "a" {
+            self.select_all(cx);
+        } else if m.control && k.key == "v" {
             let clip = cx.read_from_clipboard().and_then(|c| c.text());
-            if clip.is_some_and(|c| paste(&mut self.text, &c, self.max_len, self.allowed)) {
+            if clip.is_some_and(|c| {
+                replace_selection(
+                    &mut self.text,
+                    &mut self.selected_all,
+                    c.lines().next().unwrap_or(""),
+                    self.max_len,
+                    self.allowed,
+                )
+            }) {
                 self.changed(cx);
             }
-        } else if k.key == "backspace" {
-            if backspace(&mut self.text) {
+        } else if k.key == "backspace" || (k.key == "delete" && self.selected_all) {
+            if std::mem::take(&mut self.selected_all) {
+                self.text.clear();
+                self.changed(cx);
+            } else if backspace(&mut self.text) {
                 self.changed(cx);
             }
         } else if !m.control
@@ -173,7 +219,13 @@ impl TextInput {
             && !m.platform
             && !m.function
             && let Some(ch) = &k.key_char
-            && push_str(&mut self.text, ch, self.max_len, self.allowed)
+            && replace_selection(
+                &mut self.text,
+                &mut self.selected_all,
+                ch,
+                self.max_len,
+                self.allowed,
+            )
         {
             self.changed(cx);
         }
@@ -196,7 +248,11 @@ impl Render for TextInput {
                 .text_color(t.colors.text_muted)
                 .child(self.placeholder.clone())
         } else {
-            div().child(self.text.clone())
+            div()
+                .when(self.selected_all && focused, |this| {
+                    this.bg(t.colors.accent)
+                })
+                .child(self.text.clone())
         };
         div()
             .id("text-input")
@@ -207,8 +263,18 @@ impl Render for TextInput {
                 div()
                     .flex()
                     .items_center()
-                    .h(t.metrics.control_height)
-                    .px(t.metrics.control_padding)
+                    .h(if self.compact {
+                        px(24.)
+                    } else {
+                        t.metrics.control_height
+                    })
+                    .px(if self.compact {
+                        px(3.)
+                    } else {
+                        t.metrics.control_padding
+                    })
+                    .min_w_0()
+                    .overflow_hidden()
                     .rounded_md()
                     .border_1()
                     .border_color(border)
@@ -293,5 +359,29 @@ mod tests {
         assert!(paste(&mut s, "#9B5CF6\nsecond", 64, any_char));
         assert_eq!(s, "#9B5CF6");
         assert!(!paste(&mut s, "", 64, any_char));
+    }
+
+    #[test]
+    fn selected_text_is_replaced_only_by_an_accepted_edit() {
+        let mut text = "12".to_owned();
+        let mut selected = true;
+        assert!(!replace_selection(
+            &mut text,
+            &mut selected,
+            "\n",
+            8,
+            any_char
+        ));
+        assert_eq!(text, "12");
+        assert!(selected);
+        assert!(replace_selection(
+            &mut text,
+            &mut selected,
+            "-6,5",
+            8,
+            any_char
+        ));
+        assert_eq!(text, "-6,5");
+        assert!(!selected);
     }
 }

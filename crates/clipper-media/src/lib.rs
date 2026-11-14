@@ -15,6 +15,3 @@ pub mod exact;
 pub mod audio;
 #[cfg(windows)]
 mod audio_preview;
-
-#[cfg(windows)]
-pub mod notification_sound;

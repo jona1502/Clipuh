@@ -9,7 +9,6 @@ mod meter;
 mod notification_center;
 mod notifications;
 mod recent_clips;
-mod sounds;
 mod state;
 mod storage_status;
 mod theme;

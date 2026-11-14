@@ -5,7 +5,6 @@ pub mod disk;
 pub mod hotkey;
 pub mod notify;
 pub mod shell;
-pub mod sound;
 pub mod startup;
 pub mod system_info;
 pub mod tray;

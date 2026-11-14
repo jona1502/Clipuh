@@ -54,6 +54,28 @@ const CATEGORY_INDENT: f32 = 30.0;
 /// Free space below this on the chosen clip folder gets a warning.
 const LOW_SPACE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
+fn sound_file_label(path: Option<&Path>) -> String {
+    match path {
+        None => "Default Windows sound".into(),
+        Some(path) => path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Custom sound".into()),
+    }
+}
+
+/// Cancellation and failed validation leave the authoritative selection intact.
+fn apply_sound_import(
+    settings: &mut NotificationSettings,
+    result: Result<Option<PathBuf>, String>,
+) -> Result<bool, String> {
+    let Some(path) = result? else {
+        return Ok(false);
+    };
+    settings.custom_sound = Some(path);
+    Ok(true)
+}
+
 // Tab order follows the screen: shell and Capture page use 0-11, then the
 // section list, then the cards row by row.
 const TAB_NAV: isize = 12;
@@ -68,17 +90,18 @@ pub(super) const TAB_ACCENT_INPUT: isize = 46;
 const TAB_DENSITY: isize = 47;
 const TAB_STARTUP: isize = 50;
 pub(super) const TAB_NOTIFY: isize = 51;
-const TAB_ADVANCED: isize = 55;
+const TAB_SOUND: isize = 55;
+const TAB_ADVANCED: isize = 58;
 /// Diagnostics controls (logging toggle, verbosity, open logs, export).
-const TAB_DIAGNOSTICS: isize = 56;
-/// Clip-saved sound controls (two choices, import, preview, reset).
-const TAB_SOUND: isize = 61;
+const TAB_DIAGNOSTICS: isize = 59;
 
 // Tab ranges must not overlap: nav, 7 dropdowns, audio pair, notify toggles.
 const _: () = {
     assert!(TAB_NAV + SECTIONS.len() as isize <= TAB_MENUS);
     assert!(TAB_MENUS + 7 <= TAB_AUDIO);
     assert!(TAB_NOTIFY + 4 <= TAB_ADVANCED);
+    assert!(TAB_NOTIFY + 4 <= TAB_SOUND);
+    assert!(TAB_SOUND + 3 <= TAB_ADVANCED);
     assert!(TAB_ACCENT_SWATCH + ACCENT_PRESETS.len() as isize <= TAB_ACCENT_INPUT);
     assert!(TAB_ADVANCED < TAB_DIAGNOSTICS);
 };
@@ -801,6 +824,71 @@ impl ClipperWindow {
         .detach();
     }
 
+    fn choose_notification_sound(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.notification_sound_importing {
+            return;
+        }
+        self.notification_sound_importing = true;
+        self.notification_sound_notice = None;
+        cx.notify();
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Import notification WAV".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = match paths.await {
+                Ok(Ok(Some(mut paths))) => match paths.pop() {
+                    Some(path) => {
+                        cx.background_spawn(async move {
+                            clipper_storage::import_notification_sound(&path)
+                                .map(Some)
+                                .map_err(|error| error.to_string())
+                        })
+                        .await
+                    }
+                    None => Ok(None),
+                },
+                Ok(Ok(None)) | Err(_) => Ok(None),
+                Ok(Err(error)) => Err(format!("Sound picker failed: {error}")),
+            };
+            this.update(cx, |this, cx| {
+                this.notification_sound_importing = false;
+                match apply_sound_import(&mut this.config.notifications, result) {
+                    Ok(true) => {
+                        this.notification_sound_notice =
+                            Some("Custom sound imported. Preview it below.".into());
+                        this.persist_config(cx);
+                    }
+                    Ok(false) => {}
+                    Err(error) => this.notification_sound_notice = Some(error),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn reset_notification_sound(&mut self, cx: &mut Context<Self>) {
+        if self.notification_sound_importing {
+            return;
+        }
+        self.config.notifications.custom_sound = None;
+        self.notification_sound_notice = None;
+        self.persist_config(cx);
+        cx.notify();
+    }
+
+    fn preview_notification_sound(&mut self) {
+        if !self.notification_sound_importing {
+            // A deliberate preview remains available even when automatic sounds are off.
+            self.notifier
+                .play_sound(self.config.notifications.custom_sound.clone());
+        }
+    }
+
     fn choose_clip_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.recording.settings_enabled() {
             self.settings_notice =
@@ -973,309 +1061,6 @@ impl ClipperWindow {
                     }
                 });
                 cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    /// Clip-saved sound: bundled default or an imported sound, with import,
-    /// preview and reset.
-    fn clip_sound_section(
-        &self,
-        t: &Theme,
-        enabled: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Div {
-        use clipper_storage::SoundChoice;
-        let settings = &self.config.notifications;
-        let custom = settings.custom_sound.clone();
-        let busy = self.sound_busy;
-        let choice = |index: usize, label: String, selected: bool, available: bool| {
-            chip(
-                t,
-                ("clip-sound", index),
-                label,
-                selected,
-                enabled && available && !busy,
-            )
-        };
-        let default = activatable(
-            choice(
-                0,
-                format!("Default · {}", crate::sounds::DEFAULT_NAME),
-                settings.sound_choice == SoundChoice::Default,
-                true,
-            ),
-            t,
-            TAB_SOUND,
-            window,
-            cx,
-            |this, _, cx| this.select_clip_sound(SoundChoice::Default, cx),
-        );
-        let custom_label = custom.as_deref().map_or_else(
-            || "Custom · none imported".to_owned(),
-            |name| format!("Custom · {}", crate::sounds::display_name(name)),
-        );
-        let custom_chip = activatable(
-            choice(
-                1,
-                custom_label,
-                settings.sound_choice == SoundChoice::Custom,
-                custom.is_some(),
-            ),
-            t,
-            TAB_SOUND + 1,
-            window,
-            cx,
-            |this, _, cx| this.select_clip_sound(SoundChoice::Custom, cx),
-        );
-        let import = activatable(
-            button(
-                t,
-                "clip-sound-import",
-                if busy {
-                    "Importing…"
-                } else {
-                    "Import Custom Sound…"
-                },
-                ButtonVariant::Secondary,
-                None,
-                enabled && !busy,
-            ),
-            t,
-            TAB_SOUND + 2,
-            window,
-            cx,
-            |this, window, cx| this.import_clip_sound(window, cx),
-        );
-        let preview = activatable(
-            button(
-                t,
-                "clip-sound-preview",
-                "Preview",
-                ButtonVariant::Ghost,
-                None,
-                enabled && !busy,
-            ),
-            t,
-            TAB_SOUND + 3,
-            window,
-            cx,
-            |this, _, _| crate::sounds::preview(&this.config.notifications),
-        );
-        let reset = activatable(
-            button(
-                t,
-                "clip-sound-reset",
-                "Reset to Default",
-                ButtonVariant::Ghost,
-                None,
-                enabled && !busy && settings.sound_choice != SoundChoice::Default,
-            ),
-            t,
-            TAB_SOUND + 4,
-            window,
-            cx,
-            |this, _, cx| this.select_clip_sound(SoundChoice::Default, cx),
-        );
-        div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .pl_1()
-            .when(!enabled, |this| this.opacity(0.45))
-            .child(div().text_sm().child("Clip Saved Sound"))
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap_2()
-                    .child(default)
-                    .child(custom_chip),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap_2()
-                    .child(import)
-                    .child(preview)
-                    .child(reset),
-            )
-            .children(self.sound_notice.clone().map(|(error, message)| {
-                if error {
-                    error_note(t, message).into_any_element()
-                } else {
-                    note(t, message).into_any_element()
-                }
-            }))
-            .child(note(
-                t,
-                "WAV or MP3, up to 10 seconds. Imported sounds are copied into clipuh's \
-                 folder, so the original file can move. The sound plays after a clip is \
-                 saved; failed saves play the system error sound instead.",
-            ))
-    }
-
-    /// Selects the bundled or the imported sound. The imported sound is
-    /// loaded into memory first; if that fails the selection stays unchanged.
-    fn select_clip_sound(&mut self, choice: clipper_storage::SoundChoice, cx: &mut Context<Self>) {
-        use clipper_storage::SoundChoice;
-        match choice {
-            SoundChoice::Default => {
-                self.config.notifications.sound_choice = SoundChoice::Default;
-                self.sound_notice = None;
-                self.persist_config(cx);
-            }
-            SoundChoice::Custom => {
-                let Some(name) = self.config.notifications.custom_sound.clone() else {
-                    return;
-                };
-                if crate::sounds::is_loaded(&name) {
-                    self.config.notifications.sound_choice = SoundChoice::Custom;
-                    self.sound_notice = None;
-                    self.persist_config(cx);
-                } else {
-                    self.load_sound_then_select(name, cx);
-                }
-            }
-        }
-    }
-
-    fn load_sound_then_select(&mut self, name: String, cx: &mut Context<Self>) {
-        let Ok(folder) = clipper_storage::sound_directory() else {
-            self.sound_notice = Some((true, "The sound folder is unavailable.".into()));
-            cx.notify();
-            return;
-        };
-        self.sound_busy = true;
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            let read_name = name.clone();
-            let result = cx
-                .background_spawn(async move { crate::sounds::read_stored(&folder, &read_name) })
-                .await;
-            this.update(cx, |this, cx| {
-                this.sound_busy = false;
-                match result {
-                    Ok(bytes) => {
-                        crate::sounds::set_loaded(&name, bytes);
-                        this.config.notifications.sound_choice =
-                            clipper_storage::SoundChoice::Custom;
-                        this.sound_notice = None;
-                        this.persist_config(cx);
-                    }
-                    Err(message) => {
-                        this.sound_notice = Some((true, message));
-                        cx.notify();
-                    }
-                }
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    /// Loads the selected imported sound at startup. A missing or broken file
-    /// leaves the setting as is (the bundled sound plays meanwhile) and says
-    /// so in Settings.
-    pub(super) fn load_custom_sound(&mut self, cx: &mut Context<Self>) {
-        let Some(name) = self
-            .config
-            .notifications
-            .selected_custom_sound()
-            .map(str::to_owned)
-        else {
-            return;
-        };
-        let Ok(folder) = clipper_storage::sound_directory() else {
-            return;
-        };
-        cx.spawn(async move |this, cx| {
-            let read_name = name.clone();
-            let result = cx
-                .background_spawn(async move { crate::sounds::read_stored(&folder, &read_name) })
-                .await;
-            match result {
-                Ok(bytes) => crate::sounds::set_loaded(&name, bytes),
-                Err(message) => {
-                    clipper_diagnostics::log::warn!("custom notification sound: {message}");
-                    this.update(cx, |this, cx| {
-                        this.sound_notice = Some((true, message));
-                        cx.notify();
-                    })
-                    .ok();
-                }
-            }
-        })
-        .detach();
-    }
-
-    /// Picks a sound file, imports it off the UI thread and selects it. A
-    /// failed import keeps the previous sound and explains why.
-    fn import_clip_sound(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.sound_busy {
-            return;
-        }
-        let Ok(folder) = clipper_storage::sound_directory() else {
-            self.sound_notice = Some((true, "The sound folder is unavailable.".into()));
-            cx.notify();
-            return;
-        };
-        let paths = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: false,
-            prompt: Some("Import sound".into()),
-        });
-        self.sound_busy = true;
-        cx.notify();
-        cx.spawn_in(window, async move |this, cx| {
-            let picked = match paths.await {
-                Ok(Ok(Some(mut paths))) => paths.pop(),
-                _ => None,
-            };
-            let Some(source) = picked else {
-                this.update(cx, |this, cx| {
-                    this.sound_busy = false;
-                    cx.notify();
-                })
-                .ok();
-                return;
-            };
-            let result = cx
-                .background_spawn(async move {
-                    let name = clipper_media::notification_sound::import(&source, &folder)
-                        .map_err(|error| error.to_string())?;
-                    let bytes = crate::sounds::read_stored(&folder, &name)?;
-                    Ok::<_, String>((name, bytes))
-                })
-                .await;
-            this.update(cx, |this, cx| {
-                this.sound_busy = false;
-                match result {
-                    Ok((name, bytes)) => {
-                        crate::sounds::set_loaded(&name, bytes);
-                        clipper_diagnostics::log::info!("notification sound imported");
-                        this.config.notifications.custom_sound = Some(name.clone());
-                        this.config.notifications.sound_choice =
-                            clipper_storage::SoundChoice::Custom;
-                        this.sound_notice = Some((
-                            false,
-                            format!("Imported {}.", crate::sounds::display_name(&name)),
-                        ));
-                        this.persist_config(cx);
-                    }
-                    Err(message) => {
-                        clipper_diagnostics::log::warn!(
-                            "notification sound import failed: {message}"
-                        );
-                        this.sound_notice = Some((true, message));
-                        cx.notify();
-                    }
-                }
             })
             .ok();
         })
@@ -1947,6 +1732,80 @@ impl ClipperWindow {
         )
     }
 
+    fn notification_sound_controls(
+        &self,
+        t: &Theme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let available = !self.notification_sound_importing;
+        let custom = self.config.notifications.custom_sound.as_deref();
+        let selected = sound_file_label(custom);
+        let default = activatable(
+            button(
+                t,
+                "notify-default-sound",
+                "Default",
+                if custom.is_none() {
+                    ButtonVariant::Primary
+                } else {
+                    ButtonVariant::Secondary
+                },
+                None,
+                available,
+            ),
+            t,
+            TAB_SOUND,
+            window,
+            cx,
+            |this, _, cx| this.reset_notification_sound(cx),
+        );
+        let import = activatable(
+            button(
+                t,
+                "notify-custom-sound",
+                if self.notification_sound_importing {
+                    "Choosing / importing…"
+                } else {
+                    "Custom WAV…"
+                },
+                if custom.is_some() {
+                    ButtonVariant::Primary
+                } else {
+                    ButtonVariant::Secondary
+                },
+                None,
+                available,
+            ),
+            t,
+            TAB_SOUND + 1,
+            window,
+            cx,
+            |this, window, cx| this.choose_notification_sound(window, cx),
+        );
+        let preview = activatable(
+            button(
+                t,
+                "notify-preview-sound",
+                "Preview",
+                ButtonVariant::Ghost,
+                None,
+                available,
+            ),
+            t,
+            TAB_SOUND + 2,
+            window,
+            cx,
+            |this, _, _| this.preview_notification_sound(),
+        );
+        div().flex().flex_col().gap_2().pl_1()
+            .child(div().flex().flex_wrap().items_center().gap_2().child(default).child(import).child(preview))
+            .child(div().id("notification-sound-selection").min_w_0().text_sm().text_color(t.colors.text_secondary)
+                .truncate().tooltip(tooltip(selected.clone())).child(selected))
+            .child(note(t, "For saved clips and notification alerts. WAV: PCM 8/16-bit, mono/stereo, up to 10 seconds and 5 MiB. Imported into clipuh; Preview plays even when automatic sounds are off."))
+            .children(self.notification_sound_notice.clone().map(|message| note(t, message)))
+    }
+
     fn settings_general_card(
         &self,
         t: &Theme,
@@ -2010,6 +1869,7 @@ impl ClipperWindow {
             cx,
             |this, on, cx| this.sync_startup(Some(on), cx),
         );
+        let sound_controls = self.notification_sound_controls(t, window, cx);
         card(t, 6)
             .child(startup)
             .children(self.startup_error.clone().map(|error| error_note(t, error)))
@@ -2044,7 +1904,7 @@ impl ClipperWindow {
                 window,
                 cx,
             ))
-            .child(self.clip_sound_section(t, notify_on && notifications.sound, window, cx))
+            .child(sound_controls)
             .child(notify(
                 "notify-open",
                 "Show Open Clip action",
@@ -2426,6 +2286,32 @@ pub(super) fn content(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sound_selection_label_shows_filename_without_exposing_folders() {
+        assert_eq!(sound_file_label(None), "Default Windows sound");
+        assert_eq!(
+            sound_file_label(Some(Path::new("C:/Users/private/sounds/Clip ready.wav"))),
+            "Clip ready.wav"
+        );
+    }
+
+    #[test]
+    fn sound_import_cancel_or_failure_preserves_previous_selection() {
+        let mut settings = NotificationSettings::default();
+        let previous = PathBuf::from("C:/clipuh/sounds/old.wav");
+        settings.custom_sound = Some(previous.clone());
+        assert_eq!(apply_sound_import(&mut settings, Ok(None)), Ok(false));
+        assert_eq!(settings.custom_sound, Some(previous.clone()));
+        assert!(apply_sound_import(&mut settings, Err("Invalid WAV".into())).is_err());
+        assert_eq!(settings.custom_sound, Some(previous));
+        let imported = PathBuf::from("C:/clipuh/sounds/new.wav");
+        assert_eq!(
+            apply_sound_import(&mut settings, Ok(Some(imported.clone()))),
+            Ok(true)
+        );
+        assert_eq!(settings.custom_sound, Some(imported));
+    }
 
     const NONE: Modifiers = Modifiers {
         ctrl: false,

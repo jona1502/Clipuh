@@ -1,8 +1,8 @@
 use clipper_core::hotkey::{DEFAULT_SAVE_REPLAY, Hotkey};
 use clipper_core::recording::{
-    AudioSourceTarget, MAX_AUDIO_GAIN_PERCENT, MAX_RECORDED_AUDIO_SOURCES, QualityProfile,
-    REPLAY_DURATIONS_SECONDS, RecordingAudioOptions, RecordingAudioSource, RecordingOptions,
-    ReplayOptions, h264_supports,
+    AudioSourceTarget, MAX_AUDIO_GAIN_PERCENT, MAX_RECORDED_AUDIO_SOURCES, NoiseGateSettings,
+    QualityProfile, REPLAY_DURATIONS_SECONDS, RecordingAudioOptions, RecordingAudioSource,
+    RecordingOptions, ReplayOptions, h264_supports,
 };
 use directories::{BaseDirs, ProjectDirs, UserDirs};
 use serde::{Deserialize, Serialize};
@@ -47,7 +47,7 @@ static SAVE_LOCK: Mutex<()> = Mutex::new(());
 /// Per-user settings for the Clipper application.
 ///
 /// TOML input may omit fields; missing values are supplied from the defaults.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
     pub video: VideoSettings,
@@ -417,7 +417,7 @@ fn default_gain() -> u16 {
 }
 
 /// One `[[audio.sources]]` row.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AudioSourceSettings {
     /// Stable and unique while the row exists.
     pub id: u32,
@@ -430,6 +430,8 @@ pub struct AudioSourceSettings {
     pub enabled: bool,
     #[serde(default = "default_gain")]
     pub gain_percent: u16,
+    #[serde(default)]
+    pub noise_gate: NoiseGateSettings,
     /// Contributes silence while keeping its track and its gain setting.
     #[serde(default, skip_serializing_if = "is_false")]
     pub muted: bool,
@@ -489,7 +491,7 @@ fn lenient_sources<'de, D: serde::Deserializer<'de>>(
         .collect())
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AudioSettings {
     pub separate_tracks: bool,
@@ -525,6 +527,7 @@ impl Default for AudioSettings {
             target: None,
             enabled: true,
             gain_percent: 100,
+            noise_gate: NoiseGateSettings::default(),
             muted: false,
             solo: false,
         };
@@ -585,6 +588,7 @@ impl AudioSettings {
                         id: s.id,
                         target: s.recording_target()?,
                         gain_percent: self.effective_gain_percent(s.id),
+                        noise_gate: s.noise_gate.sanitized(),
                     })
                 })
                 .collect(),
@@ -622,6 +626,7 @@ impl AudioSettings {
                     target,
                     enabled: enabled.unwrap_or(true),
                     gain_percent: gain.unwrap_or(100),
+                    noise_gate: NoiseGateSettings::default(),
                     muted: false,
                     solo: false,
                 };
@@ -646,6 +651,7 @@ impl AudioSettings {
         let mut kept: Vec<AudioSourceSettings> = Vec::new();
         for mut row in std::mem::take(&mut self.sources) {
             row.gain_percent = row.gain_percent.min(MAX_AUDIO_GAIN_PERCENT);
+            row.noise_gate = row.noise_gate.sanitized();
             let invalid = kept.iter().any(|k| k.id == row.id)
                 || row.recording_target().is_none()
                 || find_duplicate(&kept, row.kind, row.target.as_deref()).is_some();
@@ -681,6 +687,9 @@ impl AudioSettings {
             }
             if row.gain_percent > MAX_AUDIO_GAIN_PERCENT {
                 problem("gain must be between 0 and 200 percent");
+            }
+            if row.noise_gate != row.noise_gate.sanitized() {
+                problem("noise gate parameters must be finite and within their supported ranges");
             }
             if row.recording_target().is_none() {
                 problem("an application source needs an executable name");
@@ -759,6 +768,9 @@ pub struct NotificationSettings {
     pub duration_seconds: u32,
     /// Play a sound with the notification.
     pub sound: bool,
+    /// Application-owned imported WAV. None preserves the system sound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_sound: Option<PathBuf>,
     /// Offer an action to open the saved clip.
     pub open_clip_action: bool,
     /// Also notify when saving a clip fails.
@@ -769,51 +781,6 @@ pub struct NotificationSettings {
     /// Show native Windows notifications from the tray icon for important
     /// events while the main window is not in front. Needs the tray icon.
     pub native: bool,
-    /// Which sound plays when a clip was saved (`sound` switches it off).
-    #[serde(deserialize_with = "lenient_default")]
-    pub sound_choice: SoundChoice,
-    /// File name of the imported sound inside [`sound_directory`]. Only a
-    /// bare file name is kept; anything path-like is dropped on load.
-    #[serde(deserialize_with = "lenient_sound_file")]
-    pub custom_sound: Option<String>,
-}
-
-/// The clip-saved sound.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SoundChoice {
-    /// The bundled clipuh sound (`clipuh_05_synth_check.wav`).
-    #[default]
-    Default,
-    /// The imported sound in `custom_sound`.
-    Custom,
-}
-
-impl NotificationSettings {
-    /// The imported sound's file name when it is the selected sound.
-    pub fn selected_custom_sound(&self) -> Option<&str> {
-        match self.sound_choice {
-            SoundChoice::Custom => self.custom_sound.as_deref(),
-            SoundChoice::Default => None,
-        }
-    }
-}
-
-/// A bare file name (no folders, no `..`), as stored for imported sounds.
-pub fn is_plain_file_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 255
-        && !name.contains(['/', '\\', ':'])
-        && name != "."
-        && name != ".."
-}
-
-fn lenient_sound_file<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let name: Option<String> = lenient_option(deserializer)?;
-    Ok(name.filter(|name| is_plain_file_name(name)))
 }
 
 impl Default for NotificationSettings {
@@ -822,12 +789,11 @@ impl Default for NotificationSettings {
             enabled: true,
             duration_seconds: 4,
             sound: true,
+            custom_sound: None,
             open_clip_action: true,
             notify_on_failure: true,
             in_app: true,
             native: true,
-            sound_choice: SoundChoice::Default,
-            custom_sound: None,
         }
     }
 }
@@ -987,12 +953,6 @@ pub fn default_recording_directory() -> Result<PathBuf, ConfigError> {
         .map(Path::to_path_buf)
         .unwrap_or_else(|| user_dirs.home_dir().join("Videos"));
     Ok(videos.join("Clipper"))
-}
-
-/// Imported notification sounds (`%LOCALAPPDATA%\\Clipper\\sounds`).
-pub fn sound_directory() -> Result<PathBuf, ConfigError> {
-    let base = BaseDirs::new().ok_or(ConfigError::NoConfigDirectory)?;
-    Ok(base.data_local_dir().join("Clipper").join("sounds"))
 }
 
 /// Returns the default replay SSD cache directory
@@ -1315,6 +1275,49 @@ mod tests {
         let loaded: AppConfig = toml::from_str(&toml).expect("deserialize config");
 
         assert_eq!(loaded, config);
+    }
+
+    #[test]
+    fn noise_gate_persists_per_source_and_routes_to_recording() {
+        let dir = TestDir::new();
+        let path = dir.path("gate.toml");
+        let mut config = AppConfig::default();
+        config.audio.sources[1].noise_gate = NoiseGateSettings {
+            enabled: true,
+            threshold_db: -38.5,
+            attack_ms: 7.0,
+            hold_ms: 125.0,
+            release_ms: 230.0,
+        };
+        config.audio.sources[1].muted = true;
+        config.save_to(&path).unwrap();
+        let loaded = AppConfig::load_from(&path).unwrap();
+        assert_eq!(loaded.audio, config.audio);
+        let routed = loaded.audio.recording_options();
+        assert!(!routed.sources[0].noise_gate.enabled);
+        assert_eq!(
+            routed.sources[1].noise_gate,
+            config.audio.sources[1].noise_gate
+        );
+        assert_eq!(routed.sources[1].gain_percent, 0);
+    }
+
+    #[test]
+    fn noise_gate_legacy_defaults_and_malformed_config_repair() {
+        let config = load_text("[[audio.sources]]\nid = 1\nkind = \"microphone\"\n");
+        assert_eq!(
+            config.audio.sources[0].noise_gate,
+            NoiseGateSettings::default()
+        );
+        let config = load_text(
+            "[[audio.sources]]\nid = 1\nkind = \"microphone\"\n[audio.sources.noise_gate]\nenabled = true\nthreshold_db = nan\nattack_ms = inf\nhold_ms = -99\nrelease_ms = 99999\n",
+        );
+        let gate = config.audio.sources[0].noise_gate;
+        assert_eq!(gate.threshold_db, -45.0);
+        assert_eq!(gate.attack_ms, 5.0);
+        assert_eq!(gate.hold_ms, 0.0);
+        assert_eq!(gate.release_ms, 2000.0);
+        assert!(config.validate().is_ok());
     }
 
     #[test]
@@ -1756,6 +1759,7 @@ mod tests {
             target: target.map(str::to_owned),
             enabled: true,
             gain_percent: 100,
+            noise_gate: NoiseGateSettings::default(),
             muted: false,
             solo: false,
         }
@@ -2146,16 +2150,38 @@ hotkey = \"F9\"
             enabled: false,
             duration_seconds: 7,
             sound: false,
+            custom_sound: None,
             open_clip_action: false,
             notify_on_failure: false,
             in_app: false,
             native: false,
-            sound_choice: SoundChoice::Custom,
-            custom_sound: Some("ping-00ff.wav".to_owned()),
         };
         let path = temp.path("custom.toml");
         config.save_to(&path).expect("save");
         assert_eq!(AppConfig::load_from(&path).expect("load"), config);
+    }
+
+    #[test]
+    fn imported_notification_sound_setting_survives_restart_and_reset() {
+        let temp = TestDir::new();
+        let path = temp.path("sound.toml");
+        let mut config = AppConfig::default();
+        assert_eq!(config.notifications.custom_sound, None);
+        config.notifications.custom_sound = Some(temp.path("sounds/Chime.wav"));
+        config.save_to(&path).unwrap();
+        assert_eq!(
+            AppConfig::load_from(&path).unwrap().notifications,
+            config.notifications
+        );
+        config.notifications.custom_sound = None;
+        config.save_to(&path).unwrap();
+        assert_eq!(
+            AppConfig::load_from(&path)
+                .unwrap()
+                .notifications
+                .custom_sound,
+            None
+        );
     }
 
     #[test]

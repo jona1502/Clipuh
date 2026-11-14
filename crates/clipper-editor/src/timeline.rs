@@ -22,6 +22,15 @@ pub const ZOOM_CEILING: f32 = 4096.0;
 /// Zoom factor of one button press or one Ctrl+wheel notch.
 pub const ZOOM_STEP: f32 = 1.25;
 
+/// Zoom factor for a Ctrl+wheel movement of `lines` (positive = wheel up =
+/// zoom in). One mouse-wheel notch is three lines on Windows and zooms by
+/// [`ZOOM_STEP`]; precision touchpads (pinch) send fractions and zoom
+/// proportionally. `None` for no movement.
+pub fn wheel_zoom_factor(lines: f32) -> Option<f32> {
+    let notches = lines / 3.;
+    (notches != 0. && notches.is_finite()).then(|| ZOOM_STEP.powf(notches.clamp(-3., 3.)))
+}
+
 /// Largest useful zoom for `duration` shown in `viewport_width` pixels.
 pub fn max_zoom(duration: Duration, viewport_width: f32) -> f32 {
     if viewport_width <= 0. || duration.is_zero() {
@@ -175,6 +184,18 @@ mod tests {
         assert_eq!(clamp_zoom(0.2, s(60.), 1000.), MIN_ZOOM);
         assert_eq!(clamp_zoom(f32::NAN, s(60.), 1000.), MIN_ZOOM);
         assert!((clamp_zoom(500., s(60.), 1000.) - 36.).abs() < 0.01);
+    }
+
+    #[test]
+    fn wheel_zooms_in_up_out_down_and_ignores_no_movement() {
+        assert_eq!(wheel_zoom_factor(3.), Some(ZOOM_STEP));
+        assert!((wheel_zoom_factor(-3.).unwrap() - 1. / ZOOM_STEP).abs() < 1e-6);
+        let pinch = wheel_zoom_factor(0.3).unwrap();
+        assert!(pinch > 1. && pinch < ZOOM_STEP);
+        // A fast spin is capped at three steps per event.
+        assert_eq!(wheel_zoom_factor(300.), Some(ZOOM_STEP.powf(3.)));
+        assert_eq!(wheel_zoom_factor(0.), None);
+        assert_eq!(wheel_zoom_factor(f32::NAN), None);
     }
 
     #[test]

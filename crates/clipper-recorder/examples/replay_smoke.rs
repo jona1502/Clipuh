@@ -17,6 +17,8 @@
 //! * `desktop`/`mic` 1 or 0 (default 1 / 0)
 //! * `fps`      capture frame rate (default 60)
 //! * `profile`  `performance`, `balanced` or `quality` (default balanced)
+//! * `gate`     1 enables the mic gate and toggles it live at run thirds (default 0)
+//! * `separate` 1 writes isolated source tracks alongside the mix (default 0)
 #[cfg(windows)]
 fn main() {
     smoke::run();
@@ -113,6 +115,8 @@ mod smoke {
         let fps = number("fps", 60) as u32;
         let desktop = number("desktop", 1) != 0;
         let mic = number("mic", 0) != 0;
+        let gate = number("gate", 0) != 0;
+        let separate = number("separate", 0) != 0;
         let profile = match args.get("profile").map(String::as_str) {
             Some("performance") => QualityProfile::Performance,
             Some("quality") => QualityProfile::Quality,
@@ -180,11 +184,16 @@ mod smoke {
                             .zip(1..)
                             .map(|((_, target), id)| RecordingAudioSource {
                                 id,
-                                target,
                                 gain_percent: 100,
+                                noise_gate: clipper_core::recording::NoiseGateSettings {
+                                    enabled: gate
+                                        && matches!(&target, AudioSourceTarget::Microphone(_)),
+                                    ..Default::default()
+                                },
+                                target,
                             })
                             .collect(),
-                            separate_tracks: false,
+                            separate_tracks: separate,
                         },
                         width: 1920,
                         height: 1080,
@@ -220,8 +229,27 @@ mod smoke {
 
         let begin = Instant::now();
         let mut set_sent = false;
+        let mut gate_changes = 0;
         let mut max_tier = None;
         while begin.elapsed() < run_for {
+            if gate
+                && mic
+                && gate_changes < 2
+                && begin.elapsed() >= run_for.mul_f64(f64::from(gate_changes + 1) / 3.0)
+            {
+                let enabled = gate_changes == 1;
+                handle
+                    .send(RecorderCommand::SetAudioNoiseGate {
+                        source: if desktop { 2 } else { 1 },
+                        settings: clipper_core::recording::NoiseGateSettings {
+                            enabled,
+                            ..Default::default()
+                        },
+                    })
+                    .expect("send gate update");
+                println!("-- microphone Noise Gate enabled={enabled}");
+                gate_changes += 1;
+            }
             if let Some((seconds, at)) = set_duration
                 && !set_sent
                 && begin.elapsed() >= at
