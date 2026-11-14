@@ -27,9 +27,8 @@ pub(crate) struct StorageProjectionKey {
     codec: VideoCodec,
     quality: clipper_storage::config::QualityPreset,
     bitrate_mbps: u32,
-    desktop_audio: bool,
-    microphone_audio: bool,
-    separate_tracks: bool,
+    /// Encoded audio tracks (enabled sources plus the mix); the only audio input.
+    audio_tracks: u32,
     replay_duration_seconds: u32,
     replay_memory_limit_megabytes: u32,
 }
@@ -43,9 +42,7 @@ impl From<&AppConfig> for StorageProjectionKey {
             codec: config.video.codec,
             quality: config.recording.quality,
             bitrate_mbps: config.video.bitrate_mbps,
-            desktop_audio: config.audio.desktop,
-            microphone_audio: config.audio.microphone,
-            separate_tracks: config.audio.separate_tracks,
+            audio_tracks: config.audio.recording_options().encoded_track_count(),
             replay_duration_seconds: config.replay.duration_seconds,
             replay_memory_limit_megabytes: config.replay.memory_limit_megabytes,
         }
@@ -310,7 +307,9 @@ pub struct RecordingState {
 impl RecordingState {
     pub fn apply(&mut self, event: RecorderEvent) {
         match event {
-            RecorderEvent::AudioLevels { .. }
+            // Mixer meters and source status live in `ClipperWindow`, not here.
+            RecorderEvent::AudioLevels(_)
+            | RecorderEvent::AudioSources(_)
             | RecorderEvent::AudioTestStarted
             | RecorderEvent::AudioTestFinished { .. } => {}
             RecorderEvent::SourcesListed(sources) => {
@@ -627,7 +626,7 @@ mod tests {
             Ok(projection)
         }));
 
-        config.audio.microphone_gain_percent = 50;
+        config.audio.sources[1].gain_percent = 50;
         config.notifications.enabled = false;
         assert_eq!(StorageProjectionKey::from(&config), key);
         assert!(

@@ -10,7 +10,7 @@ use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerforma
 use super::stream::{LevelCell, StreamSource, StreamThread};
 use super::{endpoint, process};
 use crate::ring::{AudioConsumer, RingStats};
-use crate::routing::{self, RoutingWarning, StreamPlan};
+use crate::routing::{self, RoutingPlan, RoutingWarning, StreamPlan};
 use crate::types::{
     AudioConfig, AudioError, AudioEvent, AudioFrameRef, AudioLevels, AudioSelection, SAMPLE_RATE,
     TICKS_PER_SECOND, TrackInfo,
@@ -26,7 +26,7 @@ pub struct CaptureSummary {
 /// Running audio capture: one dedicated thread per track.
 pub struct AudioCapture {
     tracks: Vec<TrackInfo>,
-    warnings: Vec<RoutingWarning>,
+    warnings: Vec<(u32, RoutingWarning)>,
     consumers: Vec<AudioConsumer>,
     levels: Vec<Arc<LevelCell>>,
     stats: Vec<Arc<RingStats>>,
@@ -51,20 +51,21 @@ pub fn qpc_now_ticks() -> i64 {
 }
 
 impl AudioCapture {
-    /// Plans routing for `selection`, opens rings and starts every track.
+    /// Plans routing for `selection` and starts it (no consumer wake-up).
     pub fn start(selection: &AudioSelection, config: AudioConfig) -> Result<Self, AudioError> {
-        Self::start_with_device(selection, config, None, None)
+        let plan = routing::plan(selection, process::capabilities());
+        Self::start_plan(&plan, config, None)
     }
 
-    /// Starts capture of an explicit render endpoint, waking the consumer only
-    /// when packets/events arrive. The callback must never block or allocate.
-    pub fn start_with_device(
-        selection: &AudioSelection,
+    /// Starts exactly `plan`, waking the consumer only when packets/events
+    /// arrive. The callback must never block or allocate. A process source
+    /// whose app is not running does not fail the start: its thread reports
+    /// `SourceLost` and keeps retrying.
+    pub fn start_plan(
+        plan: &RoutingPlan,
         config: AudioConfig,
-        output_device: Option<&str>,
         wake: Option<std::sync::mpsc::SyncSender<()>>,
     ) -> Result<Self, AudioError> {
-        let plan = routing::plan(selection, process::capabilities());
         if plan.tracks.is_empty() {
             return Err(AudioError::NothingToCapture);
         }
@@ -80,8 +81,8 @@ impl AudioCapture {
 
         for (index, planned) in plan.tracks.iter().enumerate() {
             let (channels, source): (u16, Box<dyn StreamSource>) = match &planned.stream {
-                StreamPlan::EndpointLoopback => {
-                    (2, endpoint::selected_loopback_source(output_device))
+                StreamPlan::EndpointLoopback(device) => {
+                    (2, endpoint::selected_loopback_source(device.as_deref()))
                 }
                 StreamPlan::Microphone(choice) => (
                     endpoint::microphone_channels(choice),
@@ -115,6 +116,7 @@ impl AudioCapture {
             }
             tracks.push(TrackInfo {
                 index,
+                source: planned.source,
                 content: planned.content.clone(),
                 channels,
                 sample_rate: SAMPLE_RATE,
@@ -125,7 +127,7 @@ impl AudioCapture {
 
         Ok(Self {
             tracks,
-            warnings: plan.warnings,
+            warnings: plan.warnings.clone(),
             consumers,
             levels,
             stats,
@@ -139,7 +141,7 @@ impl AudioCapture {
         &self.tracks
     }
 
-    pub fn warnings(&self) -> &[RoutingWarning] {
+    pub fn warnings(&self) -> &[(u32, RoutingWarning)] {
         &self.warnings
     }
 
@@ -250,17 +252,22 @@ mod tests {
 
     #[test]
     fn unavailable_endpoint_failure_stays_latched_without_consuming_notifications() {
-        let selection = AudioSelection {
-            desktop: true,
-            ..Default::default()
+        let plan = RoutingPlan {
+            tracks: vec![routing::PlannedTrack {
+                source: 1,
+                content: crate::types::TrackContent::DesktopFull,
+                stream: StreamPlan::EndpointLoopback(Some(
+                    "clipper-nonexistent-test-endpoint".to_owned(),
+                )),
+            }],
+            warnings: Vec::new(),
         };
-        let capture = AudioCapture::start_with_device(
-            &selection,
+        let capture = AudioCapture::start_plan(
+            &plan,
             AudioConfig {
                 event_capacity: 1,
                 ..Default::default()
             },
-            Some("clipper-nonexistent-test-endpoint"),
             None,
         )
         .unwrap();

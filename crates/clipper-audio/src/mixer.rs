@@ -8,7 +8,10 @@ const CAPACITY: usize = SAMPLE_RATE as usize;
 struct Track {
     samples: Vec<[f32; 2]>,
     positions: Vec<i64>,
+    /// Gain applied right now; moves towards `target` by `step` per sample.
     gain: f32,
+    target: f32,
+    step: f32,
     received: u64,
     next_position: Option<i64>,
 }
@@ -25,11 +28,27 @@ pub struct TimelineMixer {
     /// Samples before this position are ignored silently (see `skip_to`).
     skipped_until: i64,
     mixed: Vec<f32>,
+    /// One block per track, already gained and limited.
     isolated: Vec<f32>,
+}
+
+/// Output limiter: identity up to [`KNEE`], then a smooth curve that
+/// approaches (never reaches) full scale, so gain above 100 % cannot wrap or
+/// clip hard. Slope is continuous at the knee.
+const KNEE: f32 = 0.9;
+
+fn soft_limit(x: f32) -> f32 {
+    let a = x.abs();
+    if a <= KNEE {
+        return x;
+    }
+    let t = (a - KNEE) / (1.0 - KNEE);
+    (KNEE + (1.0 - KNEE) * t / (1.0 + t)).copysign(x)
 }
 
 impl TimelineMixer {
     pub fn new(origin: i64, gains: Vec<f32>, separate: bool) -> Self {
+        let count = gains.len();
         Self {
             origin,
             position: 0,
@@ -39,6 +58,8 @@ impl TimelineMixer {
                     samples: vec![[0.0; 2]; CAPACITY],
                     positions: vec![-1; CAPACITY],
                     gain,
+                    target: gain,
+                    step: 0.0,
                     received: 0,
                     next_position: None,
                 })
@@ -47,8 +68,26 @@ impl TimelineMixer {
             late: 0,
             skipped_until: 0,
             mixed: vec![0.0; BLOCK * 2],
-            isolated: vec![0.0; BLOCK * 2],
+            isolated: vec![0.0; BLOCK * 2 * count],
         }
+    }
+
+    /// Ramps track `index` linearly to `gain` over one 480-frame block (no
+    /// click). Out-of-range indexes and non-finite gains are ignored.
+    pub fn set_gain(&mut self, index: usize, gain: f32) {
+        if let Some(track) = self.tracks.get_mut(index)
+            && gain.is_finite()
+        {
+            track.target = gain.max(0.0);
+            track.step = (track.target - track.gain) / BLOCK as f32;
+        }
+    }
+
+    /// Whether track `index` has delivered at least one sample.
+    pub fn has_received(&self, index: usize) -> bool {
+        self.tracks
+            .get(index)
+            .is_some_and(|track| track.received > 0)
     }
 
     pub fn late_frames(&self) -> u64 {
@@ -101,13 +140,7 @@ impl TimelineMixer {
                 continue;
             }
             let slot = position as usize % CAPACITY;
-            let clean = |value: f32| {
-                if value.is_finite() {
-                    value * track.gain
-                } else {
-                    0.0
-                }
-            };
+            let clean = |value: f32| if value.is_finite() { value } else { 0.0 };
             track.samples[slot] = [clean(frame[0]), clean(frame[channels.min(2) - 1])];
             track.positions[slot] = position;
             track.received += 1;
@@ -135,33 +168,43 @@ impl TimelineMixer {
         while self.position < end {
             let count = ((end - self.position) as usize).min(BLOCK);
             self.mixed[..count * 2].fill(0.0);
-            for track in &self.tracks {
+            for (index, track) in self.tracks.iter_mut().enumerate() {
+                let out = &mut self.isolated[index * BLOCK * 2..][..count * 2];
                 for offset in 0..count {
-                    let position = self.position + offset as i64;
-                    let slot = position as usize % CAPACITY;
-                    if track.positions[slot] == position {
-                        self.mixed[offset * 2] += track.samples[slot][0];
-                        self.mixed[offset * 2 + 1] += track.samples[slot][1];
+                    if track.gain != track.target {
+                        track.gain += track.step;
+                        if (track.step > 0.0 && track.gain >= track.target)
+                            || (track.step < 0.0 && track.gain <= track.target)
+                        {
+                            track.gain = track.target;
+                        }
+                    }
+                    let slot = (self.position + offset as i64) as usize % CAPACITY;
+                    let present = track.positions[slot] == self.position + offset as i64;
+                    for channel in 0..2 {
+                        let value = if present {
+                            track.samples[slot][channel] * track.gain
+                        } else {
+                            0.0
+                        };
+                        self.mixed[offset * 2 + channel] += value;
+                        out[offset * 2 + channel] = soft_limit(value);
                     }
                 }
             }
-            crate::mix::clamp(&mut self.mixed[..count * 2]);
+            for value in &mut self.mixed[..count * 2] {
+                *value = soft_limit(*value);
+            }
             let time = (i128::from(self.position) * i128::from(TICKS_PER_SECOND)
                 / i128::from(SAMPLE_RATE)) as i64;
             write(0, time, &self.mixed[..count * 2])?;
             if self.separate {
-                for (index, track) in self.tracks.iter().enumerate() {
-                    self.isolated[..count * 2].fill(0.0);
-                    for offset in 0..count {
-                        let position = self.position + offset as i64;
-                        let slot = position as usize % CAPACITY;
-                        if track.positions[slot] == position {
-                            self.isolated[offset * 2..offset * 2 + 2]
-                                .copy_from_slice(&track.samples[slot]);
-                        }
-                    }
-                    crate::mix::clamp(&mut self.isolated[..count * 2]);
-                    write(index + 1, time, &self.isolated[..count * 2])?;
+                for index in 0..self.tracks.len() {
+                    write(
+                        index + 1,
+                        time,
+                        &self.isolated[index * BLOCK * 2..][..count * 2],
+                    )?;
                 }
             }
             self.position += count as i64;
@@ -187,6 +230,60 @@ mod tests {
             })
             .unwrap();
         assert_eq!(blocks, vec![(0, 0, 0.4), (1, 0, 0.2), (2, 0, 0.2)]);
+    }
+
+    fn render(mixer: &mut TimelineMixer, end: i64) -> Vec<(usize, Vec<f32>)> {
+        let mut out = Vec::new();
+        mixer
+            .render_until(end, |track, _, samples| {
+                out.push((track, samples.to_vec()));
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        out
+    }
+
+    #[test]
+    fn gain_ramps_over_one_block_without_a_step() {
+        let mut mixer = TimelineMixer::new(0, vec![1.0], false);
+        mixer.push(0, 0, 1, &[0.5; 1440]);
+        mixer.set_gain(0, 0.0);
+        let blocks = render(&mut mixer, 300_000);
+        let all: Vec<f32> = blocks
+            .iter()
+            .flat_map(|(_, b)| b.iter().step_by(2).copied())
+            .collect();
+        assert!(all[0] < 0.5 && all[0] > 0.49);
+        assert!(all.windows(2).all(|w| w[1] <= w[0] && w[0] - w[1] < 0.002));
+        assert_eq!(all[479], 0.0);
+        assert_eq!(all[1000], 0.0);
+    }
+
+    #[test]
+    fn zero_gain_is_silence_and_unity_is_unchanged() {
+        let mut mixer = TimelineMixer::new(0, vec![0.0, 1.0], true);
+        mixer.push(0, 0, 1, &[0.8; 480]);
+        mixer.push(1, 0, 1, &[0.25; 480]);
+        let blocks = render(&mut mixer, 100_000);
+        assert!(blocks[1].1.iter().all(|v| *v == 0.0));
+        assert!(blocks[2].1.iter().all(|v| *v == 0.25));
+        assert!(blocks[0].1.iter().all(|v| *v == 0.25));
+    }
+
+    #[test]
+    fn double_gain_on_full_scale_stays_within_range() {
+        let mut mixer = TimelineMixer::new(0, vec![2.0, 2.0], true);
+        mixer.push(0, 0, 1, &[1.0; 480]);
+        mixer.push(1, 0, 1, &[-1.0; 480]);
+        let blocks = render(&mut mixer, 100_000);
+        for (_, block) in blocks {
+            assert!(block.iter().all(|v| (-1.0..=1.0).contains(v)));
+        }
+        let mut loud = TimelineMixer::new(0, vec![2.0, 2.0], false);
+        loud.push(0, 0, 1, &[1.0; 480]);
+        loud.push(1, 0, 1, &[1.0; 480]);
+        let blocks = render(&mut loud, 100_000);
+        assert!(blocks[0].1.iter().all(|v| *v > 0.99 && *v <= 1.0));
     }
 
     #[test]

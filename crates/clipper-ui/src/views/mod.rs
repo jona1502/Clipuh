@@ -73,6 +73,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("enter", Confirm, dropdown),
         KeyBinding::new("space", Confirm, dropdown),
         KeyBinding::new("escape", Dismiss, dropdown),
+        KeyBinding::new("escape", Dismiss, Some(audio::ADD_CONTEXT)),
         KeyBinding::new("space", editor::TogglePlayback, Some(editor::CONTEXT)),
         KeyBinding::new("i", editor::SetIn, Some(editor::CONTEXT)),
         KeyBinding::new("o", editor::SetOut, Some(editor::CONTEXT)),
@@ -210,9 +211,25 @@ pub struct ClipperWindow {
     palette: Option<CommandPalette>,
     config_persistence: std::sync::Arc<crate::state::SettingsSaveOrder>,
     audio_devices: Vec<clipper_audio::AudioDevice>,
-    audio_menu: Option<clipper_audio::DeviceFlow>,
+    audio_apps: Vec<clipper_audio::windows::AudioApplication>,
+    audio_capabilities: Option<clipper_audio::AudioCapabilities>,
+    /// Open target dropdown: (mixer source id, highlighted row).
+    audio_menu: Option<(u32, usize)>,
     audio_loading: bool,
-    audio_levels: (f32, f32),
+    /// Latest per-source peaks and engine state; empty when no session runs.
+    audio_levels: Vec<clipper_core::recording::SourceLevel>,
+    audio_sources: Vec<clipper_core::recording::AudioSourceState>,
+    /// Add Source popup step; `None` is closed.
+    audio_add: Option<audio::AddStep>,
+    audio_add_focus: FocusHandle,
+    audio_add_note: Option<String>,
+    audio_notice: Option<String>,
+    /// A gain changed and is not saved yet (saved when the drag or key press ends).
+    audio_gain_dirty: bool,
+    audio_focus: std::cell::RefCell<std::collections::HashMap<u32, audio::RowFocus>>,
+    /// Audio handles that held focus at the last render (components get no `Window`),
+    /// as (row id, slot); see `ClipperWindow::is_focused` in `audio.rs`.
+    audio_focused: std::cell::RefCell<std::collections::HashSet<(u32, u8)>>,
     audio_testing: bool,
     audio_test_path: Option<String>,
     /// Replay was enabled in the config and has not been auto-started yet.
@@ -273,16 +290,25 @@ impl ClipperWindow {
                     RecorderEvent::ReplaySaved { .. } | RecorderEvent::RecordingFinished { .. }
                 );
                 let updated = this.update_in(cx, |this, window, cx| {
+                    let mut quiet = false;
                     this.storage_projection_run.apply_event(&event);
                     match &event {
-                        RecorderEvent::AudioLevels {
-                            desktop,
-                            microphone,
-                        } => this.audio_levels = (*desktop, *microphone),
+                        RecorderEvent::AudioLevels(levels) => {
+                            this.audio_levels = levels.clone();
+                            // Meters only exist on the Capture page: store, don't redraw.
+                            quiet = !levels.is_empty() && this.active_page != Page::Dashboard;
+                        }
+                        RecorderEvent::AudioSources(states) => {
+                            this.audio_sources = states.clone();
+                            if states.is_empty() {
+                                this.audio_levels.clear();
+                            }
+                        }
                         RecorderEvent::AudioTestStarted => this.audio_testing = true,
                         RecorderEvent::AudioTestFinished { path, error } => {
                             this.audio_testing = false;
-                            this.audio_levels = (0.0, 0.0);
+                            this.audio_levels.clear();
+                            this.audio_sources.clear();
                             this.audio_test_path =
                                 path.as_ref().map(|path| path.display().to_string());
                             if let Some(error) = error {
@@ -290,9 +316,10 @@ impl ClipperWindow {
                             }
                         }
                         RecorderEvent::RecordingFinished { .. }
-                        | RecorderEvent::RecordingFailed { .. } => this.audio_levels = (0.0, 0.0),
+                        | RecorderEvent::RecordingFailed { .. } => this.audio_levels.clear(),
                         RecorderEvent::Stopped => {
-                            this.audio_levels = (0.0, 0.0);
+                            this.audio_levels.clear();
+                            this.audio_sources.clear();
                             this.audio_testing = false;
                         }
                         _ => {}
@@ -314,7 +341,9 @@ impl ClipperWindow {
                     if let Some(toast) = toast {
                         this.notifier.show(toast, &this.config.notifications, cx);
                     }
-                    cx.notify();
+                    if !quiet {
+                        cx.notify();
+                    }
                 });
                 if updated.is_err() {
                     return;
@@ -323,7 +352,8 @@ impl ClipperWindow {
             // Channel closed without a final event: the worker is gone.
             let _ = this.update(cx, |this, cx| {
                 this.audio_testing = false;
-                this.audio_levels = (0.0, 0.0);
+                this.audio_levels.clear();
+                this.audio_sources.clear();
                 this.storage_projection_run.clear();
                 if this.recording.phase != Phase::Idle || !this.recording.replay.is_off() {
                     this.recording.apply(RecorderEvent::Stopped);
@@ -380,9 +410,19 @@ impl ClipperWindow {
             palette: None,
             config_persistence: Default::default(),
             audio_devices: Vec::new(),
+            audio_apps: Vec::new(),
+            audio_capabilities: None,
             audio_menu: None,
             audio_loading: false,
-            audio_levels: (0.0, 0.0),
+            audio_levels: Vec::new(),
+            audio_sources: Vec::new(),
+            audio_add: None,
+            audio_add_focus: cx.focus_handle(),
+            audio_add_note: None,
+            audio_notice: None,
+            audio_gain_dirty: false,
+            audio_focus: Default::default(),
+            audio_focused: Default::default(),
             audio_testing: false,
             audio_test_path: None,
             replay_autostart_pending,
@@ -414,7 +454,7 @@ impl ClipperWindow {
         this.refresh_storage(cx);
         this.refresh_recent_clips(window, cx);
         this.send(RecorderCommand::RefreshSources);
-        this.refresh_audio_devices(cx);
+        this.refresh_audio_lists(cx);
         this.register_hotkey(cx);
         this
     }
@@ -897,6 +937,7 @@ fn hint(t: &Theme, keys: &[&'static str], label: &'static str) -> Div {
 impl Render for ClipperWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = *cx.theme();
+        self.snapshot_audio_focus(window);
         let palette = self
             .palette
             .as_ref()

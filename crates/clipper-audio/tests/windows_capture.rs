@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use clipper_audio::windows::{AudioCapture, capabilities, list_devices};
 use clipper_audio::{
     AudioConfig, AudioEvent, AudioSelection, DeviceFlow, MicrophoneChoice, ProcessTarget,
-    TrackContent,
+    SourceRequest, SourceRequestKind, TrackContent,
 };
 
 static SERIAL: Mutex<()> = Mutex::new(());
@@ -109,8 +109,10 @@ fn read_for(capture: &mut AudioCapture, duration: Duration) -> Vec<TrackStats> {
 
 fn desktop_only() -> AudioSelection {
     AudioSelection {
-        desktop: true,
-        ..Default::default()
+        sources: vec![SourceRequest {
+            id: 1,
+            kind: SourceRequestKind::Desktop { device: None },
+        }],
     }
 }
 
@@ -155,16 +157,23 @@ fn game_and_remainder_do_not_double_capture() {
     println!("ambient desktop peak before tone: {ambient:.3}");
     let tone = play_tone(5);
     let selection = AudioSelection {
-        game: Some(ProcessTarget::Pid(tone.id())),
-        desktop: true,
-        ..Default::default()
+        sources: vec![
+            SourceRequest {
+                id: 1,
+                kind: SourceRequestKind::Process(ProcessTarget::Pid(tone.id())),
+            },
+            SourceRequest {
+                id: 2,
+                kind: SourceRequestKind::Desktop { device: None },
+            },
+        ],
     };
     let mut capture = AudioCapture::start(&selection, AudioConfig::default()).unwrap();
     let contents: Vec<_> = capture.tracks().iter().map(|t| t.content.clone()).collect();
     println!("tracks: {contents:?}");
     let game = contents
         .iter()
-        .position(|c| *c == TrackContent::Game)
+        .position(|c| matches!(c, TrackContent::Application(_)))
         .expect("game track");
     let rest = contents
         .iter()
@@ -225,8 +234,10 @@ fn microphone_delivers_frames() {
     }
     println!("capture devices: {}", devices.len());
     let selection = AudioSelection {
-        microphone: Some(MicrophoneChoice::Default),
-        ..Default::default()
+        sources: vec![SourceRequest {
+            id: 1,
+            kind: SourceRequestKind::Microphone(MicrophoneChoice::Default),
+        }],
     };
     let mut capture = AudioCapture::start(&selection, AudioConfig::default()).unwrap();
     let ch = capture.tracks()[0].channels;
@@ -292,10 +303,12 @@ fn missing_executable_reports_source_lost() {
         return;
     }
     let selection = AudioSelection {
-        game: Some(ProcessTarget::Executable(
-            "clipper_not_running_xyz.exe".to_owned(),
-        )),
-        ..Default::default()
+        sources: vec![SourceRequest {
+            id: 1,
+            kind: SourceRequestKind::Process(ProcessTarget::Executable(
+                "clipper_not_running_xyz.exe".to_owned(),
+            )),
+        }],
     };
     let mut capture = AudioCapture::start(&selection, AudioConfig::default()).unwrap();
     let end = Instant::now() + Duration::from_secs(3);

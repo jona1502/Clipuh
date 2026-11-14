@@ -1,6 +1,7 @@
 use clipper_core::hotkey::{DEFAULT_SAVE_REPLAY, Hotkey};
 use clipper_core::recording::{
-    QualityProfile, REPLAY_DURATIONS_SECONDS, RecordingAudioOptions, RecordingOptions,
+    AudioSourceTarget, MAX_AUDIO_GAIN_PERCENT, MAX_RECORDED_AUDIO_SOURCES, QualityProfile,
+    REPLAY_DURATIONS_SECONDS, RecordingAudioOptions, RecordingAudioSource, RecordingOptions,
     ReplayOptions, h264_supports,
 };
 use directories::{BaseDirs, ProjectDirs, UserDirs};
@@ -126,36 +127,7 @@ impl AppConfig {
                 "must be between 16 and 512 MiB",
             ));
         }
-        for (field, gain) in [
-            (
-                "audio.microphone_gain_percent",
-                self.audio.microphone_gain_percent,
-            ),
-            (
-                "audio.desktop_gain_percent",
-                self.audio.desktop_gain_percent,
-            ),
-        ] {
-            if gain > 200 {
-                issues.push(ValidationIssue::new(
-                    field,
-                    "gain must be between 0 and 200 percent",
-                ));
-            }
-        }
-        for (field, device) in [
-            ("audio.input_device", &self.audio.input_device),
-            ("audio.output_device", &self.audio.output_device),
-        ] {
-            if device.as_ref().is_some_and(|id| {
-                id.trim().is_empty() || id.len() > 1024 || id.chars().any(char::is_control)
-            }) {
-                issues.push(ValidationIssue::new(
-                    field,
-                    "device id must be nonempty and at most 1024 bytes without control characters",
-                ));
-            }
-        }
+        self.audio.validate_sources(&mut issues);
         if self.replay.hotkey.parse::<Hotkey>().is_err() {
             issues.push(ValidationIssue::new(
                 "replay.hotkey",
@@ -226,15 +198,7 @@ impl AppConfig {
 
     fn recording_options_in(&self, output_directory: PathBuf) -> RecordingOptions {
         RecordingOptions {
-            audio: RecordingAudioOptions {
-                desktop: self.audio.desktop,
-                microphone: self.audio.microphone,
-                input_device: self.audio.input_device.clone(),
-                output_device: self.audio.output_device.clone(),
-                microphone_gain_percent: self.audio.microphone_gain_percent,
-                desktop_gain_percent: self.audio.desktop_gain_percent,
-                separate_tracks: self.audio.separate_tracks,
-            },
+            audio: self.audio.recording_options(),
             width: self.video.width,
             height: self.video.height,
             fps: self.video.fps,
@@ -292,6 +256,14 @@ impl AppConfig {
         if explicit_mode {
             config.app.theme = None;
         }
+        // An explicit `[[audio.sources]]` beats the legacy audio keys.
+        let explicit_sources = toml::from_str::<toml::Table>(&contents)
+            .ok()
+            .and_then(|table| table.get("audio")?.get("sources").cloned())
+            .is_some();
+        if explicit_sources {
+            config.audio.clear_legacy();
+        }
         config.migrate();
         config.validate().map_err(ConfigError::Validation)?;
         Ok(config)
@@ -327,6 +299,7 @@ impl AppConfig {
         {
             self.appearance.mode = theme;
         }
+        self.audio.migrate();
         // A bad accent must never block startup: fall back, or normalize case.
         self.appearance.accent_color = match parse_hex_color(&self.appearance.accent_color) {
             Some(rgb) => format_hex_color(rgb),
@@ -420,40 +393,273 @@ pub enum ReplayMode {
     Hybrid,
 }
 
+/// Most mixer rows kept in the settings.
+pub const MAX_AUDIO_SOURCES: usize = 8;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioSourceType {
+    Game,
+    Application,
+    Desktop,
+    Microphone,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_gain() -> u16 {
+    100
+}
+
+/// One `[[audio.sources]]` row.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioSourceSettings {
+    /// Stable and unique while the row exists.
+    pub id: u32,
+    pub kind: AudioSourceType,
+    /// Application: executable file name (required). Desktop/Microphone:
+    /// endpoint id, absent = Windows default. Game: unused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_gain")]
+    pub gain_percent: u16,
+}
+
+impl AudioSourceSettings {
+    /// `None` when the row is invalid (application without an executable).
+    pub fn recording_target(&self) -> Option<AudioSourceTarget> {
+        let target = self.target.clone();
+        match self.kind {
+            AudioSourceType::Game => Some(AudioSourceTarget::Game),
+            AudioSourceType::Application => target
+                .filter(|exe| !exe.trim().is_empty())
+                .map(AudioSourceTarget::Application),
+            AudioSourceType::Desktop => Some(AudioSourceTarget::Desktop(target)),
+            AudioSourceType::Microphone => Some(AudioSourceTarget::Microphone(target)),
+        }
+    }
+}
+
+fn find_duplicate(
+    rows: &[AudioSourceSettings],
+    kind: AudioSourceType,
+    target: Option<&str>,
+) -> Option<u32> {
+    rows.iter()
+        .find(|row| {
+            row.kind == kind
+                && match kind {
+                    AudioSourceType::Game => true,
+                    AudioSourceType::Application => match (row.target.as_deref(), target) {
+                        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+                        _ => false,
+                    },
+                    _ => row.target.as_deref() == target,
+                }
+        })
+        .map(|row| row.id)
+}
+
+/// Skips rows that fail to parse (unknown kind, missing id) instead of
+/// rejecting the whole settings file.
+fn lenient_sources<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<AudioSourceSettings>, D::Error> {
+    let rows = Vec::<toml::Value>::deserialize(deserializer)?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| row.try_into().ok())
+        .collect())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AudioSettings {
-    pub input_device: Option<String>,
-    pub output_device: Option<String>,
-    pub microphone_gain_percent: u16,
-    pub desktop_gain_percent: u16,
-    /// Future process-selection preference; the recorder currently uses full desktop playback.
-    pub game: bool,
-    /// The system output mix, excluding dedicated game and Discord streams.
-    /// This avoids recording process audio twice when dedicated tracks are enabled.
-    /// This crate stores the preference only; it does not capture or route audio.
-    /// The exclusion policy above is for future recorder process routing.
-    /// Current recording captures the full selected playback endpoint once,
-    /// including game/Discord; those two future preferences do not filter it.
-    pub desktop: bool,
-    /// Future process-selection preference; not an independent recording source yet.
-    pub discord: bool,
-    pub microphone: bool,
     pub separate_tracks: bool,
+    /// Mixer order is vec order.
+    #[serde(deserialize_with = "lenient_sources")]
+    pub sources: Vec<AudioSourceSettings>,
+    // Legacy keys: read for migration, never written. `game` and `discord`
+    // were "future preference" flags that never captured anything, so they do
+    // not become sources (that would silently start recording new audio).
+    #[serde(skip_serializing)]
+    input_device: Option<String>,
+    #[serde(skip_serializing)]
+    output_device: Option<String>,
+    #[serde(skip_serializing)]
+    microphone_gain_percent: Option<u16>,
+    #[serde(skip_serializing)]
+    desktop_gain_percent: Option<u16>,
+    #[serde(skip_serializing)]
+    game: Option<bool>,
+    #[serde(skip_serializing)]
+    desktop: Option<bool>,
+    #[serde(skip_serializing)]
+    discord: Option<bool>,
+    #[serde(skip_serializing)]
+    microphone: Option<bool>,
 }
 
 impl Default for AudioSettings {
     fn default() -> Self {
+        let source = |id, kind| AudioSourceSettings {
+            id,
+            kind,
+            target: None,
+            enabled: true,
+            gain_percent: 100,
+        };
         Self {
+            separate_tracks: true,
+            sources: vec![
+                source(1, AudioSourceType::Desktop),
+                source(2, AudioSourceType::Microphone),
+            ],
             input_device: None,
             output_device: None,
-            microphone_gain_percent: 100,
-            desktop_gain_percent: 100,
-            game: true,
-            desktop: true,
-            discord: true,
-            microphone: true,
-            separate_tracks: true,
+            microphone_gain_percent: None,
+            desktop_gain_percent: None,
+            game: None,
+            desktop: None,
+            discord: None,
+            microphone: None,
+        }
+    }
+}
+
+impl AudioSettings {
+    pub fn next_source_id(&self) -> u32 {
+        self.sources
+            .iter()
+            .map(|s| s.id)
+            .max()
+            .map_or(1, |id| id + 1)
+    }
+
+    /// Id of an existing row capturing the same audio.
+    pub fn duplicate_of(&self, kind: AudioSourceType, target: Option<&str>) -> Option<u32> {
+        find_duplicate(&self.sources, kind, target)
+    }
+
+    /// Enabled, valid sources in order.
+    pub fn recording_options(&self) -> RecordingAudioOptions {
+        RecordingAudioOptions {
+            sources: self
+                .sources
+                .iter()
+                .filter(|s| s.enabled)
+                .filter_map(|s| {
+                    Some(RecordingAudioSource {
+                        id: s.id,
+                        target: s.recording_target()?,
+                        gain_percent: s.gain_percent.min(MAX_AUDIO_GAIN_PERCENT),
+                    })
+                })
+                .collect(),
+            separate_tracks: self.separate_tracks,
+        }
+    }
+
+    fn clear_legacy(&mut self) {
+        self.input_device = None;
+        self.output_device = None;
+        self.microphone_gain_percent = None;
+        self.desktop_gain_percent = None;
+        self.game = None;
+        self.desktop = None;
+        self.discord = None;
+        self.microphone = None;
+    }
+
+    /// Turns legacy keys into sources, then repairs the list so a saved file
+    /// never stops startup.
+    fn migrate(&mut self) {
+        let has_legacy = self.input_device.is_some()
+            || self.output_device.is_some()
+            || self.microphone_gain_percent.is_some()
+            || self.desktop_gain_percent.is_some()
+            || self.game.is_some()
+            || self.desktop.is_some()
+            || self.discord.is_some()
+            || self.microphone.is_some();
+        if has_legacy {
+            let row =
+                |id, kind, target, enabled: Option<bool>, gain: Option<u16>| AudioSourceSettings {
+                    id,
+                    kind,
+                    target,
+                    enabled: enabled.unwrap_or(true),
+                    gain_percent: gain.unwrap_or(100),
+                };
+            self.sources = vec![
+                row(
+                    1,
+                    AudioSourceType::Desktop,
+                    self.output_device.take(),
+                    self.desktop,
+                    self.desktop_gain_percent,
+                ),
+                row(
+                    2,
+                    AudioSourceType::Microphone,
+                    self.input_device.take(),
+                    self.microphone,
+                    self.microphone_gain_percent,
+                ),
+            ];
+            self.clear_legacy();
+        }
+        let mut kept: Vec<AudioSourceSettings> = Vec::new();
+        for mut row in std::mem::take(&mut self.sources) {
+            row.gain_percent = row.gain_percent.min(MAX_AUDIO_GAIN_PERCENT);
+            let invalid = kept.iter().any(|k| k.id == row.id)
+                || row.recording_target().is_none()
+                || find_duplicate(&kept, row.kind, row.target.as_deref()).is_some();
+            if !invalid && kept.len() < MAX_AUDIO_SOURCES {
+                kept.push(row);
+            }
+        }
+        let mut enabled = 0;
+        for row in &mut kept {
+            if row.enabled {
+                enabled += 1;
+                row.enabled = enabled <= MAX_RECORDED_AUDIO_SOURCES;
+            }
+        }
+        self.sources = kept;
+    }
+
+    fn validate_sources(&self, issues: &mut Vec<ValidationIssue>) {
+        let mut problem =
+            |message: &'static str| issues.push(ValidationIssue::new("audio.sources", message));
+        if self.sources.len() > MAX_AUDIO_SOURCES {
+            problem("at most 8 sources");
+        }
+        if self.sources.iter().filter(|s| s.enabled).count() > MAX_RECORDED_AUDIO_SOURCES {
+            problem("at most 4 sources can be enabled");
+        }
+        for (index, row) in self.sources.iter().enumerate() {
+            if self.sources[..index].iter().any(|s| s.id == row.id) {
+                problem("source ids must be unique");
+            }
+            if find_duplicate(&self.sources[..index], row.kind, row.target.as_deref()).is_some() {
+                problem("the same audio is listed twice");
+            }
+            if row.gain_percent > MAX_AUDIO_GAIN_PERCENT {
+                problem("gain must be between 0 and 200 percent");
+            }
+            if row.recording_target().is_none() {
+                problem("an application source needs an executable name");
+            }
+            if row.target.as_ref().is_some_and(|t| {
+                t.trim().is_empty() || t.len() > 1024 || t.chars().any(char::is_control)
+            }) {
+                problem("target must be nonempty, at most 1024 bytes, without control characters");
+            }
         }
     }
 }
@@ -913,10 +1119,6 @@ mod tests {
         assert_eq!(config.replay.memory_limit_megabytes, 64);
         assert!(!config.replay.hotkey.trim().is_empty());
 
-        assert!(config.audio.game);
-        assert!(config.audio.desktop);
-        assert!(config.audio.discord);
-        assert!(config.audio.microphone);
         assert!(config.audio.separate_tracks);
         assert_eq!(config.performance.command_queue_capacity, 32);
         assert_eq!(config.performance.event_queue_capacity, 64);
@@ -937,7 +1139,7 @@ mod tests {
     fn toml_round_trip_preserves_the_complete_config() {
         let mut config = AppConfig::default();
         config.replay.hotkey = "Ctrl+Shift+F9".to_owned();
-        config.audio.microphone = false;
+        config.audio.sources[1].enabled = false;
         config.appearance.mode = Theme::Light;
 
         let toml = toml::to_string(&config).expect("serialize config");
@@ -1206,7 +1408,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_projection_audio_tracks_follow_current_sources_and_ignore_future_flags() {
+    fn storage_projection_audio_tracks_follow_enabled_sources() {
         for (desktop, microphone, separate_tracks, tracks, audio_bps, sixty_second_bytes) in [
             (false, false, true, 0, 0, 120_000_000),
             (true, true, false, 1, 192_000, 121_440_000),
@@ -1214,12 +1416,9 @@ mod tests {
             (true, true, true, 3, 576_000, 124_320_000),
         ] {
             let mut config = AppConfig::default();
-            config.audio.desktop = desktop;
-            config.audio.microphone = microphone;
+            config.audio.sources[0].enabled = desktop;
+            config.audio.sources[1].enabled = microphone;
             config.audio.separate_tracks = separate_tracks;
-            // These are future process-capture preferences and do not create tracks.
-            config.audio.game = true;
-            config.audio.discord = true;
 
             let projection = config.storage_projection().expect("audio config projects");
             assert_eq!(projection.audio_tracks, tracks);
@@ -1362,44 +1561,261 @@ mod tests {
             Err(ConfigError::Validation(_))
         ));
     }
-    #[test]
-    fn audio_devices_gains_and_enabled_sources_reach_the_recorder_after_reload() {
+    fn source(id: u32, kind: AudioSourceType, target: Option<&str>) -> AudioSourceSettings {
+        AudioSourceSettings {
+            id,
+            kind,
+            target: target.map(str::to_owned),
+            enabled: true,
+            gain_percent: 100,
+        }
+    }
+
+    fn load_toml(contents: &str) -> AppConfig {
         let temp = TestDir::new();
-        let path = temp.path("audio.toml");
-        let mut config = AppConfig::default();
-        config.audio.input_device = Some("capture-endpoint-id".into());
-        config.audio.output_device = Some("render-endpoint-id".into());
-        config.audio.microphone_gain_percent = 50;
-        config.audio.desktop_gain_percent = 150;
-        config.audio.desktop = false;
-        config.save_to(&path).unwrap();
-        let restored = AppConfig::load_from(&path)
-            .unwrap()
-            .recording_options()
-            .unwrap();
-        assert_eq!(
-            restored.audio.input_device.as_deref(),
-            Some("capture-endpoint-id")
-        );
-        assert_eq!(
-            restored.audio.output_device.as_deref(),
-            Some("render-endpoint-id")
-        );
-        assert_eq!(restored.audio.microphone_gain_percent, 50);
-        assert_eq!(restored.audio.desktop_gain_percent, 150);
-        assert!(!restored.audio.desktop);
-        assert!(restored.audio.microphone);
+        let path = temp.path("settings.toml");
+        fs::write(&path, contents).unwrap();
+        AppConfig::load_from(&path).unwrap()
     }
 
     #[test]
-    fn malformed_audio_devices_and_unbounded_gains_are_rejected() {
+    fn default_audio_sources_match_the_pre_mixer_recording() {
+        let audio = AudioSettings::default();
+        assert_eq!(
+            audio.sources,
+            [
+                source(1, AudioSourceType::Desktop, None),
+                source(2, AudioSourceType::Microphone, None)
+            ]
+        );
+        assert!(audio.separate_tracks);
+        let options = audio.recording_options();
+        assert_eq!(options.sources.len(), 2);
+        assert_eq!(options.track_count(), 3);
+    }
+
+    #[test]
+    fn legacy_audio_keys_migrate_to_sources_and_are_never_written() {
+        let temp = TestDir::new();
+        let path = temp.path("legacy.toml");
+        fs::write(
+            &path,
+            "[audio]\ndesktop = false\nmicrophone = true\ninput_device = \"X\"\nmicrophone_gain_percent = 150\ngame = true\ndiscord = true\n",
+        )
+        .unwrap();
+        let config = AppConfig::load_from(&path).unwrap();
+        let mut desktop = source(1, AudioSourceType::Desktop, None);
+        desktop.enabled = false;
+        let mut mic = source(2, AudioSourceType::Microphone, Some("X"));
+        mic.gain_percent = 150;
+        assert_eq!(config.audio.sources, [desktop, mic]);
+        let options = config.audio.recording_options();
+        assert_eq!(options.sources.len(), 1);
+        assert_eq!(
+            options.sources[0].target,
+            AudioSourceTarget::Microphone(Some("X".into()))
+        );
+
+        config.save_to(&path).unwrap();
+        let written = fs::read_to_string(&path).unwrap();
+        assert!(written.contains("[[audio.sources]]"));
+        for key in [
+            "input_device",
+            "output_device",
+            "microphone_gain_percent",
+            "desktop_gain_percent",
+            "game",
+            "discord",
+            "desktop =",
+            "microphone =",
+        ] {
+            assert!(!written.contains(key), "{key} was written:\n{written}");
+        }
+        assert_eq!(AppConfig::load_from(&path).unwrap(), config);
+    }
+
+    #[test]
+    fn legacy_game_and_discord_never_become_sources() {
+        let config = load_toml("[audio]\ngame = true\ndiscord = true\n");
+        assert_eq!(config.audio.sources, AudioSettings::default().sources);
+    }
+
+    #[test]
+    fn explicit_sources_win_over_legacy_keys() {
+        let config = load_toml(
+            "[audio]\nmicrophone = false\ninput_device = \"X\"\n[[audio.sources]]\nid = 7\nkind = \"game\"\n",
+        );
+        assert_eq!(
+            config.audio.sources,
+            [source(7, AudioSourceType::Game, None)]
+        );
+    }
+
+    #[test]
+    fn broken_audio_sources_are_repaired_on_load() {
+        let config = load_toml(
+            r#"
+[[audio.sources]]
+id = 1
+kind = "desktop"
+gain_percent = 999
+[[audio.sources]]
+id = 1
+kind = "microphone"
+[[audio.sources]]
+id = 2
+kind = "application"
+[[audio.sources]]
+id = 3
+kind = "teleporter"
+[[audio.sources]]
+id = 4
+kind = "application"
+target = "Discord.exe"
+[[audio.sources]]
+id = 5
+kind = "application"
+target = "discord.EXE"
+[[audio.sources]]
+id = 6
+kind = "game"
+[[audio.sources]]
+id = 7
+kind = "microphone"
+[[audio.sources]]
+id = 8
+kind = "microphone"
+target = "a"
+[[audio.sources]]
+id = 9
+kind = "microphone"
+target = "b"
+"#,
+        );
+        let ids: Vec<_> = config.audio.sources.iter().map(|s| s.id).collect();
+        assert_eq!(ids, [1, 4, 6, 7, 8, 9]);
+        assert_eq!(config.audio.sources[0].gain_percent, 200);
+        let enabled: Vec<_> = config.audio.sources.iter().map(|s| s.enabled).collect();
+        assert_eq!(enabled, [true, true, true, true, false, false]);
+    }
+
+    #[test]
+    fn too_many_rows_are_truncated_on_load() {
+        let rows: String = (1..=10)
+            .map(|id| {
+                format!(
+                    "[[audio.sources]]\nid = {id}\nkind = \"application\"\ntarget = \"a{id}.exe\"\nenabled = false\n"
+                )
+            })
+            .collect();
+        assert_eq!(load_toml(&rows).audio.sources.len(), MAX_AUDIO_SOURCES);
+    }
+
+    #[test]
+    fn programmatic_invalid_audio_sources_are_rejected() {
         let mut config = AppConfig::default();
-        config.audio.input_device = Some("".into());
-        config.audio.output_device = Some("bad\nid".into());
-        config.audio.microphone_gain_percent = 201;
-        config.audio.desktop_gain_percent = u16::MAX;
-        let error = config.validate().unwrap_err();
-        assert_eq!(error.issues().len(), 4);
+        assert!(config.validate().is_ok());
+        let bad: [fn(&mut AudioSettings); 6] = [
+            |a| a.sources[1].id = 1,
+            |a| a.sources[0].gain_percent = 201,
+            |a| {
+                a.sources
+                    .push(source(3, AudioSourceType::Application, None))
+            },
+            |a| a.sources.push(source(3, AudioSourceType::Desktop, None)),
+            |a| {
+                for id in 3..=9 {
+                    let exe = format!("{id}.exe");
+                    a.sources
+                        .push(source(id, AudioSourceType::Application, Some(&exe)));
+                }
+            },
+            |a| a.sources[0].target = Some("bad\nid".into()),
+        ];
+        for change in bad {
+            config.audio = AudioSettings::default();
+            change(&mut config.audio);
+            let error = config.validate().unwrap_err();
+            assert!(error.issues().iter().all(|i| i.field() == "audio.sources"));
+        }
+        // 5 enabled sources
+        config.audio = AudioSettings::default();
+        for id in 3..=5 {
+            let exe = format!("{id}.exe");
+            config
+                .audio
+                .sources
+                .push(source(id, AudioSourceType::Application, Some(&exe)));
+        }
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn duplicate_of_and_next_source_id() {
+        let mut audio = AudioSettings::default();
+        assert_eq!(audio.next_source_id(), 3);
+        audio.sources.clear();
+        assert_eq!(audio.next_source_id(), 1);
+        let mut audio = AudioSettings::default();
+        assert_eq!(audio.duplicate_of(AudioSourceType::Desktop, None), Some(1));
+        assert_eq!(
+            audio.duplicate_of(AudioSourceType::Desktop, Some("x")),
+            None
+        );
+        assert_eq!(
+            audio.duplicate_of(AudioSourceType::Microphone, None),
+            Some(2)
+        );
+        assert_eq!(audio.duplicate_of(AudioSourceType::Game, None), None);
+        audio
+            .sources
+            .push(source(3, AudioSourceType::Application, Some("Discord.exe")));
+        audio.sources.push(source(4, AudioSourceType::Game, None));
+        assert_eq!(
+            audio.duplicate_of(AudioSourceType::Application, Some("discord.EXE")),
+            Some(3)
+        );
+        assert_eq!(
+            audio.duplicate_of(AudioSourceType::Application, Some("o.exe")),
+            None
+        );
+        assert_eq!(audio.duplicate_of(AudioSourceType::Game, None), Some(4));
+        assert_eq!(audio.next_source_id(), 5);
+    }
+
+    #[test]
+    fn recording_options_skip_disabled_sources_and_keep_order() {
+        let mut audio = AudioSettings::default();
+        audio
+            .sources
+            .insert(0, source(9, AudioSourceType::Game, None));
+        audio.sources[1].enabled = false;
+        audio.sources[2].gain_percent = 150;
+        let options = audio.recording_options();
+        let ids: Vec<_> = options.sources.iter().map(|s| s.id).collect();
+        assert_eq!(ids, [9, 2]);
+        assert_eq!(options.sources[0].target, AudioSourceTarget::Game);
+        assert_eq!(options.sources[1].gain_percent, 150);
+    }
+
+    #[test]
+    fn audio_sources_survive_save_and_reload() {
+        let temp = TestDir::new();
+        let path = temp.path("audio.toml");
+        let mut config = AppConfig::default();
+        config.audio.sources[0].target = Some("render-endpoint-id".into());
+        config.audio.sources[0].enabled = false;
+        config.audio.sources[1].gain_percent = 50;
+        config
+            .audio
+            .sources
+            .push(source(3, AudioSourceType::Application, Some("Game.exe")));
+        config.save_to(&path).unwrap();
+        let restored = AppConfig::load_from(&path).unwrap();
+        assert_eq!(restored, config);
+        let options = restored.recording_options().unwrap().audio;
+        assert_eq!(options.sources.len(), 2);
+        assert_eq!(options.sources[0].gain_percent, 50);
     }
 
     #[test]

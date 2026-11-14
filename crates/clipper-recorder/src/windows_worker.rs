@@ -28,7 +28,7 @@ use crate::logic::{
     replay_failure_text, replay_file_name, sweep_stale_partials, unique_file_name,
     validate_replay_options,
 };
-use crate::recording_audio::{AudioTest, RecordingAudio};
+use crate::recording_audio::{AudioPlan, AudioReporter, AudioTest, RecordingAudio};
 use crate::replay_session::{ReplaySession, WAKE_WAIT};
 
 const MAX_WAIT: Duration = Duration::from_millis(250);
@@ -48,7 +48,7 @@ struct Recording {
     audio: Option<RecordingAudio>,
     audio_failed: bool,
     video_end: i64,
-    last_audio_meter: Instant,
+    audio_reporter: AudioReporter,
     _d3d: D3DContext,
     pacer: FramePacer,
     meter: RateMeter,
@@ -299,6 +299,20 @@ impl Worker<'_> {
                     replay.set_duration(duration);
                 }
             }
+            // Only gain is live. Enabling, disabling, adding or removing
+            // sources applies to the next session: the track topology of a
+            // file or replay buffer cannot change while it records.
+            RecorderCommand::SetAudioGain {
+                source,
+                gain_percent,
+            } => {
+                if let Some(audio) = self.recording.as_mut().and_then(|r| r.audio.as_mut()) {
+                    audio.set_gain(source, gain_percent);
+                }
+                if let Some(replay) = &mut self.replay {
+                    replay.set_audio_gain(source, gain_percent);
+                }
+            }
             RecorderCommand::SaveReplay => self.save_replay(),
         }
         true
@@ -381,6 +395,9 @@ impl Worker<'_> {
             eprintln!("replay stopped: {:?}", session.diagnostics());
         }
         let had_session = session.is_some();
+        if let Some(session) = &session {
+            session.finish_audio_report(self.endpoint);
+        }
         drop(session);
         if report || (had_session && error.is_some()) {
             self.send(RecorderEvent::ReplayStopped { error });
@@ -399,6 +416,7 @@ impl Worker<'_> {
             self.fail_replay(message);
             return;
         }
+        replay.report_audio(self.endpoint);
         if replay.source_closed() {
             self.fail_replay("the capture source was closed".into());
             return;
@@ -533,10 +551,7 @@ impl Worker<'_> {
             Err(error) => (None, Some(error)),
         };
         self.send(RecorderEvent::AudioTestFinished { path, error });
-        let _ = self.endpoint.events.try_send(RecorderEvent::AudioLevels {
-            desktop: 0.0,
-            microphone: 0.0,
-        });
+        AudioReporter::finish(self.endpoint);
     }
 
     fn service_audio_test(&mut self) {
@@ -548,12 +563,7 @@ impl Worker<'_> {
             self.stop_audio_test(Some(message));
             return;
         }
-        if let Some((desktop, microphone)) = test.meter() {
-            let _ = self.endpoint.events.try_send(RecorderEvent::AudioLevels {
-                desktop,
-                microphone,
-            });
-        }
+        test.report(self.endpoint);
         if test.elapsed() >= Duration::from_secs(30) {
             self.stop_audio_test(None);
         }
@@ -625,16 +635,9 @@ impl Worker<'_> {
             self.stop_recording(StopReason::Error, Some(message));
             return;
         }
-        if recording.last_audio_meter.elapsed() >= Duration::from_millis(100) {
-            if let Some(audio) = &recording.audio {
-                let (desktop, microphone) = audio.levels();
-                let _ = self.endpoint.events.try_send(RecorderEvent::AudioLevels {
-                    desktop,
-                    microphone,
-                });
-            }
-            recording.last_audio_meter = Instant::now();
-        }
+        recording
+            .audio_reporter
+            .report(self.endpoint, recording.audio.as_mut());
         if recording.source_closed.load(Ordering::Acquire) {
             self.stop_recording(StopReason::SourceClosed, None);
             return;
@@ -670,6 +673,7 @@ impl Worker<'_> {
             mut audio,
             audio_failed,
             video_end: _,
+            audio_reporter: _,
             _d3d,
             meter,
             counters,
@@ -689,6 +693,7 @@ impl Worker<'_> {
             audio.pump(&mut encoder, true, end)
         });
         drop(audio);
+        AudioReporter::finish(self.endpoint);
         let finish = encoder
             .finish()
             .map_err(|error| encoder_message(&error))
@@ -773,18 +778,17 @@ fn build_recording(
         bitrate_mbps: options.bitrate_mbps,
         profile: options.profile,
     };
-    let encoder = HardwareEncoder::create_with_audio(
-        mf,
-        &d3d,
-        &config,
-        &partial,
-        options.audio.track_count(),
-    )
-    .map_err(|error| encoder_message(&error))?;
+    // The plan decides the file's audio tracks (mix + one per planned source
+    // when separate), so it must exist before the encoder.
+    let plan = AudioPlan::for_session(&options.audio, Some(source));
+    let audio_reporter = AudioReporter::new(plan.idle_states());
+    let encoder =
+        HardwareEncoder::create_with_audio(mf, &d3d, &config, &partial, plan.encoder_tracks())
+            .map_err(|error| encoder_message(&error))?;
 
     // Initialize expensive GPU/codec resources before audio starts, otherwise
     // hardware encoder discovery can overflow the bounded audio rings.
-    let audio = RecordingAudio::start(&options.audio, wake_tx)?;
+    let audio = RecordingAudio::start(plan, wake_tx)?;
     let origin = audio.as_ref().map(RecordingAudio::origin);
 
     Ok(Recording {
@@ -793,7 +797,7 @@ fn build_recording(
         audio,
         audio_failed: false,
         video_end: 0,
-        last_audio_meter: Instant::now(),
+        audio_reporter,
         _d3d: d3d,
         pacer: origin.map_or_else(
             || FramePacer::new(options.fps),
