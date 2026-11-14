@@ -1,0 +1,52 @@
+---
+import Container from "@/components/ui/Container.astro";
+import Logo from "./Logo.astro";
+import { site } from "@/data/site";
+
+// Short product line for the footer; kept local (site.description is long).
+const blurb = "Native game clipping for Windows.";
+// Build-time year: refreshes on every deploy, which is fine for a static site.
+const year = new Date().getFullYear();
+const linkClass =
+  "text-small text-text-secondary hover:text-text -mx-1 inline-flex min-h-11 items-center rounded-md px-1 transition-colors duration-150";
+---
+
+<footer class="bg-background-elevated border-border border-t">
+  <Container class="flex flex-col gap-8 py-10 md:py-12">
+    <div class="flex flex-col gap-8 md:flex-row md:justify-between">
+      <div class="flex max-w-sm flex-col gap-3">
+        <Logo href={`${import.meta.env.BASE_URL}#top`} />
+        <p class="text-small text-text-secondary">{blurb}</p>
+      </div>
+      <nav aria-label="Footer">
+        <ul class="flex flex-wrap gap-x-6 gap-y-1 md:justify-end">
+          {site.nav.map((l) => (
+            <li>
+              <a href={l.href} class={linkClass}>
+                {l.label}
+              </a>
+            </li>
+          ))}
+          {site.repositoryUrl && (
+            <li>
+              <a href={site.repositoryUrl} rel="noopener" class={linkClass}>
+                GitHub
+              </a>
+            </li>
+          )}
+        </ul>
+      </nav>
+    </div>
+    <div class="border-border text-caption text-text-muted flex flex-col gap-2 border-t pt-6 md:flex-row md:justify-between">
+      <p>
+        <span class="text-text-secondary font-medium">
+          In active development.
+        </span>
+        {site.download.note}
+      </p>
+      <p>
+        © {year} {site.name}
+      </p>
+    </div>
+  </Container>
+</footer>

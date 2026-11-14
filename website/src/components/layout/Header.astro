@@ -1,0 +1,206 @@
+---
+import Button from "@/components/ui/Button.astro";
+import Container from "@/components/ui/Container.astro";
+import Logo from "./Logo.astro";
+import { site } from "@/data/site";
+
+/*
+ * Download CTA stays a link to the in-page #download section with a "Soon"
+ * badge: no release exists (site.download.url is null), so we never link to a
+ * fake URL, and the section is where the status is explained. If a real url
+ * ever exists, point the CTA there and drop the badge.
+ * The plain link list skips the #download entry because the CTA covers it.
+ */
+const ctaHref = "#download";
+const ctaLabel = site.nav.find((l) => l.href === ctaHref)?.label ?? "Download";
+const links = site.nav.filter((l) => l.href !== ctaHref);
+const linkClass =
+  "text-small text-text-secondary hover:text-text aria-[current=location]:text-text rounded-md px-3 py-2 font-medium transition-colors duration-150";
+const mobileLinkClass =
+  "text-body text-text-secondary hover:bg-surface-hover hover:text-text aria-[current=location]:text-text flex min-h-11 items-center rounded-md px-3 font-medium";
+const badgeClass =
+  "bg-accent-foreground/15 text-caption rounded-sm px-1.5 py-0.5";
+---
+
+<header
+  data-site-header
+  class="bg-background-elevated/90 border-border sticky top-0 z-40 border-b backdrop-blur-sm"
+>
+  <Container class="flex h-(--spacing-header) items-center justify-between">
+    <Logo href={`${import.meta.env.BASE_URL}#top`} />
+
+    <nav aria-label="Primary" class="hidden items-center gap-1 md:flex">
+      {links.map((l) => (
+        <a href={l.href} class={linkClass} data-nav-link>
+          {l.label}
+        </a>
+      ))}
+      <Button href={ctaHref} data-nav-link class="ml-3">
+        {ctaLabel}
+        {!site.download.available && <span class={badgeClass}>Soon</span>}
+      </Button>
+    </nav>
+
+    <button
+      type="button"
+      data-menu-button
+      aria-expanded="false"
+      aria-controls="mobile-nav"
+      aria-label="Open menu"
+      class="menu-button text-text hover:bg-surface-hover -mr-2 size-11 items-center justify-center rounded-md"
+    >
+      <svg
+        class="size-6"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2"
+        stroke-linecap="round"
+        aria-hidden="true"
+      >
+        <path data-icon-open d="M4 7h16M4 12h16M4 17h16"></path>
+        <path data-icon-close class="hidden" d="M6 6l12 12M18 6L6 18"></path>
+      </svg>
+    </button>
+  </Container>
+
+  <div id="mobile-nav" data-menu-panel class="menu-panel md:hidden">
+    <Container class="py-3">
+      <nav aria-label="Primary mobile" class="flex flex-col gap-1">
+        {links.map((l) => (
+          <a href={l.href} class={mobileLinkClass} data-nav-link>
+            {l.label}
+          </a>
+        ))}
+        <Button href={ctaHref} size="lg" data-nav-link class="mt-2">
+          {ctaLabel}
+          {!site.download.available && <span class={badgeClass}>Soon</span>}
+        </Button>
+      </nav>
+    </Container>
+  </div>
+</header>
+
+<style>
+  /* Without JS: no toggle, panel is a static block of links under the bar. */
+  .menu-button {
+    display: none;
+  }
+  .menu-panel {
+    border-top: 1px solid var(--color-border);
+  }
+  /* With JS (html.js set in <head>): button on mobile, panel is an overlay. */
+  :global(html.js) .menu-button {
+    display: inline-flex;
+  }
+  @media (min-width: 768px) {
+    :global(html.js) .menu-button {
+      display: none;
+    }
+  }
+  :global(html.js) .menu-panel {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    border-bottom: 1px solid var(--color-border);
+    background: var(--color-background-elevated);
+    visibility: hidden;
+    opacity: 0;
+    transform: translateY(-6px);
+    transition:
+      opacity 150ms var(--ease-out),
+      transform 150ms var(--ease-out),
+      visibility 0s linear 150ms;
+  }
+  :global(html.js) .menu-panel[data-open="true"] {
+    visibility: visible;
+    opacity: 1;
+    transform: none;
+    transition-delay: 0s;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    :global(html.js) .menu-panel {
+      transition: none;
+      transform: none;
+    }
+  }
+</style>
+
+<script>
+  const header = document.querySelector<HTMLElement>("[data-site-header]");
+  const button = header?.querySelector<HTMLButtonElement>("[data-menu-button]");
+  const panel = header?.querySelector<HTMLElement>("[data-menu-panel]");
+
+  if (header && button && panel) {
+    const iconOpen = button.querySelector<SVGElement>("[data-icon-open]");
+    const iconClose = button.querySelector<SVGElement>("[data-icon-close]");
+    const desktop = window.matchMedia("(min-width: 768px)");
+
+    const setOpen = (open: boolean, restoreFocus = false) => {
+      panel.dataset.open = String(open);
+      button.setAttribute("aria-expanded", String(open));
+      button.setAttribute("aria-label", open ? "Close menu" : "Open menu");
+      iconOpen?.classList.toggle("hidden", open);
+      iconClose?.classList.toggle("hidden", !open);
+      if (open) panel.querySelector<HTMLElement>("a")?.focus();
+      else if (restoreFocus) button.focus();
+    };
+    const isOpen = () => panel.dataset.open === "true";
+
+    button.addEventListener("click", () => setOpen(!isOpen()));
+    panel.addEventListener("click", (e) => {
+      if ((e.target as Element).closest("a")) setOpen(false);
+    });
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && isOpen()) setOpen(false, true);
+    });
+    // Not a hard focus trap: close once focus leaves the header.
+    header.addEventListener("focusout", (e) => {
+      const next = e.relatedTarget as Node | null;
+      if (isOpen() && next && !header.contains(next)) setOpen(false);
+    });
+    desktop.addEventListener("change", (e) => {
+      if (e.matches && isOpen()) setOpen(false);
+    });
+  }
+
+  // Active section highlighting for in-page anchor links.
+  const links = Array.from(
+    document.querySelectorAll<HTMLAnchorElement>("[data-nav-link]"),
+  );
+  const hashOf = (a: HTMLAnchorElement) =>
+    new URL(a.href, location.href).hash.slice(1);
+  const targets = new Map<string, HTMLElement>();
+  for (const a of links) {
+    const id = hashOf(a);
+    const el = id ? document.getElementById(id) : null;
+    if (el) targets.set(id, el);
+  }
+
+  if (targets.size && "IntersectionObserver" in window) {
+    const visible = new Set<string>();
+    const order = [...targets.keys()];
+    const apply = () => {
+      // First visible section in link order wins.
+      const active = order.find((id) => visible.has(id));
+      for (const a of links) {
+        if (active && hashOf(a) === active)
+          a.setAttribute("aria-current", "location");
+        else a.removeAttribute("aria-current");
+      }
+    };
+    const io = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (entry.isIntersecting) visible.add(entry.target.id);
+          else visible.delete(entry.target.id);
+        }
+        apply();
+      },
+      // Band across the upper-middle of the viewport, below the sticky header.
+      { rootMargin: "-80px 0px -55% 0px" },
+    );
+    targets.forEach((el) => io.observe(el));
+  }
+</script>
