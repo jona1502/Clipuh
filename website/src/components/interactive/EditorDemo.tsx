@@ -118,7 +118,7 @@ const TrackRow = memo(function TrackRow({
       <div
         style={{ gridRow: row, gridColumn: 1 }}
         className={[
-          "min-w-0 flex-col items-start justify-between gap-0.5 border-b border-border px-1.5 py-1 @[30rem]:flex-row @[30rem]:items-center @[30rem]:gap-1 @[30rem]:py-0",
+          "relative min-w-0 flex-col items-start justify-between gap-0.5 border-b border-border px-1.5 py-1 @[30rem]:flex-row @[30rem]:items-center @[30rem]:gap-1 @[30rem]:py-0",
           ROW_H,
           display,
           selected ? "bg-accent-subtle" : "",
@@ -128,7 +128,7 @@ const TrackRow = memo(function TrackRow({
           type="button"
           aria-pressed={selected}
           onClick={() => onSelect(track.id)}
-          className="flex min-h-6 min-w-0 flex-1 cursor-pointer flex-col items-start justify-center gap-0.5 rounded-sm text-left text-caption text-text hover:text-accent-hover @[30rem]:min-h-9"
+          className="flex min-h-6 min-w-0 flex-1 cursor-pointer flex-col items-start justify-center gap-0.5 rounded-sm text-left text-caption text-text after:absolute after:inset-0 hover:text-accent-hover @[30rem]:min-h-9"
         >
           <span className="max-w-full truncate font-medium">{track.name}</span>
           {track.planned && <PlannedTag />}
@@ -138,7 +138,7 @@ const TrackRow = memo(function TrackRow({
           aria-pressed={muted}
           aria-label={`Mute ${track.name}`}
           onClick={() => onMute(track.id)}
-          className="inline-flex size-11 shrink-0 cursor-pointer items-center justify-center self-end rounded-md border border-border-hover bg-surface-raised text-text-secondary hover:bg-surface-hover aria-pressed:border-accent aria-pressed:bg-accent-subtle aria-pressed:text-accent-hover @[30rem]:size-8 @[30rem]:self-auto"
+          className="relative z-10 inline-flex size-11 shrink-0 cursor-pointer items-center justify-center self-end rounded-md border border-border-hover bg-surface-raised text-text-secondary hover:bg-surface-hover aria-pressed:border-accent aria-pressed:bg-accent-subtle aria-pressed:text-accent-hover @[30rem]:size-8 @[30rem]:self-auto"
         >
           <SpeakerIcon muted={muted} />
         </button>
