@@ -89,6 +89,14 @@ impl PlayheadClock {
         value
     }
 
+    /// What [`Self::display`] would return now, without recording it.
+    pub(super) fn peek(&self, now: Instant, limit: Duration) -> Duration {
+        let shown = self.shown.get();
+        self.predict(now).map_or(shown, |predicted| {
+            predicted.max(shown).min(limit.max(shown))
+        })
+    }
+
     pub(super) fn is_running(&self) -> bool {
         self.anchor.is_some()
     }
@@ -202,6 +210,17 @@ mod tests {
             clock.sync(player, now);
         }
         assert!(clock.display(now, FAR).abs_diff(player) < ms(5));
+    }
+
+    #[test]
+    fn peek_does_not_advance_the_monotonic_floor() {
+        let mut clock = PlayheadClock::default();
+        let t0 = Instant::now();
+        clock.sync(ms(1000), t0);
+        assert_eq!(clock.peek(t0 + ms(40), FAR), ms(1040));
+        // A later correction below the peeked value is still visible.
+        clock.sync(ms(1000), t0 + ms(1));
+        assert!(clock.display(t0 + ms(1), FAR) < ms(1040));
     }
 
     #[test]

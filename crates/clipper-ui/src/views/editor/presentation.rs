@@ -578,11 +578,9 @@ impl ClipEditor {
         for i in 0..self.audio_tracks {
             tracks = tracks.child(self.audio_waveform(i, duration, cx));
         }
-        if self.playhead_animating() {
-            // Vsync-driven only while playing; idle and paused editors do
-            // not redraw. GPUI does not draw minimized windows.
-            window.request_animation_frame();
-        }
+        // Vsync-paced only while playing; idle and paused editors do not
+        // redraw. GPUI does not draw minimized windows.
+        self.queue_playhead_frame(window, cx);
         tracks = tracks.child(
             div()
                 .absolute()

@@ -2,6 +2,72 @@
 use super::*;
 use crate::components::slider;
 
+/// Peak of every drawn waveform column, cached per track and layout so a
+/// redraw (the playhead moves every display refresh while playing) does not
+/// re-scan all buckets. Bounded: old layouts (zoom levels, widths) are
+/// evicted first.
+#[derive(Default)]
+pub(super) struct PeakCache {
+    entries: Vec<(PeakKey, Arc<[f32]>)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PeakKey {
+    stream_index: u32,
+    columns: usize,
+    duration: Duration,
+    /// Identity of the decoded waveform set (replaced when re-analysed).
+    source: usize,
+}
+
+const PEAK_CACHE_ENTRIES: usize = 16;
+
+impl PeakCache {
+    fn get(&mut self, key: PeakKey, compute: impl FnOnce() -> Vec<f32>) -> Arc<[f32]> {
+        if let Some((_, peaks)) = self.entries.iter().find(|(k, _)| *k == key) {
+            return peaks.clone();
+        }
+        let peaks: Arc<[f32]> = compute().into();
+        if self.entries.len() >= PEAK_CACHE_ENTRIES {
+            self.entries.remove(0);
+        }
+        self.entries.push((key, peaks.clone()));
+        peaks
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// Largest bucket peak under each of `columns` equal slices of `duration`
+/// (the timeline), for buckets spanning `source_duration`.
+fn column_peaks(
+    buckets: &[clipper_media::audio::WaveformBucket],
+    duration: Duration,
+    source_duration: Duration,
+    columns: usize,
+) -> Vec<f32> {
+    let len = buckets.len();
+    (0..columns)
+        .map(|x| {
+            let from = ((duration.as_secs_f64() * x as f64
+                / columns as f64
+                / source_duration.as_secs_f64())
+                * len as f64) as usize;
+            let to = ((duration.as_secs_f64() * (x + 1) as f64
+                / columns as f64
+                / source_duration.as_secs_f64())
+                * len as f64)
+                .ceil() as usize;
+            buckets
+                .get(from.min(len)..to.min(len).max(from.min(len)))
+                .map_or(0., |b| b.iter().map(|b| b.peak).fold(0f32, f32::max))
+        })
+        .collect()
+}
+
 fn row_height(theme: &Theme) -> f32 {
     f32::from(theme.metrics.control_height_small) * 2. + 16.
 }
@@ -346,6 +412,7 @@ impl ClipEditor {
         let selected = edits.selected_audio() == Some(index);
         let gain = clipper_editor::effective_gain(edits.audio_tracks(), track.stream_index);
         let waveform = self.waveforms.clone();
+        let peak_cache = self.waveform_peaks.clone();
         let source_ranges = edits.segments().to_vec();
         let draw_track = track.clone();
         let color = track_color(t.colors.accent, index);
@@ -380,31 +447,22 @@ impl ClipEditor {
                         }
                         let width = f32::from(bounds.size.width).max(1.);
                         let columns = (width.ceil() as usize).min(2048);
-                        for x in 0..columns {
+                        let key = PeakKey {
+                            stream_index: data.stream_index,
+                            columns,
+                            duration,
+                            source: Arc::as_ptr(waveforms) as usize,
+                        };
+                        let peaks = peak_cache.borrow_mut().get(key, || {
+                            column_peaks(&data.buckets, duration, waveforms.duration, columns)
+                        });
+                        for (x, peak) in peaks.iter().copied().enumerate() {
                             let at = duration.mul_f64((x as f64 + 0.5) / columns as f64);
                             if !draw_track.contains(at)
                                 || !source_ranges.iter().any(|s| at >= s.start && at < s.end)
                             {
                                 continue;
                             }
-                            let from = ((duration.as_secs_f64() * x as f64
-                                / columns as f64
-                                / waveforms.duration.as_secs_f64())
-                                * data.buckets.len() as f64)
-                                as usize;
-                            let to = ((duration.as_secs_f64() * (x + 1) as f64
-                                / columns as f64
-                                / waveforms.duration.as_secs_f64())
-                                * data.buckets.len() as f64)
-                                .ceil() as usize;
-                            let peak = data
-                                .buckets
-                                .get(
-                                    from.min(data.buckets.len())
-                                        ..to.min(data.buckets.len())
-                                            .max(from.min(data.buckets.len())),
-                                )
-                                .map_or(0., |b| b.iter().map(|b| b.peak).fold(0f32, f32::max));
                             let amplitude = display_level(peak * if gain > 0. { gain } else { 1. });
                             if amplitude == 0. {
                                 continue;
@@ -523,6 +581,50 @@ impl ClipEditor {
 #[cfg(test)]
 mod display_tests {
     use super::*;
+    use clipper_media::audio::WaveformBucket;
+
+    fn buckets(peaks: &[f32]) -> Vec<WaveformBucket> {
+        peaks
+            .iter()
+            .map(|&peak| WaveformBucket { peak, rms: peak })
+            .collect()
+    }
+
+    #[test]
+    fn column_peaks_take_the_loudest_bucket_of_each_slice() {
+        let b = buckets(&[0.1, 0.9, 0.2, 0.3, 0.8, 0.1, 0.0, 0.4]);
+        let d = Duration::from_secs(8);
+        assert_eq!(column_peaks(&b, d, d, 4), vec![0.9, 0.3, 0.8, 0.4]);
+        assert_eq!(column_peaks(&b, d, d, 1), vec![0.9]);
+        // Timeline longer than the analysed audio: tail columns are silent.
+        assert_eq!(
+            column_peaks(&b, Duration::from_secs(16), d, 4),
+            vec![0.9, 0.8, 0.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn peak_cache_reuses_layouts_and_stays_bounded() {
+        let mut cache = PeakCache::default();
+        let key = |columns| PeakKey {
+            stream_index: 1,
+            columns,
+            duration: Duration::from_secs(10),
+            source: 42,
+        };
+        let mut computed = 0;
+        for _ in 0..3 {
+            cache.get(key(100), || {
+                computed += 1;
+                vec![0.; 100]
+            });
+        }
+        assert_eq!(computed, 1, "same layout is computed once");
+        for columns in 0..100 {
+            cache.get(key(columns), || vec![0.; columns]);
+        }
+        assert_eq!(cache.len(), PEAK_CACHE_ENTRIES);
+    }
 
     #[test]
     fn waveform_levels_follow_real_peaks() {

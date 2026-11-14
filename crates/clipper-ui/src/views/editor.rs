@@ -104,6 +104,10 @@ pub struct ClipEditor {
     position: Duration,
     /// Drawn playhead: `position` interpolated between player updates.
     playhead: playhead::PlayheadClock,
+    /// Playhead x (px from the timeline origin) in the last rendered frame.
+    playhead_drawn_x: Cell<f32>,
+    /// A vsync check for the playhead is queued (at most one at a time).
+    playhead_frame_queued: Cell<bool>,
     playing: bool,
     ended: bool,
     error: Option<String>,
@@ -125,6 +129,8 @@ pub struct ClipEditor {
     audio_metadata: Option<Vec<AudioTrack>>,
     last_audio_mix: Option<Vec<AudioTrack>>,
     waveforms: Option<Arc<WaveformSet>>,
+    /// Column peaks of the drawn waveforms (see `audio::PeakCache`).
+    waveform_peaks: Rc<std::cell::RefCell<audio::PeakCache>>,
     waveform_task: Option<Task<()>>,
     waveform_error: Option<String>,
     audio_start_input: Entity<TextInput>,
@@ -232,6 +238,8 @@ impl ClipEditor {
             ready: false,
             position: Duration::ZERO,
             playhead: playhead::PlayheadClock::default(),
+            playhead_drawn_x: Cell::new(0.),
+            playhead_frame_queued: Cell::new(false),
             playing: false,
             ended: false,
             error: None,
@@ -253,6 +261,7 @@ impl ClipEditor {
             audio_metadata: None,
             last_audio_mix: None,
             waveforms: None,
+            waveform_peaks: Rc::default(),
             waveform_task: None,
             waveform_error: None,
             audio_start_input,
@@ -544,7 +553,21 @@ impl ClipEditor {
     }
 
     /// Playhead position to draw now (see [`playhead::PlayheadClock`]).
+    /// Records the drawn x for [`Self::queue_playhead_frame`].
     pub(super) fn playhead_position(&self) -> Duration {
+        let position = self.playhead_at(false);
+        if let Some(duration) = self.duration {
+            self.playhead_drawn_x
+                .set(self.playhead_x(position, duration));
+        }
+        position
+    }
+
+    fn playhead_x(&self, position: Duration, duration: Duration) -> f32 {
+        f32::from(self.timeline.get().size.width) * fraction(position, duration)
+    }
+
+    fn playhead_at(&self, peek: bool) -> Duration {
         let Some(duration) = self.duration else {
             return self.position;
         };
@@ -563,7 +586,34 @@ impl ClipEditor {
             })
             .unwrap_or(duration)
             .min(duration);
-        self.playhead.display(Instant::now(), limit)
+        if peek {
+            self.playhead.peek(Instant::now(), limit)
+        } else {
+            self.playhead.display(Instant::now(), limit)
+        }
+    }
+
+    /// While playing, checks once per display refresh whether the playhead
+    /// moved far enough to be visible (half a pixel) and only then redraws.
+    /// At low zoom the line moves a fraction of a pixel per refresh, so most
+    /// refreshes cost nothing; at high zoom it redraws every refresh.
+    pub(super) fn queue_playhead_frame(&self, window: &Window, cx: &mut Context<Self>) {
+        if !self.playhead_animating() || self.playhead_frame_queued.replace(true) {
+            return;
+        }
+        let editor = cx.entity().downgrade();
+        window.on_next_frame(move |window, cx| playhead_frame(editor, window, cx));
+    }
+
+    /// `Some(true)`: redraw now; `Some(false)`: check again next refresh;
+    /// `None`: not playing any more.
+    fn playhead_moved(&self) -> Option<bool> {
+        if !self.playhead_animating() {
+            return None;
+        }
+        let duration = self.duration?;
+        let x = self.playhead_x(self.playhead_at(true), duration);
+        Some((x - self.playhead_drawn_x.get()).abs() >= PLAYHEAD_MIN_STEP_PX)
     }
 
     /// While playing, the playhead moves every display refresh.
@@ -844,6 +894,25 @@ fn position_fraction(x: Pixels, bounds: Bounds<Pixels>) -> f32 {
         return 0.0;
     }
     (f32::from(x - bounds.origin.x) / width).clamp(0.0, 1.0)
+}
+
+/// Smallest playhead movement worth a redraw, in logical pixels.
+const PLAYHEAD_MIN_STEP_PX: f32 = 0.5;
+
+fn playhead_frame(editor: gpui::WeakEntity<ClipEditor>, window: &mut Window, cx: &mut gpui::App) {
+    let Some(editor) = editor.upgrade() else {
+        return;
+    };
+    let moved = editor.update(cx, |this, _| {
+        this.playhead_frame_queued.set(false);
+        this.playhead_moved()
+    });
+    match moved {
+        // Rendering queues the next check.
+        Some(true) => editor.update(cx, |_, cx| cx.notify()),
+        Some(false) => editor.update(cx, |this, cx| this.queue_playhead_frame(window, cx)),
+        None => {}
+    }
 }
 
 fn fraction(at: Duration, duration: Duration) -> f32 {
