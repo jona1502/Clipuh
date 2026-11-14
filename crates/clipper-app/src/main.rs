@@ -168,6 +168,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     drop(hotkey);
     drop(recorder);
 
+    // A notification sound may still be playing from memory.
+    clipper_platform::windows::sound::stop();
     log::info!("clipuh shut down");
     clipper_diagnostics::shutdown();
 

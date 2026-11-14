@@ -48,6 +48,17 @@ const ACTION_H: f32 = 28.0;
 const ICON_W: f32 = 18.0;
 const TOAST_H: f32 = (PAD + BORDER) * 2.0 + TITLE_H + GAP + DESC_H + GAP + ACTION_H;
 
+/// The sound of a toast: the clip-saved sound only for a finished save (the
+/// toast comes from the recorder's `ReplaySaved` event, sent after the file
+/// was finalised), the error sound for a failed one, nothing while saving.
+fn sound_for(toast: &Toast) -> Option<crate::sounds::SoundKind> {
+    match toast {
+        Toast::Saved { .. } => Some(crate::sounds::SoundKind::Success),
+        Toast::Failed { .. } => Some(crate::sounds::SoundKind::Error),
+        Toast::Saving => None,
+    }
+}
+
 /// `None` means do nothing at all (no window, no sound).
 fn plan(
     toast: &Toast,
@@ -85,8 +96,10 @@ impl Notifier {
         let Some(plan) = plan(&toast, settings, notify::exclusive_fullscreen_active()) else {
             return;
         };
-        if plan.play_sound {
-            notify::play_notification_sound();
+        if plan.play_sound
+            && let Some(kind) = sound_for(&toast)
+        {
+            crate::sounds::play(kind, settings);
         }
         if !plan.show_window {
             return;
@@ -380,6 +393,7 @@ mod tests {
             notify_on_failure: true,
             in_app: true,
             native: true,
+            ..NotificationSettings::default()
         }
     }
     fn saved() -> Toast {
@@ -392,6 +406,18 @@ mod tests {
         Toast::Failed {
             message: "x".into(),
         }
+    }
+
+    #[test]
+    fn only_a_finished_save_plays_the_success_sound() {
+        use crate::sounds::SoundKind;
+        assert_eq!(sound_for(&saved()), Some(SoundKind::Success));
+        assert_eq!(sound_for(&failed()), Some(SoundKind::Error));
+        assert_eq!(
+            sound_for(&Toast::Saving),
+            None,
+            "pressing the hotkey is not success"
+        );
     }
 
     #[test]

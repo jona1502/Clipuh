@@ -769,6 +769,51 @@ pub struct NotificationSettings {
     /// Show native Windows notifications from the tray icon for important
     /// events while the main window is not in front. Needs the tray icon.
     pub native: bool,
+    /// Which sound plays when a clip was saved (`sound` switches it off).
+    #[serde(deserialize_with = "lenient_default")]
+    pub sound_choice: SoundChoice,
+    /// File name of the imported sound inside [`sound_directory`]. Only a
+    /// bare file name is kept; anything path-like is dropped on load.
+    #[serde(deserialize_with = "lenient_sound_file")]
+    pub custom_sound: Option<String>,
+}
+
+/// The clip-saved sound.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SoundChoice {
+    /// The bundled clipuh sound (`clipuh_05_synth_check.wav`).
+    #[default]
+    Default,
+    /// The imported sound in `custom_sound`.
+    Custom,
+}
+
+impl NotificationSettings {
+    /// The imported sound's file name when it is the selected sound.
+    pub fn selected_custom_sound(&self) -> Option<&str> {
+        match self.sound_choice {
+            SoundChoice::Custom => self.custom_sound.as_deref(),
+            SoundChoice::Default => None,
+        }
+    }
+}
+
+/// A bare file name (no folders, no `..`), as stored for imported sounds.
+pub fn is_plain_file_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 255
+        && !name.contains(['/', '\\', ':'])
+        && name != "."
+        && name != ".."
+}
+
+fn lenient_sound_file<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let name: Option<String> = lenient_option(deserializer)?;
+    Ok(name.filter(|name| is_plain_file_name(name)))
 }
 
 impl Default for NotificationSettings {
@@ -781,6 +826,8 @@ impl Default for NotificationSettings {
             notify_on_failure: true,
             in_app: true,
             native: true,
+            sound_choice: SoundChoice::Default,
+            custom_sound: None,
         }
     }
 }
@@ -940,6 +987,12 @@ pub fn default_recording_directory() -> Result<PathBuf, ConfigError> {
         .map(Path::to_path_buf)
         .unwrap_or_else(|| user_dirs.home_dir().join("Videos"));
     Ok(videos.join("Clipper"))
+}
+
+/// Imported notification sounds (`%LOCALAPPDATA%\\Clipper\\sounds`).
+pub fn sound_directory() -> Result<PathBuf, ConfigError> {
+    let base = BaseDirs::new().ok_or(ConfigError::NoConfigDirectory)?;
+    Ok(base.data_local_dir().join("Clipper").join("sounds"))
 }
 
 /// Returns the default replay SSD cache directory
@@ -2097,6 +2150,8 @@ hotkey = \"F9\"
             notify_on_failure: false,
             in_app: false,
             native: false,
+            sound_choice: SoundChoice::Custom,
+            custom_sound: Some("ping-00ff.wav".to_owned()),
         };
         let path = temp.path("custom.toml");
         config.save_to(&path).expect("save");

@@ -1,14 +1,14 @@
-//! Overlay helpers: fullscreen detection, non-activating show, notification sound.
+//! Overlay helpers: fullscreen detection and non-activating show. Notification
+//! sounds live in [`super::sound`].
 
 use windows::Win32::Foundation::{HWND, POINT, RECT};
-use windows::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Shell::{QUNS_RUNNING_D3D_FULL_SCREEN, SHQueryUserNotificationState};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GWL_EXSTYLE, GetCursorPos, GetWindowLongPtrW, GetWindowRect, HWND_TOPMOST, MB_OK,
-    SPI_GETWORKAREA, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_SHOWWINDOW,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetWindowLongPtrW, SetWindowPos, SystemParametersInfoW,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    GWL_EXSTYLE, GetCursorPos, GetWindowLongPtrW, GetWindowRect, HWND_TOPMOST, SPI_GETWORKAREA,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_SHOWWINDOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    SetWindowLongPtrW, SetWindowPos, SystemParametersInfoW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST,
 };
 
 /// True when a Direct3D exclusive-fullscreen app is running; overlays cannot
@@ -75,10 +75,4 @@ pub fn cursor_over_window(hwnd: isize) -> bool {
     known
         && (rect.left..rect.right).contains(&cursor.x)
         && (rect.top..rect.bottom).contains(&cursor.y)
-}
-
-/// Short system notification sound; MessageBeep returns immediately.
-pub fn play_notification_sound() {
-    // SAFETY: no pointer arguments.
-    let _ = unsafe { MessageBeep(MB_OK) };
 }

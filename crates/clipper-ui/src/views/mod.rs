@@ -324,6 +324,10 @@ pub struct ClipperWindow {
     diagnostics_notice: Option<(bool, String)>,
     /// A debug-log export is running (the button is disabled meanwhile).
     diagnostics_exporting: bool,
+    /// Last clip-saved sound message: `(is_error, text)`.
+    sound_notice: Option<(bool, String)>,
+    /// A sound import or load is running.
+    sound_busy: bool,
 }
 
 impl ClipperWindow {
@@ -614,6 +618,8 @@ impl ClipperWindow {
             settings_notice: None,
             diagnostics_notice: None,
             diagnostics_exporting: false,
+            sound_notice: None,
+            sound_busy: false,
         };
         this.storage_projection_cache.refresh(&this.config);
         this.refresh_storage(cx);
@@ -621,6 +627,7 @@ impl ClipperWindow {
         this.send(RecorderCommand::RefreshSources);
         this.refresh_audio_lists(cx);
         this.register_hotkey(cx);
+        this.load_custom_sound(cx);
         this
     }
 
