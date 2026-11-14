@@ -10,3 +10,8 @@ pub mod trim;
 
 #[cfg(windows)]
 pub mod exact;
+
+#[cfg(windows)]
+pub mod audio;
+#[cfg(windows)]
+mod audio_preview;

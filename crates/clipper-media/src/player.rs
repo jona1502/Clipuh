@@ -1,15 +1,20 @@
 //! Video playback for the clip editor: `IMFMediaEngine` in frame-server mode
 //! (hardware decode through a DXGI device manager, audio rendered by the
 //! engine itself). Frames are copied to CPU BGRA buffers for the UI.
+//! Editor-supplied audio tracks replace engine audio with the bounded WASAPI
+//! mixer; its scheduling follows this engine's source time.
 //!
 //! One dedicated thread owns every COM object; the engine's notify callback
 //! (an MF worker thread) only forwards events into the thread's mailbox.
 
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+use crate::audio_preview::AudioPreview;
+use clipper_editor::AudioTrack;
 
 use clipper_encoder::backends::media_foundation::MediaFoundation;
 use clipper_platform::windows::{ComApartment, D3DContext};
@@ -48,12 +53,15 @@ pub enum PlayerEvent {
     Playing(bool),
     Ended,
     Error(String),
+    /// Nonfatal output-device or multitrack decode failure; video keeps playing.
+    AudioError(String),
 }
 
 enum Cmd {
     Play,
     Pause,
     Seek(Duration),
+    AudioTracks,
     Shutdown,
 }
 
@@ -66,6 +74,7 @@ pub struct Player {
     tx: mpsc::Sender<Msg>,
     events: async_channel::Sender<PlayerEvent>,
     thread: Option<JoinHandle<()>>,
+    audio_tracks: Arc<Mutex<Option<Vec<AudioTrack>>>>,
 }
 
 impl Player {
@@ -75,11 +84,14 @@ impl Player {
         let (etx, erx) = async_channel::bounded(16);
         let (tx, rx) = mpsc::channel();
         let path = path.to_path_buf();
+        let audio_tracks = Arc::new(Mutex::new(None));
+        let thread_tracks = audio_tracks.clone();
         let (thread_tx, thread_etx) = (tx.clone(), etx.clone());
         let thread = std::thread::Builder::new()
             .name("clip-player".into())
             .spawn(move || {
-                if let Err(Exit::Fail(message)) = run(&path, max_width, &rx, thread_tx, &thread_etx)
+                if let Err(Exit::Fail(message)) =
+                    run(&path, max_width, &rx, thread_tx, &thread_etx, thread_tracks)
                 {
                     let _ = thread_etx.send_blocking(PlayerEvent::Error(message));
                 }
@@ -93,6 +105,7 @@ impl Player {
                 tx,
                 events: etx,
                 thread,
+                audio_tracks,
             },
             erx,
         )
@@ -100,6 +113,22 @@ impl Player {
 
     pub fn play(&self) {
         let _ = self.tx.send(Msg::Cmd(Cmd::Play));
+    }
+
+    /// Replaces the source-domain audio mix without creating a video session.
+    pub fn set_audio_tracks(&self, tracks: Vec<AudioTrack>) {
+        let notify = {
+            let mut pending = self
+                .audio_tracks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            pending.replace(tracks).is_none()
+        };
+        // Audio gestures retain one latest snapshot and at most one wake in
+        // the existing player mailbox, regardless of UI input frequency.
+        if notify {
+            let _ = self.tx.send(Msg::Cmd(Cmd::AudioTracks));
+        }
     }
 
     pub fn pause(&self) {
@@ -303,6 +332,7 @@ fn run(
     rx: &mpsc::Receiver<Msg>,
     self_tx: mpsc::Sender<Msg>,
     events: &async_channel::Sender<PlayerEvent>,
+    audio_tracks: Arc<Mutex<Option<Vec<AudioTrack>>>>,
 ) -> Result<(), Exit> {
     if !path.is_file() {
         return Err(Exit::Fail("The clip file could not be found.".into()));
@@ -357,6 +387,9 @@ fn run(
     // Paused and the engine reached a new position: show its frame now.
     let mut force_frame = false;
     let mut last_position = Instant::now();
+    let mut audio: Option<AudioPreview> = None;
+    let mut audio_muted = false;
+    let mut audio_seeking = false;
 
     loop {
         let msg = if playing || settle.is_some() {
@@ -375,21 +408,65 @@ fn run(
 
         match msg {
             Some(Msg::Cmd(Cmd::Shutdown)) => return Ok(()),
+            Some(Msg::Cmd(Cmd::AudioTracks)) => {
+                let Some(tracks) = audio_tracks
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                else {
+                    continue;
+                };
+                if audio.is_none() {
+                    match AudioPreview::open(path, events.clone()) {
+                        Ok(preview) => audio = Some(preview),
+                        Err(error) => {
+                            // SAFETY: valid engine; a failed custom mix must not
+                            // leak the engine's unedited default audio stream.
+                            unsafe {
+                                engine.SetMuted(true)?;
+                            }
+                            audio_muted = true;
+                            let _ = events.try_send(PlayerEvent::AudioError(error));
+                        }
+                    }
+                }
+                if let Some(audio) = &audio {
+                    audio.set_tracks(tracks);
+                    // SAFETY: engine time is the only authoritative clock.
+                    let now = unsafe { engine.GetCurrentTime() };
+                    audio.synchronize(
+                        Duration::from_secs_f64(now.max(0.0)),
+                        playing && !audio_seeking,
+                        false,
+                    );
+                }
+            }
             Some(Msg::Cmd(Cmd::Play)) if surfaces.is_some() => {
                 // SAFETY: valid engine.
                 unsafe {
                     if ended {
                         engine.SetCurrentTime(0.0)?;
+                        audio_seeking = true;
                         ended = false;
                     }
                     engine.Play()?;
                 }
                 playing = true;
+                if let Some(audio) = &audio {
+                    // SAFETY: valid engine; uses the post-play/restart time.
+                    let now = unsafe { engine.GetCurrentTime() };
+                    audio.synchronize(Duration::from_secs_f64(now.max(0.0)), !audio_seeking, true);
+                }
                 send(PlayerEvent::Playing(true))?;
             }
             Some(Msg::Cmd(Cmd::Pause)) => {
                 // SAFETY: valid engine.
                 unsafe { engine.Pause()? };
+                if let Some(audio) = &audio {
+                    // SAFETY: valid engine.
+                    let now = unsafe { engine.GetCurrentTime() };
+                    audio.synchronize(Duration::from_secs_f64(now.max(0.0)), false, true);
+                }
                 if playing {
                     playing = false;
                     send(PlayerEvent::Playing(false))?;
@@ -398,8 +475,12 @@ fn run(
             // shortcut: play/seek before metadata loads are ignored; the UI waits for Loaded.
             Some(Msg::Cmd(Cmd::Seek(position))) if surfaces.is_some() => {
                 ended = false;
+                audio_seeking = true;
                 // SAFETY: valid engine.
                 unsafe { engine.SetCurrentTime(position.min(duration).as_secs_f64())? };
+                if let Some(audio) = &audio {
+                    audio.synchronize(position.min(duration), false, true);
+                }
             }
             Some(Msg::Engine(event, extended)) => match event {
                 e if e == MF_MEDIA_ENGINE_EVENT_LOADEDMETADATA.0 as u32 => {
@@ -436,18 +517,26 @@ fn run(
                 // In frame-server mode a paused seek only completes while
                 // OnVideoStreamTick is being polled.
                 e if e == MF_MEDIA_ENGINE_EVENT_SEEKING.0 as u32 => {
+                    audio_seeking = true;
                     settle = Some(Instant::now() + Duration::from_secs(2));
                 }
                 e if e == MF_MEDIA_ENGINE_EVENT_SEEKED.0 as u32 => {
+                    audio_seeking = false;
                     settle = Some(Instant::now() + Duration::from_millis(300));
                     force_frame = !playing;
                     // SAFETY: valid engine.
                     let now = unsafe { engine.GetCurrentTime() };
+                    if let Some(audio) = &audio {
+                        audio.synchronize(Duration::from_secs_f64(now.max(0.0)), playing, true);
+                    }
                     send(PlayerEvent::Position(Duration::from_secs_f64(now.max(0.0))))?;
                 }
                 e if e == MF_MEDIA_ENGINE_EVENT_ENDED.0 as u32 => {
                     playing = false;
                     ended = true;
+                    if let Some(audio) = &audio {
+                        audio.synchronize(duration, false, true);
+                    }
                     send(PlayerEvent::Playing(false))?;
                     send(PlayerEvent::Position(duration))?;
                     send(PlayerEvent::Ended)?;
@@ -460,6 +549,28 @@ fn run(
             _ => {}
         }
 
+        if let Some(audio) = &audio {
+            if audio.owns_audio() {
+                if !audio_muted {
+                    // SAFETY: custom output is initialized (or explicitly failed).
+                    unsafe {
+                        engine.SetMuted(true)?;
+                    }
+                    audio_muted = true;
+                }
+                audio.activate();
+            }
+            // The audio worker consumes a bounded lookahead of this exact
+            // engine position. It never advances a second playback clock.
+            // SAFETY: valid engine on its owning thread.
+            let now = unsafe { engine.GetCurrentTime() };
+            let seeking = audio_seeking || unsafe { engine.IsSeeking().as_bool() };
+            audio.synchronize(
+                Duration::from_secs_f64(now.max(0.0)),
+                playing && !seeking,
+                false,
+            );
+        }
         if let (Some(s), true) = (&surfaces, playing || settle.is_some()) {
             if let Some(frame) = grab(engine, &d3d, s, std::mem::take(&mut force_frame))? {
                 settle = None;
@@ -486,6 +597,98 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a Windows default render endpoint and hardware media engine"]
+    fn multitrack_preview_device_smoke() {
+        let dir = crate::trim::tests::temp_dir("audio-preview-device");
+        let path = dir.join("source.mp4");
+        crate::trim::tests::write_test_clip(&path, 3, 2);
+        let (player, events) = Player::open(&path, 320);
+        let mut tracks = crate::audio::discover(&path).unwrap();
+        assert_eq!(tracks.len(), 2);
+        // Commands before metadata must remain applied after the player loads.
+        tracks[0].muted = true;
+        tracks[1].gain_percent = 50;
+        player.set_audio_tracks(tracks.clone());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut loaded = false;
+        while Instant::now() < deadline {
+            match events.try_recv() {
+                Ok(PlayerEvent::Loaded { .. }) => {
+                    loaded = true;
+                    break;
+                }
+                Ok(PlayerEvent::Error(error) | PlayerEvent::AudioError(error)) => panic!("{error}"),
+                _ => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        assert!(loaded, "player failed to load");
+        player.play();
+        let deadline = Instant::now() + Duration::from_millis(600);
+        let mut positions = 0;
+        while Instant::now() < deadline {
+            match events.try_recv() {
+                Ok(PlayerEvent::Error(error) | PlayerEvent::AudioError(error)) => panic!("{error}"),
+                Ok(PlayerEvent::Position(_)) => positions += 1,
+                _ => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        assert!(positions > 0);
+        // Repeated gain gestures must not recreate the endpoint or seek the
+        // streaming decoder. Exercise live updates while video keeps running.
+        for gain in 51..=90 {
+            tracks[1].gain_percent = gain;
+            player.set_audio_tracks(tracks.clone());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        player.pause();
+        tracks[0].muted = false;
+        tracks[0].solo = true;
+        tracks[1].segments.clear();
+        player.set_audio_tracks(tracks);
+        player.seek(Duration::from_millis(1250));
+        player.play();
+        let deadline = Instant::now() + Duration::from_millis(600);
+        while Instant::now() < deadline {
+            match events.try_recv() {
+                Ok(PlayerEvent::Error(error) | PlayerEvent::AudioError(error)) => panic!("{error}"),
+                _ => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        let started = Instant::now();
+        drop(player);
+        assert!(started.elapsed() < Duration::from_secs(3));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn gain_commands_coalesce_into_one_pending_snapshot() {
+        let (tx, commands) = mpsc::channel();
+        let (events, _) = async_channel::bounded(16);
+        let player = Player {
+            tx,
+            events,
+            thread: None,
+            audio_tracks: Arc::new(Mutex::new(None)),
+        };
+        let mut tracks = vec![AudioTrack::new(
+            1,
+            "Audio".into(),
+            2,
+            48_000,
+            Duration::from_secs(3),
+        )];
+        for gain in 1..=200 {
+            tracks[0].gain_percent = gain;
+            player.set_audio_tracks(tracks.clone());
+        }
+        assert_eq!(commands.try_iter().count(), 1);
+        assert_eq!(
+            player.audio_tracks.lock().unwrap().as_ref().unwrap()[0].gain_percent,
+            200
+        );
+    }
 
     #[test]
     fn preview_size_cases() {
