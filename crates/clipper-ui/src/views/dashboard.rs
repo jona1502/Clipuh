@@ -5,7 +5,7 @@ use clipper_storage::config::ReplayMode;
 use clipper_storage::storage_projection::StorageProjection;
 use clipper_storage::{VIDEO_FPS, VIDEO_RESOLUTIONS, video_mode_supported};
 use gpui::prelude::*;
-use gpui::{AnyElement, Context, Div, FontWeight, SharedString, Window, div, px, rgb};
+use gpui::{AnyElement, Context, Div, FontWeight, SharedString, Window, div, px};
 
 use super::{CaptureMenu, ClipperWindow, Confirm, Dismiss, SelectNext, SelectPrevious};
 use crate::components::{
@@ -16,13 +16,14 @@ use crate::state::{
     Phase, ReplayPhase, format_decimal_size, format_elapsed, format_megabytes, format_mib,
     resolution_label, tier_label,
 };
-use crate::theme;
+use crate::theme::{ActiveTheme, Theme};
 
 pub(super) fn content(
     window: &ClipperWindow,
     win: &Window,
     cx: &mut Context<ClipperWindow>,
 ) -> Div {
+    let t = *cx.theme();
     div()
         .flex()
         .flex_col()
@@ -39,39 +40,47 @@ pub(super) fn content(
         .child(sources(window, cx))
         .child(capture_settings(window, win, cx))
         .child(overview(window, cx))
-        .child(performance(window))
-        .child(recent_clips())
+        .child(performance(&t, window))
+        .child(recent_clips(&t))
 }
 
-fn section(title: &'static str, note: Option<SharedString>) -> Div {
+fn section(t: &Theme, title: &'static str, note: Option<SharedString>) -> Div {
     div()
         .flex()
         .flex_col()
         .gap_3()
-        .child(section_header(title, note))
+        .child(section_header(t, title, note))
 }
 
 fn error_banner(message: String, cx: &mut Context<ClipperWindow>) -> Div {
-    panel()
+    let t = *cx.theme();
+    panel(&t)
         .px_4()
         .py_3()
         .flex()
         .items_center()
         .gap_3()
-        .border_color(rgb(theme::RECORDING))
-        .child(status_dot(Tone::Danger))
+        .border_color(t.colors.recording)
+        .child(status_dot(&t, Tone::Danger))
         .child(div().flex_1().text_sm().child(message))
         .child(
-            button("dismiss-error", "Dismiss", ButtonVariant::Ghost, None, true).on_click(
-                cx.listener(|this, _, _, cx| {
-                    this.recording.dismiss_error();
-                    cx.notify();
-                }),
-            ),
+            button(
+                &t,
+                "dismiss-error",
+                "Dismiss",
+                ButtonVariant::Ghost,
+                None,
+                true,
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.recording.dismiss_error();
+                cx.notify();
+            })),
         )
 }
 
 fn replay(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
+    let t = *cx.theme();
     let state = &window.recording;
     let replay = &state.replay;
     let config = &window.config.replay;
@@ -110,9 +119,10 @@ fn replay(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
             this.cursor_pointer()
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_replay(cx)))
         })
-        .child(switch(on));
+        .child(switch(&t, on));
     let save_enabled = replay.is_running();
     let save = button(
+        &t,
         "save-replay",
         "Save replay",
         ButtonVariant::Secondary,
@@ -132,7 +142,7 @@ fn replay(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
         .flex()
         .items_center()
         .gap_3()
-        .child(status_dot(tone))
+        .child(status_dot(&t, tone))
         .child(
             div()
                 .flex_1()
@@ -149,7 +159,7 @@ fn replay(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
                 .children(detail.map(|detail| {
                     div()
                         .text_xs()
-                        .text_color(rgb(theme::TEXT_TERTIARY))
+                        .text_color(t.colors.text_muted)
                         .truncate()
                         .child(detail)
                 })),
@@ -157,9 +167,9 @@ fn replay(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
         .child(save)
         .child(toggle);
 
-    let mut card = panel().child(header);
+    let mut card = panel(&t).child(header);
     if replay.is_running() {
-        let metric = |value: String| value_text(value);
+        let metric = |value: String| value_text(&t, value);
         let (buffered, configured, ram, disk, tier, exports) = match &replay.status {
             Some(status) => (
                 format_elapsed(status.buffered),
@@ -185,15 +195,17 @@ fn replay(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
         };
         card = card
             .child(property_row(
+                &t,
                 "Buffered",
                 Some("Footage available to save right now.".into()),
                 metric(format!("{buffered} / {configured}")),
                 false,
             ))
-            .child(property_row("Memory", None, metric(ram), false))
-            .child(property_row("Disk cache", None, metric(disk), false))
-            .child(property_row("Storage", None, metric(tier), false))
+            .child(property_row(&t, "Memory", None, metric(ram), false))
+            .child(property_row(&t, "Disk cache", None, metric(disk), false))
+            .child(property_row(&t, "Storage", None, metric(tier), false))
             .child(property_row(
+                &t,
                 "Saves in progress",
                 None,
                 metric(exports),
@@ -204,21 +216,22 @@ fn replay(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
             .as_ref()
             .and_then(|status| status.warning.clone())
         {
-            card = card.child(replay_notice(warning, Tone::Warning));
+            card = card.child(replay_notice(&t, warning, Tone::Warning));
         }
     }
     if let Some(error) = replay.error.clone() {
-        card = card.child(replay_notice(error, Tone::Danger));
+        card = card.child(replay_notice(&t, error, Tone::Danger));
     }
 
     section(
+        &t,
         "Instant replay",
         Some(format!("Save: {}", config.hotkey).into()),
     )
     .child(card)
 }
 
-fn replay_notice(message: String, tone: Tone) -> Div {
+fn replay_notice(t: &Theme, message: String, tone: Tone) -> Div {
     div()
         .px_4()
         .py_3()
@@ -226,12 +239,13 @@ fn replay_notice(message: String, tone: Tone) -> Div {
         .items_center()
         .gap_3()
         .border_t_1()
-        .border_color(rgb(theme::BORDER))
-        .child(status_dot(tone))
+        .border_color(t.colors.border)
+        .child(status_dot(t, tone))
         .child(div().flex_1().min_w_0().text_sm().child(message))
 }
 
 fn recording(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
+    let t = *cx.theme();
     let state = &window.recording;
     let (label, variant, enabled) = match state.phase {
         Phase::Idle => ("Start recording", ButtonVariant::Primary, state.can_start()),
@@ -240,7 +254,7 @@ fn recording(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
         Phase::Stopping => ("Saving…", ButtonVariant::Danger, false),
     };
     let stop = state.phase == Phase::Recording;
-    let toggle = button("record-toggle", label, variant, None, enabled).when(enabled, |this| {
+    let toggle = button(&t, "record-toggle", label, variant, None, enabled).when(enabled, |this| {
         this.on_click(cx.listener(move |this, _, _, cx| {
             if stop {
                 if this.send(RecorderCommand::StopRecording) {
@@ -277,14 +291,14 @@ fn recording(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
         Phase::Recording | Phase::Stopping => Tone::Danger,
     };
 
-    section("Recording", None).child(
-        panel()
+    section(&t, "Recording", None).child(
+        panel(&t)
             .px_4()
             .py_3()
             .flex()
             .items_center()
             .gap_3()
-            .child(status_dot(tone))
+            .child(status_dot(&t, tone))
             .child(
                 div()
                     .flex_1()
@@ -301,7 +315,7 @@ fn recording(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
                     .children(detail.map(|detail| {
                         div()
                             .text_xs()
-                            .text_color(rgb(theme::TEXT_TERTIARY))
+                            .text_color(t.colors.text_muted)
                             .truncate()
                             .child(detail)
                     })),
@@ -311,9 +325,11 @@ fn recording(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
 }
 
 fn sources(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
+    let t = *cx.theme();
     let state = &window.recording;
     let enabled = state.settings_enabled();
     let refresh = button(
+        &t,
         "refresh-sources",
         "Refresh",
         ButtonVariant::Ghost,
@@ -337,6 +353,7 @@ fn sources(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
         .gap_0p5();
     if state.sources.is_empty() {
         list = list.child(empty_state(
+            &t,
             "▭",
             "No sources found",
             "Open the game or window you want to record, then refresh.",
@@ -353,7 +370,7 @@ fn sources(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
                         .pt_2()
                         .pb_1()
                         .text_xs()
-                        .text_color(rgb(theme::TEXT_TERTIARY))
+                        .text_color(t.colors.text_muted)
                         .child(title),
                 )
                 .children(
@@ -378,10 +395,10 @@ fn sources(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
                 .flex()
                 .items_center()
                 .justify_between()
-                .child(section_header("Source", None))
+                .child(section_header(&t, "Source", None))
                 .child(refresh),
         )
-        .child(panel().child(list))
+        .child(panel(&t).child(list))
 }
 
 fn source_row(
@@ -390,17 +407,18 @@ fn source_row(
     enabled: bool,
     cx: &mut Context<ClipperWindow>,
 ) -> AnyElement {
+    let t = *cx.theme();
     let (kind, id) = (source.kind, source.id);
     let (prefix, glyph) = match kind {
         SourceKind::Monitor => ("mon", "▭"),
         SourceKind::Window => ("win", "◰"),
     };
-    list_item((prefix, id), glyph, source.name.clone(), None, selected)
+    list_item(&t, (prefix, id), glyph, source.name.clone(), None, selected)
         .child(
             div()
                 .flex_none()
                 .text_xs()
-                .text_color(rgb(theme::TEXT_TERTIARY))
+                .text_color(t.colors.text_muted)
                 .child(format!("{}×{}", source.width, source.height)),
         )
         .map(|this| {
@@ -495,6 +513,7 @@ fn bitrate_options() -> Vec<DropdownOption> {
 }
 
 fn capture_settings(window: &ClipperWindow, win: &Window, cx: &mut Context<ClipperWindow>) -> Div {
+    let t = *cx.theme();
     let note = (!window.recording.settings_enabled())
         .then(|| "Changes apply to the next recording.".into());
     let cards = CAPTURE_MENUS.into_iter().enumerate().map(|(index, menu)| {
@@ -517,10 +536,11 @@ fn capture_settings(window: &ClipperWindow, win: &Window, cx: &mut Context<Clipp
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(theme::TEXT_TERTIARY))
+                    .text_color(t.colors.text_muted)
                     .child(menu.label()),
             )
             .child(dropdown(
+                &t,
                 ("capture-menu", index),
                 &options,
                 selected,
@@ -541,7 +561,7 @@ fn capture_settings(window: &ClipperWindow, win: &Window, cx: &mut Context<Clipp
             )
             .on_action(cx.listener(|this, _: &Dismiss, _, cx| this.capture_close(cx)))
     });
-    section("Capture settings", note).child(div().flex().flex_wrap().gap_3().children(cards))
+    section(&t, "Capture settings", note).child(div().flex().flex_wrap().gap_3().children(cards))
 }
 
 impl ClipperWindow {
@@ -631,6 +651,7 @@ impl ClipperWindow {
 }
 
 fn overview(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
+    let t = *cx.theme();
     let configured = window.storage_projection_cache.projection();
     let pending = window.storage_projection_run.pending();
     let active = window.storage_projection_run.active();
@@ -659,6 +680,7 @@ fn overview(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
         .clone()
         .unwrap_or_else(|| "Auto".to_owned());
     let encoder_tile = stat_tile(
+        &t,
         "Encoder",
         "H.264",
         format!(
@@ -676,117 +698,115 @@ fn overview(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
         .replay
         .hotkey
         .split('+')
-        .map(|key| kbd(key.trim().to_owned()));
+        .map(|key| kbd(&t, key.trim().to_owned()));
 
-    let storage_tile = if let Some(projection) = projection {
-        let sizes = projection.sizes;
-        let mut tile = panel()
-            .flex_1()
-            .min_w_0()
-            .p_4()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(theme::TEXT_TERTIARY))
-                    .child("Storage estimate"),
-            )
-            .child(
-                div()
-                    .text_lg()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(format!("{} / min", format_decimal_size(sizes[1]))),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(theme::TEXT_SECONDARY))
-                    .child(format!(
-                        "30 s {} · 1 min {}",
-                        format_decimal_size(sizes[0]),
-                        format_decimal_size(sizes[1]),
-                    )),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(theme::TEXT_SECONDARY))
-                    .child(format!(
-                        "2 min {} · 5 min {}",
-                        format_decimal_size(sizes[2]),
-                        format_decimal_size(sizes[3]),
-                    )),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(theme::TEXT_TERTIARY))
-                    .child(target_rate_description(projection)),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(theme::TEXT_TERTIARY))
-                    .child(projection_assumptions(projection)),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(theme::TEXT_TERTIARY))
-                    .child(status),
-            );
-        if is_active && differs_from_next {
-            if let Some(next) = configured {
-                tile = tile.child(div().text_xs().text_color(rgb(theme::TEXT_TERTIARY)).child(
-                    format!(
-                        "Next: {} · {} fps · {} · {} / min · replay {} s / {} RAM",
-                        resolution_label(window.config.video.width, window.config.video.height),
-                        window.config.video.fps,
-                        format_video_rate(next.video_bps),
-                        format_decimal_size(next.sizes[1]),
-                        next.replay_duration_seconds,
-                        format_mib(next.replay.ram_budget_bytes),
-                    ),
-                ));
-            } else if let Some(error) = window.storage_projection_cache.error() {
-                tile = tile.child(
+    let storage_tile =
+        if let Some(projection) = projection {
+            let sizes = projection.sizes;
+            let mut tile = panel(&t)
+                .flex_1()
+                .min_w_0()
+                .p_4()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
                     div()
                         .text_xs()
-                        .text_color(rgb(theme::TEXT_TERTIARY))
-                        .child(format!("Next estimate unavailable: {error}")),
+                        .text_color(t.colors.text_muted)
+                        .child("Storage estimate"),
+                )
+                .child(
+                    div()
+                        .text_lg()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(format!("{} / min", format_decimal_size(sizes[1]))),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(t.colors.text_secondary)
+                        .child(format!(
+                            "30 s {} · 1 min {}",
+                            format_decimal_size(sizes[0]),
+                            format_decimal_size(sizes[1]),
+                        )),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(t.colors.text_secondary)
+                        .child(format!(
+                            "2 min {} · 5 min {}",
+                            format_decimal_size(sizes[2]),
+                            format_decimal_size(sizes[3]),
+                        )),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(t.colors.text_muted)
+                        .child(target_rate_description(projection)),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(t.colors.text_muted)
+                        .child(projection_assumptions(projection)),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(t.colors.text_muted)
+                        .child(status),
                 );
+            if is_active && differs_from_next {
+                if let Some(next) = configured {
+                    tile = tile.child(div().text_xs().text_color(t.colors.text_muted).child(
+                        format!(
+                            "Next: {} · {} fps · {} · {} / min · replay {} s / {} RAM",
+                            resolution_label(window.config.video.width, window.config.video.height),
+                            window.config.video.fps,
+                            format_video_rate(next.video_bps),
+                            format_decimal_size(next.sizes[1]),
+                            next.replay_duration_seconds,
+                            format_mib(next.replay.ram_budget_bytes),
+                        ),
+                    ));
+                } else if let Some(error) = window.storage_projection_cache.error() {
+                    tile = tile.child(
+                        div()
+                            .text_xs()
+                            .text_color(t.colors.text_muted)
+                            .child(format!("Next estimate unavailable: {error}")),
+                    );
+                }
             }
-        }
-        tile
-    } else {
-        panel()
-            .flex_1()
-            .min_w_0()
-            .p_4()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(theme::TEXT_TERTIARY))
-                    .child("Storage estimate"),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(theme::TEXT_SECONDARY))
-                    .child(
+            tile
+        } else {
+            panel(&t)
+                .flex_1()
+                .min_w_0()
+                .p_4()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(t.colors.text_muted)
+                        .child("Storage estimate"),
+                )
+                .child(
+                    div().text_xs().text_color(t.colors.text_secondary).child(
                         window
                             .storage_projection_cache
                             .error()
                             .unwrap_or("Unavailable")
                             .to_owned(),
                     ),
-            )
-    };
+                )
+        };
 
     let mode = match window.config.replay.mode {
         ReplayMode::Hybrid => "Hybrid",
@@ -798,7 +818,7 @@ fn overview(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
             .flex_col()
             .gap_0p5()
             .text_xs()
-            .text_color(rgb(theme::TEXT_TERTIARY))
+            .text_color(t.colors.text_muted)
             .child(format!(
                 "{} total · RAM budget {} · SSD {} theoretical",
                 // Total and SSD are estimates from the same target-rate projection.
@@ -811,10 +831,11 @@ fn overview(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
     } else {
         div()
             .text_xs()
-            .text_color(rgb(theme::TEXT_TERTIARY))
+            .text_color(t.colors.text_muted)
             .child("Estimate unavailable; replay engine is not available in this build.")
     };
     let replay_tile = stat_tile(
+        &t,
         "Replay buffer",
         format!(
             "{} s",
@@ -832,6 +853,7 @@ fn overview(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
             .gap_2()
             .child(
                 button(
+                    &t,
                     "save-replay",
                     "Save replay",
                     ButtonVariant::Secondary,
@@ -847,7 +869,7 @@ fn overview(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
     )
     .child(replay_details);
 
-    section("Configuration", None).child(
+    section(&t, "Configuration", None).child(
         div()
             .flex()
             .flex_wrap()
@@ -904,7 +926,7 @@ fn format_audio_rate(bits_per_second: u64) -> String {
     format!("{} kbps", bits_per_second / 1_000)
 }
 
-fn performance(window: &ClipperWindow) -> Div {
+fn performance(t: &Theme, window: &ClipperWindow) -> Div {
     let state = &window.recording;
     let perf = &window.config.performance;
     // Live stats while recording; otherwise the last finished run, if any.
@@ -915,42 +937,50 @@ fn performance(window: &ClipperWindow) -> Div {
             None => (None, "No recording yet"),
         },
     };
-    let metric = |value: Option<String>| value_text(value.unwrap_or_else(|| "—".to_owned()));
+    let metric = |value: Option<String>| value_text(t, value.unwrap_or_else(|| "—".to_owned()));
 
-    section("Performance", Some(note.into())).child(
-        panel()
+    section(t, "Performance", Some(note.into())).child(
+        panel(t)
             .child(property_row(
+                t,
                 "Frame rate",
                 None,
                 metric(stats.map(|s| format!("{:.0} fps", s.current_fps))),
                 true,
             ))
             .child(property_row(
+                t,
                 "Frames encoded",
                 None,
                 metric(stats.map(|s| s.frames_encoded.to_string())),
                 false,
             ))
             .child(property_row(
+                t,
                 "Dropped frames",
                 Some("Lost when the encoder falls behind.".into()),
                 metric(stats.map(|s| s.frames_dropped.to_string())),
                 false,
             ))
             .child(property_row(
+                t,
                 "Queues",
                 Some("Command and event capacity.".into()),
-                value_text(format!(
-                    "{} / {}",
-                    perf.command_queue_capacity, perf.event_queue_capacity
-                )),
+                value_text(
+                    t,
+                    format!(
+                        "{} / {}",
+                        perf.command_queue_capacity, perf.event_queue_capacity
+                    ),
+                ),
                 false,
             )),
     )
 }
 
-fn recent_clips() -> Div {
-    section("Recent clips", Some("Library is empty".into())).child(panel().child(empty_state(
+fn recent_clips(t: &Theme) -> Div {
+    section(t, "Recent clips", Some("Library is empty".into())).child(panel(t).child(empty_state(
+        t,
         "◌",
         "Nothing to replay yet",
         "When clips are available, your latest highlights will appear here.",

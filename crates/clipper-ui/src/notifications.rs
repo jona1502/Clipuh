@@ -8,12 +8,12 @@ use clipper_storage::NotificationSettings;
 use gpui::prelude::*;
 use gpui::{
     App, Bounds, Context, Div, SharedString, Stateful, Task, Window, WindowBackgroundAppearance,
-    WindowBounds, WindowHandle, WindowKind, WindowOptions, div, point, px, rgb, size,
+    WindowBounds, WindowHandle, WindowKind, WindowOptions, div, point, px, size,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 use crate::components::{ButtonVariant, Tone, button, status_dot};
-use crate::theme;
+use crate::theme::ActiveTheme;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Toast {
@@ -253,6 +253,7 @@ fn compact(b: Stateful<Div>) -> Stateful<Div> {
 
 impl Render for ToastView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = *cx.theme();
         let (title, description, tone): (&str, SharedString, Tone) = match &self.toast {
             Toast::Saving => (
                 "Saving clip…",
@@ -278,6 +279,7 @@ impl Render for ToastView {
                 let p = path.clone();
                 actions = actions.child(compact(
                     button(
+                        &t,
                         "toast-open-clip",
                         "Open Clip",
                         ButtonVariant::Primary,
@@ -292,6 +294,7 @@ impl Render for ToastView {
             let p = path.clone();
             actions = actions.child(compact(
                 button(
+                    &t,
                     "toast-open-folder",
                     "Open Folder",
                     ButtonVariant::Secondary,
@@ -305,7 +308,7 @@ impl Render for ToastView {
         }
         actions = actions.child(div().flex_1()).child(
             compact(
-                button("toast-dismiss", "×", ButtonVariant::Ghost, None, true)
+                button(&t, "toast-dismiss", "×", ButtonVariant::Ghost, None, true)
                     .w(px(ACTION_H))
                     .px_0()
                     .justify_center(),
@@ -322,10 +325,10 @@ impl Render for ToastView {
             .p(px(PAD))
             .rounded_xl()
             .border_1()
-            .border_color(rgb(theme::BORDER_STRONG))
-            .bg(rgb(theme::SURFACE))
+            .border_color(t.colors.border_strong)
+            .bg(t.colors.surface)
             .shadow_lg()
-            .text_color(rgb(theme::TEXT))
+            .text_color(t.colors.text)
             .child(
                 div()
                     .flex()
@@ -337,7 +340,7 @@ impl Render for ToastView {
                             .flex_none()
                             .flex()
                             .items_center()
-                            .child(status_dot(tone)),
+                            .child(status_dot(&t, tone)),
                     )
                     .child(
                         div()
@@ -357,7 +360,7 @@ impl Render for ToastView {
                     .text_xs()
                     .line_height(px(DESC_LINE_H))
                     .line_clamp(DESC_LINES)
-                    .text_color(rgb(theme::TEXT_SECONDARY))
+                    .text_color(t.colors.text_secondary)
                     .child(description),
             )
             .child(actions)

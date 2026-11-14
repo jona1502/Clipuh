@@ -1,13 +1,14 @@
 use gpui::prelude::*;
-use gpui::{Context, Div, div, px, rgb};
+use gpui::{Context, Div, div, px};
 
 use super::ClipperWindow;
 use crate::components::{ButtonVariant, button, empty_state, panel};
 use crate::state::{SavedClip, format_elapsed};
-use crate::theme;
+use crate::theme::{ActiveTheme, Theme};
 use clipper_platform::windows::shell;
 
 pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
+    let t = *cx.theme();
     let clips = &window.recording.saved_clips;
     let count = match clips.len() {
         1 => "1 clip this session".to_owned(),
@@ -22,10 +23,11 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
             div()
                 .flex_1()
                 .text_sm()
-                .text_color(rgb(theme::TEXT_TERTIARY))
+                .text_color(t.colors.text_muted)
                 .child(count),
         )
         .child(button(
+            &t,
             "sort",
             "Newest",
             ButtonVariant::Secondary,
@@ -38,16 +40,16 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
         .px_4()
         .py_2()
         .border_b_1()
-        .border_color(rgb(theme::BORDER))
+        .border_color(t.colors.border)
         .text_xs()
-        .text_color(rgb(theme::TEXT_TERTIARY))
+        .text_color(t.colors.text_muted)
         .child(div().flex_1().min_w_0().child("Name"))
         .child(div().w(px(80.)).child("Duration"))
         .child(div().w(px(290.)).child("Actions"));
 
-    let mut list = panel().child(header);
+    let mut list = panel(&t).child(header);
     if clips.is_empty() {
-        list = list.child(empty_state(
+        list = list.child(empty_state(&t,
             "▤",
             "No clips yet",
             "Replays you save during this session appear here. Turn on instant replay on the Dashboard, then press your save hotkey.",
@@ -57,14 +59,14 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
             clips
                 .iter()
                 .enumerate()
-                .map(|(index, clip)| row(index, clip, cx)),
+                .map(|(index, clip)| row(&t, index, clip, cx)),
         );
     }
 
     div().flex().flex_col().gap_3().child(toolbar).child(list)
 }
 
-fn row(index: usize, clip: &SavedClip, cx: &mut Context<ClipperWindow>) -> Div {
+fn row(t: &Theme, index: usize, clip: &SavedClip, cx: &mut Context<ClipperWindow>) -> Div {
     let edit = clip.path.clone();
     let open = clip.path.clone();
     let folder = clip.path.clone();
@@ -74,14 +76,14 @@ fn row(index: usize, clip: &SavedClip, cx: &mut Context<ClipperWindow>) -> Div {
         .px_4()
         .py_2()
         .when(index > 0, |this| {
-            this.border_t_1().border_color(rgb(theme::BORDER))
+            this.border_t_1().border_color(t.colors.border)
         })
         .text_sm()
         .child(div().flex_1().min_w_0().truncate().child(clip.name()))
         .child(
             div()
                 .w(px(80.))
-                .text_color(rgb(theme::TEXT_SECONDARY))
+                .text_color(t.colors.text_secondary)
                 .child(format_elapsed(clip.duration)),
         )
         .child(
@@ -91,6 +93,7 @@ fn row(index: usize, clip: &SavedClip, cx: &mut Context<ClipperWindow>) -> Div {
                 .gap_2()
                 .child(
                     button(
+                        t,
                         ("clip-edit", index),
                         "Edit",
                         ButtonVariant::Primary,
@@ -103,6 +106,7 @@ fn row(index: usize, clip: &SavedClip, cx: &mut Context<ClipperWindow>) -> Div {
                 )
                 .child(
                     button(
+                        t,
                         ("clip-open", index),
                         "Open",
                         ButtonVariant::Secondary,
@@ -117,6 +121,7 @@ fn row(index: usize, clip: &SavedClip, cx: &mut Context<ClipperWindow>) -> Div {
                 )
                 .child(
                     button(
+                        t,
                         ("clip-folder", index),
                         "Open Folder",
                         ButtonVariant::Ghost,

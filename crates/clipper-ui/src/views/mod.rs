@@ -11,7 +11,7 @@ use clipper_storage::AppConfig;
 use gpui::prelude::*;
 use gpui::{
     App, Context, Div, Entity, FocusHandle, FontWeight, KeyBinding, KeyDownEvent, NoAction, Render,
-    Task, Window, actions, div, px, rgb, rgba,
+    Task, Window, actions, div, px,
 };
 
 use crate::components::{Tone, badge, kbd, list_item, shortcut, status_dot};
@@ -19,7 +19,7 @@ use crate::notifications::{Notifier, Toast};
 use crate::state::{
     Phase, RecordingState, ReplayPhase, StorageProjectionCache, StorageProjectionRun,
 };
-use crate::theme;
+use crate::theme::{ActiveTheme, Theme};
 
 actions!(
     clipper,
@@ -46,6 +46,7 @@ const HOTKEY_CONTEXT: &str = "HotkeyRecorder";
 
 /// Registers the window's keyboard shortcuts. Call once at startup.
 pub fn bind_keys(cx: &mut App) {
+    crate::components::bind_keys(cx);
     let window = Some(WINDOW_CONTEXT);
     let palette = Some(PALETTE_CONTEXT);
     let dropdown = Some("Dropdown");
@@ -224,6 +225,10 @@ pub struct ClipperWindow {
     capture_focus: [FocusHandle; 4],
     /// The clip open in the Editor page; its player only runs while that page is shown.
     editor: Option<Entity<editor::ClipEditor>>,
+    /// Custom accent color field on the Settings page.
+    accent_input: Entity<crate::components::TextInput>,
+    /// Keyboard focus for the notification toggles on the Settings page.
+    notify_focus: [FocusHandle; 4],
 }
 
 impl ClipperWindow {
@@ -322,6 +327,13 @@ impl ClipperWindow {
             .map(|index| cx.focus_handle().tab_index(index as isize).tab_stop(true))
             .collect();
 
+        let accent_input = settings::accent_input(&config, window, cx);
+        // System mode follows the OS light/dark setting the moment it changes.
+        cx.observe_window_appearance(window, |this, _, cx| {
+            crate::theme::apply(&this.config.appearance, cx)
+        })
+        .detach();
+
         let mut this = Self {
             handle,
             hotkeys,
@@ -352,6 +364,13 @@ impl ClipperWindow {
             capture_focus: [4, 5, 6, 7]
                 .map(|index| cx.focus_handle().tab_index(index).tab_stop(true)),
             editor: None,
+            accent_input,
+            // After the sidebar (0-3) and the capture menus (4-7).
+            notify_focus: std::array::from_fn(|index| {
+                cx.focus_handle()
+                    .tab_index(8 + index as isize)
+                    .tab_stop(true)
+            }),
         };
         this.storage_projection_cache.refresh(&this.config);
         this.send(RecorderCommand::RefreshSources);
@@ -531,12 +550,14 @@ impl ClipperWindow {
     }
 
     fn sidebar(&self, window: &Window, cx: &mut Context<Self>) -> Div {
+        let t = *cx.theme();
         let navigation = Page::ALL
             .into_iter()
             .zip(&self.nav_focus)
             .map(|(page, focus)| {
                 let focused = focus.is_focused(window);
                 list_item(
+                    &t,
                     ("nav", page.index()),
                     page.glyph(),
                     page.label(),
@@ -545,7 +566,11 @@ impl ClipperWindow {
                 )
                 .track_focus(focus)
                 .border_1()
-                .border_color(rgba(if focused { theme::FOCUS_RING } else { 0 }))
+                .border_color(if focused {
+                    t.colors.focus_ring
+                } else {
+                    gpui::transparent_black()
+                })
                 .on_click(cx.listener(move |this, _, window, cx| this.navigate(page, window, cx)))
                 .on_action(
                     cx.listener(move |this, _: &Confirm, window, cx| {
@@ -562,9 +587,9 @@ impl ClipperWindow {
             .gap_4()
             .px_3()
             .py_4()
-            .bg(rgb(theme::SIDEBAR))
+            .bg(t.colors.sidebar)
             .border_r_1()
-            .border_color(rgb(theme::BORDER))
+            .border_color(t.colors.border)
             .child(
                 div()
                     .flex()
@@ -578,10 +603,10 @@ impl ClipperWindow {
                             .items_center()
                             .justify_center()
                             .rounded_md()
-                            .bg(rgb(theme::ACCENT))
+                            .bg(t.colors.accent)
                             .text_xs()
                             .font_weight(FontWeight::BOLD)
-                            .text_color(rgb(theme::TEXT_ON_ACCENT))
+                            .text_color(t.colors.accent_foreground)
                             .child("C"),
                     )
                     .child(
@@ -601,17 +626,17 @@ impl ClipperWindow {
                     .px_2()
                     .rounded_md()
                     .border_1()
-                    .border_color(rgb(theme::BORDER))
-                    .bg(rgb(theme::SURFACE))
+                    .border_color(t.colors.border)
+                    .bg(t.colors.surface)
                     .cursor_pointer()
-                    .hover(|style| style.border_color(rgb(theme::BORDER_STRONG)))
+                    .hover(|style| style.border_color(t.colors.border_strong))
                     .text_sm()
-                    .text_color(rgb(theme::TEXT_TERTIARY))
+                    .text_color(t.colors.text_muted)
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.toggle_palette(&ToggleCommandPalette, window, cx)
                     }))
                     .child(div().flex_1().child("Search commands"))
-                    .child(shortcut(&["Ctrl", "K"])),
+                    .child(shortcut(&t, &["Ctrl", "K"])),
             )
             .child(div().flex().flex_col().gap_0p5().children(navigation))
             .child(
@@ -622,13 +647,13 @@ impl ClipperWindow {
                     .gap_2()
                     .px_2()
                     .text_xs()
-                    .text_color(rgb(theme::TEXT_TERTIARY))
-                    .child(status_dot(self.status_tone()))
+                    .text_color(t.colors.text_muted)
+                    .child(status_dot(&t, self.status_tone()))
                     .child(self.recording.overall_label()),
             )
     }
 
-    fn top_bar(&self) -> Div {
+    fn top_bar(&self, t: &Theme) -> Div {
         let page = self.active_page;
         div()
             .h(px(56.))
@@ -638,7 +663,7 @@ impl ClipperWindow {
             .items_center()
             .justify_between()
             .border_b_1()
-            .border_color(rgb(theme::BORDER))
+            .border_color(t.colors.border)
             .child(
                 div()
                     .flex()
@@ -653,11 +678,11 @@ impl ClipperWindow {
                     .child(
                         div()
                             .text_xs()
-                            .text_color(rgb(theme::TEXT_TERTIARY))
+                            .text_color(t.colors.text_muted)
                             .child(page.subtitle()),
                     ),
             )
-            .child(badge(self.recording.overall_label(), self.status_tone()))
+            .child(badge(t, self.recording.overall_label(), self.status_tone()))
     }
 
     fn page_content(&self, window: &Window, cx: &mut Context<Self>) -> Div {
@@ -666,17 +691,19 @@ impl ClipperWindow {
             Page::Clips => clips::content(self, cx),
             Page::Editor => match &self.editor {
                 Some(editor) => div().child(editor.clone()),
-                None => editor::empty(),
+                None => editor::empty(cx.theme()),
             },
-            Page::Settings => settings::content(self, cx),
+            Page::Settings => settings::content(self, window, cx),
         }
     }
 
     fn command_palette(&self, palette: &CommandPalette, cx: &mut Context<Self>) -> Div {
+        let t = *cx.theme();
         let matches = palette.matches();
         let rows = matches.iter().enumerate().map(|(index, page)| {
             let page = *page;
             list_item(
+                &t,
                 ("palette", index),
                 page.glyph(),
                 format!("Open {}", page.label()),
@@ -688,7 +715,7 @@ impl ClipperWindow {
 
         let query = if palette.query.is_empty() {
             div()
-                .text_color(rgb(theme::TEXT_TERTIARY))
+                .text_color(t.colors.text_muted)
                 .child("Search commands…")
         } else {
             div().child(palette.query.clone())
@@ -701,7 +728,7 @@ impl ClipperWindow {
             .justify_center()
             .items_start()
             .pt(px(96.))
-            .bg(rgba(theme::SCRIM))
+            .bg(t.colors.scrim)
             .child(
                 // Backdrop: blocks clicks to the shell below and closes the palette.
                 div()
@@ -736,10 +763,10 @@ impl ClipperWindow {
                     .flex_col()
                     .rounded_xl()
                     .border_1()
-                    .border_color(rgb(theme::BORDER_STRONG))
-                    .bg(rgb(theme::SURFACE))
+                    .border_color(t.colors.border_strong)
+                    .bg(t.colors.surface)
                     .shadow_lg()
-                    .text_color(rgb(theme::TEXT))
+                    .text_color(t.colors.text)
                     .child(
                         div()
                             .h(px(48.))
@@ -747,7 +774,7 @@ impl ClipperWindow {
                             .flex()
                             .items_center()
                             .border_b_1()
-                            .border_color(rgb(theme::BORDER))
+                            .border_color(t.colors.border)
                             .text_sm()
                             .child(query),
                     )
@@ -759,7 +786,7 @@ impl ClipperWindow {
                                     .px_2()
                                     .py_3()
                                     .text_sm()
-                                    .text_color(rgb(theme::TEXT_TERTIARY))
+                                    .text_color(t.colors.text_muted)
                                     .child("No matching commands"),
                             )
                         },
@@ -773,28 +800,29 @@ impl ClipperWindow {
                             .justify_end()
                             .gap_4()
                             .border_t_1()
-                            .border_color(rgb(theme::BORDER))
+                            .border_color(t.colors.border)
                             .text_xs()
-                            .text_color(rgb(theme::TEXT_TERTIARY))
-                            .child(hint(&["↑", "↓"], "Navigate"))
-                            .child(hint(&["Enter"], "Open"))
-                            .child(hint(&["Esc"], "Close")),
+                            .text_color(t.colors.text_muted)
+                            .child(hint(&t, &["↑", "↓"], "Navigate"))
+                            .child(hint(&t, &["Enter"], "Open"))
+                            .child(hint(&t, &["Esc"], "Close")),
                     ),
             )
     }
 }
 
-fn hint(keys: &[&'static str], label: &'static str) -> Div {
+fn hint(t: &Theme, keys: &[&'static str], label: &'static str) -> Div {
     div()
         .flex()
         .items_center()
         .gap_1p5()
-        .children(keys.iter().map(|key| kbd(*key)))
+        .children(keys.iter().map(|key| kbd(t, *key)))
         .child(label)
 }
 
 impl Render for ClipperWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = *cx.theme();
         let palette = self
             .palette
             .as_ref()
@@ -843,8 +871,8 @@ impl Render for ClipperWindow {
             .relative()
             .size_full()
             .flex()
-            .bg(rgb(theme::BACKGROUND))
-            .text_color(rgb(theme::TEXT))
+            .bg(t.colors.background)
+            .text_color(t.colors.text)
             .child(self.sidebar(window, cx))
             .child(
                 div()
@@ -853,7 +881,7 @@ impl Render for ClipperWindow {
                     .h_full()
                     .flex()
                     .flex_col()
-                    .child(self.top_bar())
+                    .child(self.top_bar(&t))
                     .child(
                         div().id("main-scroll").flex_1().overflow_y_scroll().child(
                             div()

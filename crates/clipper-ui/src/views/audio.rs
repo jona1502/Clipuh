@@ -1,11 +1,11 @@
 //! Audio device controls. Enumeration and persistence run off the UI thread.
 use super::ClipperWindow;
 use crate::components::{chip, panel, property_row, section_header};
-use crate::theme;
+use crate::theme::ActiveTheme;
 use clipper_audio::DeviceFlow;
 use clipper_core::recording::{RecorderCommand, RecordingAudioOptions};
 use gpui::prelude::*;
-use gpui::{Context, Div, div, px, rgb};
+use gpui::{Context, Div, div, px};
 
 impl ClipperWindow {
     pub(super) fn refresh_audio_devices(&mut self, cx: &mut Context<Self>) {
@@ -64,6 +64,7 @@ impl ClipperWindow {
 }
 
 fn device_picker(window: &ClipperWindow, flow: DeviceFlow, cx: &mut Context<ClipperWindow>) -> Div {
+    let t = *cx.theme();
     let selected = match flow {
         DeviceFlow::Capture => &window.config.audio.input_device,
         DeviceFlow::Render => &window.config.audio.output_device,
@@ -88,6 +89,7 @@ fn device_picker(window: &ClipperWindow, flow: DeviceFlow, cx: &mut Context<Clip
         .max_w(px(520.))
         .child(
             chip(
+                &t,
                 if flow == DeviceFlow::Capture {
                     "input-picker"
                 } else {
@@ -122,6 +124,7 @@ fn device_picker(window: &ClipperWindow, flow: DeviceFlow, cx: &mut Context<Clip
             let label = device.map_or("Windows default".to_owned(), |d| d.name.clone());
             root = root.child(
                 chip(
+                    &t,
                     (
                         if flow == DeviceFlow::Capture {
                             "input-option"
@@ -149,16 +152,19 @@ fn device_picker(window: &ClipperWindow, flow: DeviceFlow, cx: &mut Context<Clip
 }
 
 pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -> Div {
+    let t = *cx.theme();
     let enabled = window.recording.settings_enabled() && !window.audio_testing;
     let audio = &window.config.audio;
-    let mut body = panel()
+    let mut body = panel(&t)
         .child(property_row(
+            &t,
             "Microphone input",
             Some("A capture device, never the playback endpoint.".into()),
             device_picker(window, DeviceFlow::Capture, cx),
             true,
         ))
         .child(property_row(
+            &t,
             "Desktop output",
             Some("WASAPI loopback of this playback device.".into()),
             device_picker(window, DeviceFlow::Render, cx),
@@ -173,9 +179,11 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
     .enumerate()
     {
         body = body.child(property_row(
+            &t,
             label,
             None,
             chip(
+                &t,
                 ("audio-toggle", index),
                 if on { "On" } else { "Off" },
                 on,
@@ -202,6 +210,7 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
     .enumerate()
     {
         body = body.child(property_row(
+            &t,
             label,
             None,
             div()
@@ -209,6 +218,7 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
                 .gap_1()
                 .children([0_u16, 50, 100, 150, 200].into_iter().map(|value| {
                     chip(
+                        &t,
                         (
                             if index == 0 {
                                 "mic-gain"
@@ -243,6 +253,7 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
     .enumerate()
     {
         body = body.child(property_row(
+            &t,
             label,
             Some("Live during recording or the selected source test.".into()),
             div()
@@ -250,15 +261,15 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
                 .items_center()
                 .gap_2()
                 .child(
-                    div().w(px(120.)).h(px(5.)).bg(rgb(theme::BORDER)).child(
+                    div().w(px(120.)).h(px(5.)).bg(t.colors.border).child(
                         div()
                             .h_full()
                             .w(px(120. * peak.clamp(0.0, 1.0)))
-                            .bg(rgb(theme::ACCENT)),
+                            .bg(t.colors.accent),
                     ),
                 )
                 .child(
-                    chip(("audio-test", index), "Test 30 s", false, enabled).when(
+                    chip(&t, ("audio-test", index), "Test 30 s", false, enabled).when(
                         enabled,
                         |item| {
                             item.on_click(cx.listener(move |this, _, _, cx| {
@@ -270,12 +281,12 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
             false,
         ));
     }
-    let mut root = div().flex().flex_col().gap_2().child(section_header("Audio", None)).child(body)
-        .child(div().text_xs().text_color(rgb(theme::TEXT_TERTIARY)).child("Primary AAC track: desktop + microphone mix. Optional extra tracks are isolated alternatives for editing. Game/Discord are included once in desktop playback; separate process routing and Instant Replay are not integrated. Settings apply to the next recording."))
-        .child(chip("refresh-audio", if window.audio_loading { "Refreshing…" } else { "Refresh devices" }, false, !window.audio_loading).on_click(cx.listener(|this, _, _, cx| this.refresh_audio_devices(cx))));
+    let mut root = div().flex().flex_col().gap_2().child(section_header(&t, "Audio", None)).child(body)
+        .child(div().text_xs().text_color(t.colors.text_muted).child("Primary AAC track: desktop + microphone mix. Optional extra tracks are isolated alternatives for editing. Game/Discord are included once in desktop playback; separate process routing and Instant Replay are not integrated. Settings apply to the next recording."))
+        .child(chip(&t, "refresh-audio", if window.audio_loading { "Refreshing…" } else { "Refresh devices" }, false, !window.audio_loading).on_click(cx.listener(|this, _, _, cx| this.refresh_audio_devices(cx))));
     if window.audio_testing {
         root = root.child(
-            chip("stop-audio-test", "Stop audio test", true, true).on_click(cx.listener(
+            chip(&t, "stop-audio-test", "Stop audio test", true, true).on_click(cx.listener(
                 |this, _, _, cx| {
                     this.send(RecorderCommand::StopAudioTest);
                     cx.notify();
