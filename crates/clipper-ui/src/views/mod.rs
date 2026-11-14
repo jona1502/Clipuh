@@ -311,6 +311,9 @@ pub struct ClipperWindow {
     /// selected category, the only one rendered. Kept while navigating away.
     settings_scroll: gpui::ScrollHandle,
     settings_section: usize,
+    /// Settings categories shown under Settings in the sidebar. Collapsing
+    /// keeps `settings_section`.
+    settings_expanded: bool,
     /// Whether Windows launches clipuh at sign-in, read from the registry;
     /// `None` while a read or change is in flight.
     startup: Option<bool>,
@@ -605,6 +608,7 @@ impl ClipperWindow {
             settings_menu: None,
             settings_scroll,
             settings_section: 0,
+            settings_expanded: false,
             startup: None,
             startup_error: None,
             settings_notice: None,
@@ -738,6 +742,8 @@ impl ClipperWindow {
         if page == Page::Settings && self.active_page != page {
             // Picks up changes made outside clipuh (Task Manager, Settings app).
             self.sync_startup(None, cx);
+            // Entering Settings shows its categories in the sidebar.
+            self.settings_expanded = true;
         }
         let palette_was_open = self.palette.take().is_some();
         if palette_was_open {
@@ -839,7 +845,19 @@ impl ClipperWindow {
     /// The one sidebar of every page (sidebar reference: the left column of
     /// the approved screenshots): logo, four tall navigation rows with a
     /// filled accent active row, storage at the bottom.
-    fn sidebar(&self, window: &Window, cx: &mut Context<Self>) -> Stateful<Div> {
+    /// A sidebar page row: Settings while on Settings expands or collapses
+    /// its categories; every other click navigates.
+    fn nav_clicked(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings_expanded =
+            settings_expanded_after(page, self.active_page, self.settings_expanded);
+        if page == self.active_page {
+            cx.notify();
+        } else {
+            self.navigate(page, window, cx);
+        }
+    }
+
+    fn sidebar(&self, window: &mut Window, cx: &mut Context<Self>) -> Stateful<Div> {
         let t = *cx.theme();
         let navigation = Page::ALL
             .into_iter()
@@ -882,13 +900,31 @@ impl ClipperWindow {
                             .when(!active, |icon| icon.text_color(t.colors.text_secondary)),
                     )
                     .child(div().flex_1().truncate().child(page.label()))
+                    .when(page == Page::Settings, |this| {
+                        this.child(
+                            icon(
+                                if self.settings_expanded {
+                                    Icon::ChevronDown
+                                } else {
+                                    Icon::ChevronRight
+                                },
+                                px(12.),
+                            )
+                            .when(!active, |icon| icon.text_color(t.colors.text_muted)),
+                        )
+                    })
                     .on_click(
-                        cx.listener(move |this, _, window, cx| this.navigate(page, window, cx)),
+                        cx.listener(move |this, _, window, cx| this.nav_clicked(page, window, cx)),
                     )
                     .on_action(cx.listener(move |this, _: &Confirm, window, cx| {
-                        this.navigate(page, window, cx)
+                        this.nav_clicked(page, window, cx)
                     }))
-            });
+            })
+            .collect::<Vec<_>>();
+        // Settings is the last page, so its categories follow it directly.
+        let categories = self
+            .settings_expanded
+            .then(|| self.settings_categories(&t, window, cx));
 
         div()
             .id("sidebar")
@@ -901,8 +937,6 @@ impl ClipperWindow {
             .px_4()
             .pt_6()
             .pb_8()
-            // Short windows scroll the sidebar instead of clipping storage.
-            .overflow_y_scroll()
             .bg(t.colors.sidebar)
             .border_r_1()
             .border_color(t.colors.border)
@@ -930,10 +964,20 @@ impl ClipperWindow {
                             .child(version_label()),
                     ),
             )
-            .child(div().flex().flex_col().gap_2().children(navigation))
+            // Navigation scrolls when expanded categories do not fit; logo and
+            // storage stay visible.
             .child(
                 div()
-                    .mt_auto()
+                    .id("sidebar-navigation")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(div().flex().flex_col().gap_2().children(navigation))
+                    .children(categories),
+            )
+            .child(
+                div()
+                    .flex_none()
                     .flex()
                     .flex_col()
                     .gap_4()
@@ -1096,6 +1140,17 @@ impl ClipperWindow {
                             .child(hint(&t, &["Esc"], "Close")),
                     ),
             )
+    }
+}
+
+/// Whether the sidebar shows the Settings categories after a click on the
+/// `clicked` page row while `current` is open: Settings toggles them while it
+/// is open and opens them from elsewhere; other pages leave them as they are.
+fn settings_expanded_after(clicked: Page, current: Page, expanded: bool) -> bool {
+    match (clicked, current) {
+        (Page::Settings, Page::Settings) => !expanded,
+        (Page::Settings, _) => true,
+        _ => expanded,
     }
 }
 
@@ -1299,6 +1354,22 @@ mod tests {
         assert_eq!(Page::Dashboard.offset(1), Page::Clips);
         assert_eq!(Page::Settings.offset(1), Page::Dashboard);
         assert_eq!(Page::Dashboard.offset(-1), Page::Settings);
+    }
+
+    #[test]
+    fn settings_categories_expand_toggle_and_survive_navigation() {
+        use super::settings_expanded_after as after;
+        // From another page, Settings always opens its categories.
+        assert!(after(Page::Settings, Page::Clips, false));
+        assert!(after(Page::Settings, Page::Dashboard, true));
+        // On Settings, its row toggles them.
+        assert!(!after(Page::Settings, Page::Settings, true));
+        assert!(after(Page::Settings, Page::Settings, false));
+        // Other pages keep the state (collapsed stays collapsed and back).
+        for page in [Page::Dashboard, Page::Clips, Page::Editor] {
+            assert!(after(page, Page::Settings, true));
+            assert!(!after(page, Page::Settings, false));
+        }
     }
 
     #[test]

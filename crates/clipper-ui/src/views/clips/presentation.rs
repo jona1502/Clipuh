@@ -628,9 +628,8 @@ impl Render for ClipLibrary {
                 grid = grid.child(row);
             }
         }
-        content = content.child(grid);
-
-        // Bottom selection bar.
+        // Selection bar: above the clips, below the toolbar and count, so it
+        // never covers the grid or its scrollbar (the grid scrolls below it).
         let shown = self.ordered();
         let all_selected =
             !shown.is_empty() && shown.iter().all(|id| self.selection.ids.contains(id));
@@ -772,7 +771,7 @@ impl Render for ClipLibrary {
                 cx,
                 |this, _, cx| this.open(true, cx),
             ));
-        content = content.child(bar);
+        content = content.child(bar).child(grid);
 
         if let Some(position) = self.context_position {
             let single = selected == 1;

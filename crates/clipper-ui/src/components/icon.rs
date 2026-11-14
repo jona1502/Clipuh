@@ -12,6 +12,7 @@ const ICON_FONT_FALLBACK: &str = "Segoe MDL2 Assets";
 pub enum Icon {
     Camera,
     ChevronDown,
+    ChevronRight,
     Cut,
     Drive,
     Folder,
@@ -35,6 +36,7 @@ impl Icon {
         match self {
             Self::Camera => "\u{E722}",
             Self::ChevronDown => "\u{E70D}",
+            Self::ChevronRight => "\u{E76C}",
             Self::Cut => "\u{E8C6}",
             Self::Drive => "\u{EDA2}",
             Self::Folder => "\u{E8B7}",
