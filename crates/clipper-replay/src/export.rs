@@ -590,6 +590,52 @@ mod tests {
     }
 
     #[test]
+    fn same_interval_saved_twice_gives_two_independent_clips() {
+        let dir = temp_dir("twice");
+        let exporter = Exporter::spawn(4).unwrap();
+        let snapshot = job(dir.join("unused.mp4")).snapshot;
+        let (tx, rx) = channel();
+        for name in ["a.mp4", "b.mp4"] {
+            let tx = tx.clone();
+            let job = ExportJob {
+                snapshot: snapshot.clone(),
+                final_path: dir.join(name),
+            };
+            exporter
+                .try_submit(job, Box::new(move |r| tx.send(r).unwrap()))
+                .unwrap();
+        }
+        for _ in 0..2 {
+            assert!(rx.recv_timeout(Duration::from_secs(20)).unwrap().is_ok());
+        }
+        let a = fs::read(dir.join("a.mp4")).unwrap();
+        assert!(!a.is_empty());
+        assert_eq!(a, fs::read(dir.join("b.mp4")).unwrap());
+        drop(exporter);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_save_does_not_hold_up_the_next_one() {
+        let dir = temp_dir("fail-then-ok");
+        let exporter = Exporter::spawn(4).unwrap();
+        let (tx, rx) = channel();
+        for path in [dir.join("missing").join("x.mp4"), dir.join("ok.mp4")] {
+            let tx = tx.clone();
+            exporter
+                .try_submit(job(path), Box::new(move |r| tx.send(r).unwrap()))
+                .unwrap();
+        }
+        assert!(rx.recv_timeout(Duration::from_secs(20)).unwrap().is_err());
+        assert!(rx.recv_timeout(Duration::from_secs(20)).unwrap().is_ok());
+        assert!(exporter.finish_queued(Duration::from_secs(20)));
+        assert_eq!(exporter.in_flight(), 0);
+        assert!(dir.join("ok.mp4").exists() && no_partials(&dir));
+        drop(exporter);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn concurrent_submissions_complete_exactly_once() {
         let dir = temp_dir("concurrent");
         let exporter = Arc::new(Exporter::spawn(64).unwrap());

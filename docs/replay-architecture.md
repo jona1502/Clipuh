@@ -134,14 +134,47 @@ export thread.
 * `StartRecording` / `StartAudioTest` while replay runs: `RecordingFailed` /
   `AudioTestFinished{error}` with "Stop instant replay first.".
 
-Shutdown: the export thread delivers completion events with `try_send` plus a
-10 ms sleep loop, so it never blocks without bound on a UI queue nobody drains.
-On shutdown the worker first lets already accepted saves finish
+Save jobs: every request gets an id (`save #N` in the logs) and an in-memory
+name reservation; the same or an overlapping interval saved twice gives two
+files. Lifecycle: `ReplaySaving` is sent before the job is submitted (so it
+always precedes the result), then queued -> `export started` -> `ReplaySaved`
+(only after the rename) or `ReplaySaveFailed`. Up to 4 jobs (1 running + 3
+queued); a further request fails at once with "Already saving clips". Each job
+owns its snapshot (`Arc` GOPs / segments), so eviction and `StopReplay` never
+take its input away.
+
+Completion delivery: the export thread hands results to a small forwarder
+thread (`Completions`, unbounded channel, at most one pending event per
+accepted job) that waits for room in the UI queue (`try_send` plus a 10 ms
+sleep). A slow or stalled UI therefore never holds up the export thread or the
+saves queued behind it.
+
+Stop policy: `StopReplay` rejects nothing that was accepted. It releases
+capture, encoder, audio and buffer synchronously (tens of ms), sends
+`ReplayStopped{None}`, and lets accepted exports finish from their snapshots
+on the export thread; their results arrive later. Stop never waits for disk
+I/O.
+
+UI: the recorder event loop runs on the main window. gpui refuses a window
+update while that window is mid-update (a nested Win32 message loop can poll
+the task then); the loop retries a frame later instead of exiting. Exiting
+there used to stop event draining for good: completions piled up, the worker
+blocked emitting `ReplayStopped`, so saves stalled and the toggle stayed on
+"Stopping…".
+
+Shutdown: the worker first lets already accepted saves finish
 (`Exporter::finish_queued`, at most 10 s; the UI keeps draining events
 meanwhile), then sets `shutting_down` (pending completion events are given up
-if the queue is still full) and drops the exporter, which fails whatever is
-still queued with `Shutdown`. `Recorder::drop` also drains events while
-joining.
+if the queue is still full), drops the exporter, which fails whatever is still
+queued with `Shutdown`, and then the forwarder. `Recorder::drop` also drains
+events while joining.
+
+Logs (stderr, `clipuh replay:` prefix): save accepted/rejected with interval,
+export started, saved/failed, stop requested and release time, shutdown drain.
+
+Stress check: `cargo run --release -p clipper-recorder --example
+replay_stress` (back-to-back saves, stop right after a save, restart, stop with
+queued saves, write failure then recovery).
 
 Hardware check: `cargo run --release -p clipper-recorder --example
 replay_smoke -- run=45 duration=30` then `probe_clip` on every clip.

@@ -214,28 +214,6 @@ impl NotificationCenter {
     }
 }
 
-/// Spam guard for repeated Save Clip requests (double clicks, menu repeats).
-#[derive(Debug, Default)]
-pub(crate) struct SaveGuard {
-    last: Option<Instant>,
-}
-
-impl SaveGuard {
-    pub const MIN_INTERVAL: Duration = Duration::from_millis(750);
-
-    /// True when a new save may be sent now; records it.
-    pub fn try_begin(&mut self, now: Instant) -> bool {
-        if self
-            .last
-            .is_some_and(|last| now.saturating_duration_since(last) < Self::MIN_INTERVAL)
-        {
-            return false;
-        }
-        self.last = Some(now);
-        true
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,14 +318,5 @@ mod tests {
         assert!(allowed(&n("r", Severity::Error), &s));
         s.enabled = false;
         assert!(!allowed(&n("r", Severity::Info), &s));
-    }
-
-    #[test]
-    fn save_guard_blocks_rapid_repeats() {
-        let now = Instant::now();
-        let mut g = SaveGuard::default();
-        assert!(g.try_begin(now));
-        assert!(!g.try_begin(now + Duration::from_millis(100)));
-        assert!(g.try_begin(now + SaveGuard::MIN_INTERVAL));
     }
 }

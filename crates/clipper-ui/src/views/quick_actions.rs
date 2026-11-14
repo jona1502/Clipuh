@@ -20,8 +20,7 @@ use super::{ClipperWindow, Page};
 use crate::components::{ButtonVariant, Tone, button, status_dot};
 use crate::feedback::{self, StorageLevel};
 use crate::notification_center::{
-    Category, Notice, NotificationCenter, SaveGuard, Severity, ToastAction, allowed,
-    display_duration,
+    Category, Notice, NotificationCenter, Severity, ToastAction, allowed, display_duration,
 };
 use crate::recent_clips::RecentClips;
 use crate::state::{Phase, RecordingState, ReplayPhase};
@@ -39,7 +38,6 @@ pub(crate) struct Feedback {
     pub toast_timer: Option<Task<()>>,
     pub tray: Option<TrayHandle>,
     pub main_hwnd: Option<isize>,
-    pub save_guard: SaveGuard,
     pub storage_level: StorageLevel,
     /// The library has at least one clip (updated on library changes).
     pub has_recent_clip: bool,
@@ -269,9 +267,8 @@ impl ClipperWindow {
             self.action_notice(Severity::Warning, "Clip not saved", reason, cx);
             return;
         }
-        if !self.feedback.save_guard.try_begin(Instant::now()) {
-            return;
-        }
+        // Every press is a separate save: the recorder bounds its queue and
+        // rejects overflow with a visible error, so nothing is dropped here.
         if let Err(error) = self.handle.send(RecorderCommand::SaveReplay) {
             let body = format!("Could not save the replay: {error}.");
             self.action_notice(Severity::Error, "Clip not saved", &body, cx);

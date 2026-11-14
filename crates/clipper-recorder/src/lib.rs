@@ -97,6 +97,14 @@ pub(crate) fn emit(endpoint: &RecorderEndpoint, event: RecorderEvent) {
     let _ = endpoint.events.send_blocking(event);
 }
 
+/// Diagnostics line on stderr, the app's log sink. Unlike `eprintln!` it never
+/// panics when stderr is closed, so logging cannot take the worker down.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn log(args: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "clipuh replay: {args}");
+}
+
 #[cfg(windows)]
 fn run(endpoint: &RecorderEndpoint) {
     windows_worker::run(endpoint);

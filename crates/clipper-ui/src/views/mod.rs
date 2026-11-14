@@ -16,8 +16,8 @@ use clipper_platform::windows::tray::{TrayCommand, TrayHandle};
 use clipper_storage::AppConfig;
 use gpui::prelude::*;
 use gpui::{
-    App, Context, Div, Entity, FocusHandle, FontWeight, KeyBinding, KeyDownEvent, NoAction, Render,
-    Task, Window, actions, div, img, px,
+    App, AsyncWindowContext, Context, Div, Entity, FocusHandle, FontWeight, KeyBinding,
+    KeyDownEvent, NoAction, Render, Task, WeakEntity, Window, actions, div, img, px,
 };
 
 use crate::components::{kbd, list_item, shortcut};
@@ -25,6 +25,29 @@ use crate::notifications::{Notifier, Toast};
 use crate::state::{Phase, RecordingState, StorageProjectionCache, StorageProjectionRun};
 use crate::storage_status::{self, StorageStatus};
 use crate::theme::{ActiveTheme, Theme};
+
+/// Updates the view from a task spawned on its window. gpui refuses the update
+/// while that window is itself mid-update, which happens when a nested Win32
+/// message loop (move/size loop, COM call, dialog) runs this task's posted
+/// wake-up. That is transient: wait a frame and retry. `None` once the view is
+/// gone. Giving up on the first refusal used to end the recorder event loop
+/// for good: nothing drained recorder events any more, so clip saves never
+/// completed and Instant Replay hung in "Stopping…".
+async fn update_view<R>(
+    this: &WeakEntity<ClipperWindow>,
+    cx: &mut AsyncWindowContext,
+    mut update: impl FnMut(&mut ClipperWindow, &mut Window, &mut Context<ClipperWindow>) -> R,
+) -> Option<R> {
+    loop {
+        if let Ok(result) = this.update_in(cx, &mut update) {
+            return Some(result);
+        }
+        this.upgrade()?;
+        cx.background_executor()
+            .timer(std::time::Duration::from_millis(16))
+            .await;
+    }
+}
 
 /// clipuh logo shown in the sidebar header; brand purple, independent of the user accent.
 fn brand_logo() -> std::sync::Arc<gpui::Image> {
@@ -318,7 +341,11 @@ impl ClipperWindow {
                     event,
                     RecorderEvent::ReplaySaved { .. } | RecorderEvent::RecordingFinished { .. }
                 );
-                let updated = this.update_in(cx, |this, window, cx| {
+                let mut pending = Some((event, toast));
+                let updated = update_view(&this, cx, |this, window, cx| {
+                    let Some((event, toast)) = pending.take() else {
+                        return;
+                    };
                     let mut quiet = false;
                     let notices = crate::feedback::notices(
                         &event,
@@ -398,8 +425,9 @@ impl ClipperWindow {
                     if !quiet {
                         cx.notify();
                     }
-                });
-                if updated.is_err() {
+                })
+                .await;
+                if updated.is_none() {
                     return;
                 }
             }
@@ -485,10 +513,14 @@ impl ClipperWindow {
             Some((tray, commands)) => {
                 let task = cx.spawn_in(window, async move |this, cx| {
                     while let Ok(command) = commands.recv().await {
-                        let alive = this.update_in(cx, |this, window, cx| {
-                            this.run_tray_command(command, window, cx)
-                        });
-                        if alive.is_err() {
+                        let mut command = Some(command);
+                        let alive = update_view(&this, cx, |this, window, cx| {
+                            if let Some(command) = command.take() {
+                                this.run_tray_command(command, window, cx);
+                            }
+                        })
+                        .await;
+                        if alive.is_none() {
                             return;
                         }
                     }
