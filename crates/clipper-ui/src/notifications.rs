@@ -74,11 +74,20 @@ fn plan(
 /// Owns at most one toast window.
 pub struct Notifier {
     window: Option<WindowHandle<ToastView>>,
+    sound: notify::NotificationSoundPlayer,
 }
 
 impl Notifier {
     pub fn new() -> Self {
-        Self { window: None }
+        Self {
+            window: None,
+            sound: notify::NotificationSoundPlayer::new(),
+        }
+    }
+
+    /// Explicit previews and automatic notifications share one bounded worker.
+    pub fn play_sound(&self, custom: Option<PathBuf>) {
+        self.sound.play(custom);
     }
 
     pub fn show(&mut self, toast: Toast, settings: &NotificationSettings, cx: &mut App) {
@@ -86,7 +95,7 @@ impl Notifier {
             return;
         };
         if plan.play_sound {
-            notify::play_notification_sound();
+            self.play_sound(settings.custom_sound.clone());
         }
         if !plan.show_window {
             return;
@@ -380,6 +389,7 @@ mod tests {
             notify_on_failure: true,
             in_app: true,
             native: true,
+            custom_sound: None,
         }
     }
     fn saved() -> Toast {
