@@ -58,74 +58,83 @@ impl Clip {
 
 /// Finds direct, completed MP4 children and reuses decoded metadata for files
 /// whose identity and size/mtime fingerprint have not changed.
+///
+/// Recorder partial files (`*.mp4.partial`, also the legacy `*.partial.mp4`)
+/// are never listed. A file that vanishes or cannot be read while the folder
+/// is listed (a clip deleted, a partial committed) is skipped instead of
+/// failing the whole scan, so one bad entry never hides the other clips.
 pub fn scan(dir: &Path, previous: &[Clip]) -> io::Result<Vec<Clip>> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error),
     };
+    scan_paths(
+        entries.map(|entry| entry.map(|entry| entry.path())),
+        previous,
+    )
+}
 
+fn scan_paths(
+    paths: impl Iterator<Item = io::Result<PathBuf>>,
+    previous: &[Clip],
+) -> io::Result<Vec<Clip>> {
     let previous_by_id: HashMap<&str, &Clip> = previous
         .iter()
         .map(|clip| (clip.id.as_str(), clip))
         .collect();
     let mut clips = Vec::new();
-    for entry in entries {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        if !file_type.is_file() {
-            continue;
+    for path in paths {
+        // A failing directory listing is an error; a failing entry is not.
+        let path = path?;
+        if let Some(clip) = clip_at(path, &previous_by_id) {
+            clips.push(clip);
         }
-
-        let path = entry.path();
-        if path.file_name().is_some_and(|name| {
-            name.to_string_lossy()
-                .to_ascii_lowercase()
-                .ends_with(".partial.mp4")
-        }) {
-            continue;
-        }
-        let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
-            continue;
-        };
-        if !extension.eq_ignore_ascii_case("mp4") {
-            continue;
-        }
-
-        // Read metadata without following links. This also handles a path that
-        // changed to a symlink between file_type() and metadata collection.
-        let metadata = fs::symlink_metadata(&path)?;
-        if !metadata.file_type().is_file() {
-            continue;
-        }
-        let modified = metadata.modified()?;
-        let Some(id) = file_id(&path, &metadata) else {
-            continue;
-        };
-        let name = path
-            .file_stem()
-            .map(|stem| stem.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let cached = previous_by_id
-            .get(id.as_str())
-            .copied()
-            .filter(|clip| clip.size_bytes == metadata.len() && clip.modified == modified);
-
-        clips.push(Clip {
-            id,
-            path,
-            name,
-            source: cached.and_then(|clip| clip.source.clone()),
-            duration: cached.and_then(|clip| clip.duration),
-            size_bytes: metadata.len(),
-            created: metadata.created().ok(),
-            modified,
-        });
     }
 
     clips.sort_by(|a, b| a.id.cmp(&b.id).then_with(|| a.path.cmp(&b.path)));
     clips.dedup_by(|a, b| a.id == b.id);
     Ok(clips)
+}
+
+/// The clip at `path`, or `None` if it is not a completed MP4 or vanished.
+fn clip_at(path: PathBuf, previous_by_id: &HashMap<&str, &Clip>) -> Option<Clip> {
+    let name = path.file_name()?.to_string_lossy().to_ascii_lowercase();
+    if name.ends_with(".partial.mp4") || name.ends_with(".partial") {
+        return None;
+    }
+    let extension = path.extension().and_then(|value| value.to_str())?;
+    if !extension.eq_ignore_ascii_case("mp4") {
+        return None;
+    }
+
+    // Read metadata without following links. This also handles a path that
+    // changed to a symlink after it was listed.
+    let metadata = fs::symlink_metadata(&path).ok()?;
+    if !metadata.file_type().is_file() {
+        return None;
+    }
+    let modified = metadata.modified().ok()?;
+    let id = file_id(&path, &metadata)?;
+    let name = path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let cached = previous_by_id
+        .get(id.as_str())
+        .copied()
+        .filter(|clip| clip.size_bytes == metadata.len() && clip.modified == modified);
+
+    Some(Clip {
+        id,
+        path,
+        name,
+        source: cached.and_then(|clip| clip.source.clone()),
+        duration: cached.and_then(|clip| clip.duration),
+        size_bytes: metadata.len(),
+        created: metadata.created().ok(),
+        modified,
+    })
 }
 
 /// Returns clip indices matching the query, sorted by the selected field.
@@ -443,4 +452,43 @@ fn invalid_input(message: &str) -> io::Error {
 
 fn not_found(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::NotFound, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// TEST K: a clip committed by the recorder is found by any later scan,
+    /// even when another entry of the same listing vanished in between (a
+    /// deleted clip, a partial removed after its commit) or is unreadable.
+    #[test]
+    fn vanished_or_unreadable_entries_do_not_hide_committed_clips() {
+        let dir = std::env::temp_dir().join(format!("clipuh scan ü {}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let committed = dir.join("Clipper_Replay_2026-11-15_21-30-00.mp4");
+        fs::write(&committed, b"clip").unwrap();
+        fs::write(dir.join("Clipper_Replay_next.mp4.partial"), b"half").unwrap();
+
+        let listing = vec![
+            Ok(dir.join("deleted while listing.mp4")),
+            Ok(dir.join("Clipper_Replay_next.mp4.partial")),
+            Ok(committed.clone()),
+        ];
+        let clips = scan_paths(listing.into_iter(), &[]).unwrap();
+        assert_eq!(clips.len(), 1);
+        assert_eq!(clips[0].path, committed);
+
+        // A failing directory listing is still reported.
+        let broken = vec![Err(io::Error::other("listing failed"))];
+        assert!(scan_paths(broken.into_iter(), &[]).is_err());
+
+        // And the real scan sees the same.
+        let clips = scan(&dir, &[]).unwrap();
+        assert_eq!(
+            clips.iter().map(|c| &c.path).collect::<Vec<_>>(),
+            vec![&committed]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
