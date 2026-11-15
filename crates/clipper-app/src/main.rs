@@ -12,7 +12,18 @@ actions!(clipper_app, [Quit]);
 #[cfg(windows)]
 fn main() {
     if let Err(error) = run() {
-        eprintln!("Clipper could not start: {error}");
+        // Release builds have no console: the box is what the user sees.
+        eprintln!("clipuh could not start: {error}");
+        clipper_diagnostics::log::error!("clipuh could not start: {error}");
+        clipper_diagnostics::flush();
+        let mut text = format!("clipuh could not start:\n\n{error}");
+        if let Some(dir) = clipper_diagnostics::log_dir() {
+            text.push_str(&format!(
+                "\n\nDetails are in the log files in {}",
+                dir.display()
+            ));
+        }
+        clipper_platform::windows::dialog::show_error("clipuh", &text);
         std::process::exit(1);
     }
 }
