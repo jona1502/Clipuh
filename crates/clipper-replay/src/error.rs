@@ -19,6 +19,9 @@ pub enum ReplayError {
     Shutdown,
     /// Input packets violate the contract (e.g. unknown track, bad layout).
     Invalid(String),
+    /// The written clip failed its final check (truncated or not finalized);
+    /// it was not published.
+    Incomplete(String),
     Io {
         context: String,
         source: std::io::Error,
@@ -63,6 +66,9 @@ impl fmt::Display for ReplayError {
             Self::Busy => f.write_str("clips are already being saved, try again in a moment"),
             Self::Shutdown => f.write_str("the replay buffer is shutting down"),
             Self::Invalid(detail) => write!(f, "invalid replay data: {detail}"),
+            Self::Incomplete(detail) => {
+                write!(f, "the clip could not be finalized ({detail})")
+            }
             Self::Io { context, source } => write!(f, "{context}: {source}"),
         }
     }
