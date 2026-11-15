@@ -859,8 +859,8 @@ impl ClipEditor {
 
     /// Ctrl+wheel zoom anywhere over the timeline panel (toolbar, track
     /// headers and tracks). Registered for the capture phase, so the wheel
-    /// never also scrolls the timeline or the page; a plain wheel still
-    /// scrolls. Zooms around the pointer when it is over the tracks,
+    /// never also scrolls the timeline or the page; a plain wheel
+    /// scrolls the timeline horizontally and never the page. Zooms around the pointer when it is over the tracks,
     /// otherwise around the playhead (or the viewport centre).
     fn wheel_zoom_area(&self, cx: &mut Context<Self>) -> gpui::Canvas<()> {
         let editor = cx.entity().downgrade();
@@ -871,13 +871,30 @@ impl ClipEditor {
                 let editor = editor.clone();
                 let viewport = viewport.clone();
                 window.on_mouse_event(move |event: &gpui::ScrollWheelEvent, phase, window, cx| {
-                    if phase != gpui::DispatchPhase::Capture
-                        || !event.modifiers.control
-                        || !panel.contains(&event.position)
-                    {
+                    if phase != gpui::DispatchPhase::Capture || !panel.contains(&event.position) {
                         return;
                     }
                     let line = window.line_height();
+                    if !event.modifiers.control {
+                        cx.stop_propagation();
+                        let delta = event.delta.pixel_delta(line);
+                        editor
+                            .update(cx, |this, cx| {
+                                let offset = this.timeline_scroll.offset();
+                                let max = this.timeline_scroll.max_offset();
+                                let next = clipper_editor::timeline::wheel_scroll_offset(
+                                    -f32::from(offset.x),
+                                    f32::from(delta.x),
+                                    f32::from(delta.y),
+                                    f32::from(max.width),
+                                );
+                                this.timeline_scroll
+                                    .set_offset(gpui::point(px(-next), offset.y));
+                                cx.notify();
+                            })
+                            .ok();
+                        return;
+                    }
                     let lines = f32::from(event.delta.pixel_delta(line).y) / f32::from(line);
                     let Some(factor) = clipper_editor::timeline::wheel_zoom_factor(lines) else {
                         return;

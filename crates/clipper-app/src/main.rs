@@ -122,7 +122,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         })
         .detach();
 
-        let bounds = WindowBounds::centered(size(px(1200.), px(760.)), cx);
+        let bounds = WindowBounds::centered(size(px(1280.), px(900.)), cx);
         let result = cx.open_window(
             WindowOptions {
                 window_bounds: Some(bounds),

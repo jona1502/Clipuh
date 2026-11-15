@@ -22,6 +22,13 @@ pub const ZOOM_CEILING: f32 = 4096.0;
 /// Zoom factor of one button press or one Ctrl+wheel notch.
 pub const ZOOM_STEP: f32 = 1.25;
 
+/// Pan the visible time range, using vertical wheels as horizontal movement.
+/// Native horizontal touchpad movement takes precedence over vertical movement.
+pub fn wheel_scroll_offset(scroll: f32, delta_x: f32, delta_y: f32, max: f32) -> f32 {
+    let delta = if delta_x != 0. { delta_x } else { delta_y };
+    (scroll - delta).clamp(0., max.max(0.))
+}
+
 /// Zoom factor for a Ctrl+wheel movement of `lines` (positive = wheel up =
 /// zoom in). One mouse-wheel notch is three lines on Windows and zooms by
 /// [`ZOOM_STEP`]; precision touchpads (pinch) send fractions and zoom

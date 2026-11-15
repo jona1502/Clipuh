@@ -73,14 +73,30 @@ pub fn display_label(track: &AudioTrack) -> &str {
     }
 }
 
-/// Discovered tracks in editor order: the combined track first, every other
+/// Discovered tracks in editor order: combined, microphone, desktop, then every other
 /// track in its recorded order. When the combined track and isolated source
 /// tracks both exist, the sources start muted: they contain the same audio
 /// again, and playing both would double every source. Unmuting either side
 /// later mutes the other (see [`EditSession::set_track_mute`]).
 pub fn arrange_audio_tracks(mut tracks: Vec<AudioTrack>) -> Vec<AudioTrack> {
     // Stable: equal keys keep their relative (recorded) order.
-    tracks.sort_by_key(|track| !is_combined(track));
+    tracks.sort_by_key(|track| {
+        if is_combined(track) {
+            0
+        } else if track.label.trim().eq_ignore_ascii_case("Microphone") {
+            1
+        } else if track.label.trim().eq_ignore_ascii_case("Desktop")
+            || track
+                .label
+                .trim()
+                .to_ascii_lowercase()
+                .starts_with("desktop (")
+        {
+            2
+        } else {
+            3
+        }
+    });
     if tracks.len() > 1 && tracks.first().is_some_and(is_combined) {
         for track in tracks.iter_mut().skip(1) {
             if !is_combined(track) {

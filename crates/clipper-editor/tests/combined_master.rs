@@ -45,21 +45,36 @@ fn legacy_mix_is_shown_as_combined_master_without_renaming_the_file_label() {
 }
 
 #[test]
-fn combined_is_always_the_first_audio_track_and_sources_keep_their_order() {
+fn combined_microphone_desktop_precede_other_sources_in_stable_order() {
     let arranged = arrange_audio_tracks(vec![
         track(3, "game.exe"),
         track(4, "Discord.exe"),
         track(1, "Mix"),
         track(5, "Microphone"),
+        track(6, "Desktop (full mix)"),
     ]);
     let order: Vec<u32> = arranged.iter().map(|t| t.stream_index).collect();
-    assert_eq!(order, [1, 3, 4, 5]);
+    assert_eq!(order, [1, 5, 6, 3, 4]);
     // Re-arranging is stable (refresh, reopen).
     let again: Vec<u32> = arrange_audio_tracks(arranged)
         .iter()
         .map(|t| t.stream_index)
         .collect();
-    assert_eq!(again, [1, 3, 4, 5]);
+    assert_eq!(again, [1, 5, 6, 3, 4]);
+}
+
+#[test]
+fn source_priority_without_master_ignores_case_and_whitespace() {
+    let arranged = arrange_audio_tracks(vec![
+        track(3, "game.exe"),
+        track(2, " desktop (without Discord.exe) "),
+        track(1, "MICROPHONE"),
+        track(4, "Discord.exe"),
+    ]);
+    assert_eq!(
+        arranged.iter().map(|t| t.stream_index).collect::<Vec<_>>(),
+        [1, 2, 3, 4]
+    );
 }
 
 #[test]
@@ -83,8 +98,8 @@ fn only_the_combined_track_is_heard_by_default() {
         audible(&session),
         [
             (COMBINED_LABEL.to_owned(), true),
-            ("game.exe".to_owned(), false),
             ("Microphone".to_owned(), false),
+            ("game.exe".to_owned(), false),
         ]
     );
 }
@@ -96,10 +111,10 @@ fn unmuting_a_source_mutes_combined_and_back_in_one_undo_step() {
         track(2, "game.exe"),
         track(3, "Microphone"),
     ]);
-    session.set_track_mute(2, false).unwrap(); // Microphone on
+    session.set_track_mute(1, false).unwrap(); // Microphone on
     let heard: Vec<bool> = audible(&session).into_iter().map(|(_, on)| on).collect();
-    assert_eq!(heard, [false, false, true], "combined muted, mic heard");
-    session.set_track_mute(1, false).unwrap(); // game on too: both sources
+    assert_eq!(heard, [false, true, false], "combined muted, mic heard");
+    session.set_track_mute(2, false).unwrap(); // game on too: both sources
     let heard: Vec<bool> = audible(&session).into_iter().map(|(_, on)| on).collect();
     assert_eq!(heard, [false, true, true]);
     session.set_track_mute(0, false).unwrap(); // back to combined
