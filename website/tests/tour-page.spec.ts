@@ -161,43 +161,23 @@ test("chapter headings and copy are visible without JavaScript", async ({
 });
 
 for (const width of [375, 1440]) {
-  test(`hero window is a preview: Tab skips it at ${width}px`, async ({
-    browser,
-  }) => {
+  test(`hero has no app preview at ${width}px`, async ({ browser }) => {
     const context = await browser.newContext({
       viewport: { width, height: 900 },
     });
     const page = await context.newPage();
     await page.goto("/");
     const hero = page.locator("#top");
-    await expect(hero.locator("astro-island").first()).not.toHaveAttribute(
-      "ssr",
+    await expect(hero.getByRole("heading", { level: 1 })).toBeVisible();
+    await expect(hero.locator("astro-island, [data-app-window]")).toHaveCount(
+      0,
     );
-    // The hero shows another page than the Capture chapter right below.
-    await expect(hero.locator("[data-app-window]")).toHaveAttribute(
-      "data-page",
-      "library",
-    );
-    // The honesty label stays visible and readable.
-    await expect(
-      hero.getByText("Interactive demo · sample data", { exact: true }),
-    ).toBeVisible();
-
-    await hero.getByRole("link", { name: "Take the tour" }).focus();
-    await page.keyboard.press("Tab");
-    const landed = await page.evaluate(() => ({
-      inHero: !!document.activeElement?.closest(".hero-window"),
-      chapter: document.activeElement?.closest("section")?.id ?? null,
-    }));
-    expect(landed.inHero).toBe(false);
-    expect(landed.chapter).toBe("capture");
-    expect(
-      await hero.locator(".hero-window").evaluate((e) => e.scrollTop),
-    ).toBe(0);
+    await hero.getByRole("link", { name: "Take the tour" }).click();
+    await expect(page).toHaveURL(/#capture$/);
+    await expect(page.locator("#capture [data-app-window]")).toBeVisible();
     await context.close();
   });
 }
-
 test("header highlight follows the chapters and clears past them", async ({
   page,
 }) => {
