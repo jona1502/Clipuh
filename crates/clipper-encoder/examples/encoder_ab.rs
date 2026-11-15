@@ -22,7 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         EncoderConfig, MediaFoundation, SubmitOutcome,
     };
     use clipper_encoder::backends::packet_encoder::PacketEncoder;
-    use clipper_encoder::codecs::{H264Tuning, RateControl};
+    use clipper_encoder::codecs::{H264Profile, H264Tuning, RateControl};
     use clipper_platform::windows::{ComApartment, D3DContext};
     use clipper_replay::{CodecConfig, EncodedPacket, TICKS_PER_SECOND};
     use std::collections::HashMap;
@@ -42,6 +42,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut rc: Option<RateControl> = None;
     let mut out: Option<String> = None;
     let mut paced = true;
+    let mut refs: Option<u32> = None;
+    let mut cabac: Option<bool> = None;
+    let mut slice_rows: Option<u32> = None;
+    let mut gop: Option<u32> = None;
+    let mut h264: Option<H264Profile> = None;
     for arg in std::env::args().skip(1) {
         let (key, value) = arg.split_once('=').ok_or("arguments are key=value")?;
         match key {
@@ -72,6 +77,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // retried, never dropped); out_fps then measures encoder time per
             // frame at full clock, independent of power-state ramping.
             "paced" => paced = value != "0",
+            "refs" => refs = Some(value.parse()?),
+            "cabac" => cabac = Some(value != "0"),
+            "slice_rows" => slice_rows = Some(value.parse()?),
+            "gop" => gop = Some(value.parse()?),
+            "h264" => {
+                h264 = Some(match value {
+                    "main" => H264Profile::Main,
+                    "high" => H264Profile::High,
+                    _ => return Err("h264=main|high".into()),
+                })
+            }
             _ => return Err(format!("unknown argument {key}").into()),
         }
     }
@@ -142,6 +158,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(value) = peak {
         tuning.peak_bitrate_bps = (f64::from(tuning.bitrate_bps) * value) as u32;
+    }
+    tuning.max_ref_frames = refs.or(tuning.max_ref_frames);
+    tuning.cabac = cabac.or(tuning.cabac);
+    tuning.slice_mb_rows = slice_rows.or(tuning.slice_mb_rows);
+    if let Some(value) = gop {
+        tuning.gop_frames = value;
+    }
+    if let Some(value) = h264 {
+        tuning.profile = value;
     }
     if tuning.rate_control == RateControl::Cbr {
         tuning.peak_bitrate_bps = tuning.bitrate_bps;

@@ -39,6 +39,14 @@ pub struct H264Tuning {
     pub gop_frames: u32,
     /// B-frames add latency and are not supported by every hardware encoder.
     pub b_frames: u32,
+    /// Optional encoder knobs; `None` leaves the encoder's own default.
+    /// `CODECAPI_AVEncVideoMaxNumRefFrame`.
+    pub max_ref_frames: Option<u32>,
+    /// `CODECAPI_AVEncH264CABACEnable` (false = CAVLC).
+    pub cabac: Option<bool>,
+    /// Slices per frame given as macroblock rows per slice
+    /// (`CODECAPI_AVEncSliceControlMode` = 2 plus `..SliceControlSize`).
+    pub slice_mb_rows: Option<u32>,
 }
 
 impl H264Tuning {
@@ -55,6 +63,9 @@ impl H264Tuning {
                 profile: H264Profile::Main,
                 gop_frames,
                 b_frames: 0,
+                max_ref_frames: None,
+                cabac: None,
+                slice_mb_rows: None,
             },
             QualityProfile::Balanced => Self {
                 rate_control: RateControl::PeakConstrainedVbr,
@@ -65,6 +76,9 @@ impl H264Tuning {
                 profile: H264Profile::High,
                 gop_frames,
                 b_frames: 0,
+                max_ref_frames: None,
+                cabac: None,
+                slice_mb_rows: None,
             },
             QualityProfile::Quality => Self {
                 rate_control: RateControl::PeakConstrainedVbr,
@@ -75,6 +89,9 @@ impl H264Tuning {
                 profile: H264Profile::High,
                 gop_frames,
                 b_frames: 2,
+                max_ref_frames: None,
+                cabac: None,
+                slice_mb_rows: None,
             },
         }
     }
