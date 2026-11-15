@@ -166,6 +166,13 @@ test("track toggles flip aria-pressed and lock disables handles", async ({
       win.locator('[data-element="editor.trackLock"] [data-planned-badge]'),
     ).toBeVisible();
   }
+  // The link toggle comes from appStatus.ts like every other badge.
+  expect(isPlanned("editor.linkTracks")).toBe(true);
+  await expect(
+    win.locator(
+      '[data-element="editor.linkTracks"] [data-planned-badge="editor.linkTracks"]',
+    ),
+  ).toBeVisible();
 });
 
 test("side tabs switch all five panels with Planned badges", async ({

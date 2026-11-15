@@ -7,8 +7,6 @@ import {
   type CSSProperties,
   type PointerEvent,
 } from "react";
-import { statusBadgeClass, statusDotClass } from "@/components/feature/status";
-import { statusLabel } from "@/data/features";
 import { ClipThumb, type ThumbScene } from "../../thumbs";
 import { Icon, type IconName } from "../../ui/Icon";
 import { IconButton } from "../../ui/IconButton";
@@ -518,14 +516,7 @@ export function Timeline(p: Props) {
             pressed={p.link}
             onClick={p.onLink}
           />
-          {/* Not in appStatus.ts yet: no link toggle exists in the app. */}
-          <span
-            data-planned-badge="editor.linkTracks"
-            className={statusBadgeClass("planned", "sm")}
-          >
-            <span className={statusDotClass("planned")} aria-hidden="true" />
-            {statusLabel.planned}
-          </span>
+          <PlannedBadge id="editor.linkTracks" />
         </span>
         <IconButton
           label="Snap to playhead"

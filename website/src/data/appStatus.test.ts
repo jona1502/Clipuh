@@ -50,6 +50,7 @@ const ids = [
   "editor.snap",
   "editor.zoom",
   "editor.addTrack",
+  "editor.linkTracks",
   "settings.resolution",
   "settings.fps",
   "settings.encoder",

@@ -57,6 +57,7 @@ export type ElementId =
   | "editor.snap"
   | "editor.zoom"
   | "editor.addTrack"
+  | "editor.linkTracks"
   | "settings.resolution"
   | "settings.fps"
   | "settings.encoder"
@@ -173,6 +174,9 @@ export const elementStatus: Record<ElementId, FeatureStatus> = {
   "editor.zoom": "in-development",
   // not found in crates/clipper-editor or crates/clipper-ui/src/views/editor
   "editor.addTrack": "planned",
+  // not found in crates/clipper-ui/src/views/editor*: no link toggle; the audio
+  // inspector only notes that video ranges stay linked
+  "editor.linkTracks": "planned",
   // crates/clipper-ui/src/views/settings.rs (Resolution)
   "settings.resolution": "in-development",
   // crates/clipper-ui/src/views/settings.rs (Frame Rate)
