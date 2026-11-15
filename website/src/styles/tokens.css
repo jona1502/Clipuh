@@ -54,6 +54,28 @@
    */
   --color-accent-foreground: #111118;
 
+  /*
+   * ---- Web-only: canvas, glass and glow (no app counterpart). ----
+   * canvas: near-black page background behind the app windows, so a window
+   *   (background = app Base::DARK) reads as an object on the page.
+   * glass: translucent panels (chapter backdrops, cards) over the canvas;
+   *   use with backdrop-blur-glass and shadow-glass (1px light top edge).
+   * glow: accent light behind windows and the CTA shape. Derived from the
+   *   site accent, so it follows --color-accent.
+   */
+  --color-canvas: #08090d;
+  --color-glass: color-mix(in srgb, var(--color-surface) 58%, transparent);
+  --color-glass-tint: color-mix(in srgb, var(--color-accent) 7%, transparent);
+  --color-glass-border: color-mix(in srgb, var(--color-text) 9%, transparent);
+  --color-glass-highlight: color-mix(
+    in srgb,
+    var(--color-text) 16%,
+    transparent
+  );
+  --color-glow: color-mix(in srgb, var(--color-accent) 38%, transparent);
+  --color-glow-soft: color-mix(in srgb, var(--color-accent) 14%, transparent);
+  --blur-glass: 20px;
+
   /* ---- Status. error = app danger. ---- */
   --color-success: #4ade80;
   --color-warning: #fbbf24;
@@ -72,6 +94,11 @@
   --text-display--line-height: 1.05;
   --text-display--letter-spacing: -0.035em;
   --text-display--font-weight: 700;
+  /* Chapter headline: between display and h1, tighter tracking. */
+  --text-chapter: clamp(2.25rem, 1.45rem + 3.4vw, 4rem);
+  --text-chapter--line-height: 1.04;
+  --text-chapter--letter-spacing: -0.04em;
+  --text-chapter--font-weight: 700;
   --text-h1: clamp(2rem, 1.5rem + 2vw, 3rem);
   --text-h1--line-height: 1.1;
   --text-h1--letter-spacing: -0.03em;
@@ -112,6 +139,9 @@
   --radius-md: 0.5rem;
   --radius-lg: 0.75rem;
   --radius-xl: 1rem;
+  /* Glass backdrops and large floating panels. */
+  --radius-2xl: 1.25rem;
+  --radius-3xl: 1.75rem;
   /* Aliases kept for existing markup; prefer rounded-md / rounded-lg. */
   --radius-control: 0.5rem;
   --radius-surface: 0.75rem;
@@ -120,6 +150,13 @@
   --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.35);
   --shadow-md: 0 4px 16px rgb(0 0 0 / 0.35);
   --shadow-lg: 0 16px 48px rgb(0 0 0 / 0.45);
+  /* Glass panels: inner 1px highlight on the top edge plus a soft drop. */
+  --shadow-glass:
+    inset 0 1px 0 var(--color-glass-highlight), 0 24px 64px rgb(0 0 0 / 0.4);
+  /* Floating product window (hero, chapters): long, soft drop shadow. */
+  --shadow-float:
+    0 0 0 1px var(--color-glass-border), 0 40px 120px -20px rgb(0 0 0 / 0.75),
+    0 12px 32px rgb(0 0 0 / 0.45);
 
   /* ---- Motion ---- */
   --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
