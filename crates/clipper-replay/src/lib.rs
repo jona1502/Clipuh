@@ -22,6 +22,7 @@ pub mod hybrid;
 pub mod mp4;
 pub mod packet;
 pub mod plan;
+pub mod publish;
 pub mod ram;
 pub mod track_names;
 
