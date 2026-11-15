@@ -1,6 +1,5 @@
 ---
 import Container from "@/components/ui/Container.astro";
-import StatusBadge from "@/components/feature/StatusBadge.astro";
 import { featureIds, performance } from "@/data/features";
 
 // Main path: 2-column grid at every width (compact boxes below sm).
@@ -31,12 +30,6 @@ const box =
 >
   <Container>
     <div class="reveal mx-auto flex max-w-3xl flex-col items-center gap-5 text-center">
-      <div class="flex flex-wrap items-center justify-center gap-3">
-        <p class="text-caption text-accent-hover font-semibold tracking-widest uppercase">
-          {performance.eyebrow}
-        </p>
-        <StatusBadge status={performance.status} />
-      </div>
       <h2
         id={`${featureIds.performance}-title`}
         class="text-chapter text-gradient pb-1"

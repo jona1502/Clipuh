@@ -280,3 +280,14 @@
   background: white;
   transform: translateX(1.5rem);
 }
+
+/* Hide app-window scrollbars while preserving wheel, touch and keyboard scrolling. */
+[data-app-window],
+[data-app-window] * {
+  scrollbar-width: none;
+}
+
+[data-app-window]::-webkit-scrollbar,
+[data-app-window] *::-webkit-scrollbar {
+  display: none;
+}

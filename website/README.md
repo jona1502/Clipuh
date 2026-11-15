@@ -78,32 +78,22 @@ Planned routes: `/features`, `/showcase`, `/download`, `/changelog`, `/docs`, `/
 nav links to the four chapters (mobile menu below 768px).
 
 - **Islands.** Every window is one `AppTour` island
-  (`interactive/app/AppTour.tsx`): the hero mounts it with `client:idle` on the
-  Library page, each `TourChapter` with `client:visible` on its own page. The
-  islands share one module-level store (`app/store.ts`, `useSyncExternalStore`),
+  (`interactive/app/AppTour.tsx`): each `TourChapter` mounts it with
+  `client:visible` on its own page. The islands share one module-level store (`app/store.ts`, `useSyncExternalStore`),
   so favorites, renames, deletes, accent, theme and top-bar values sync across
   windows. Each window keeps its own current page. Page components are
   `React.lazy` chunks loaded when a window shows them.
-- **Hero choice.** The server render of the hero window is visible at once and
-  the LCP element stays text (Lighthouse 12: mobile LCP 2.5 s, desktop 0.6 s,
-  both on the hero headline block, CLS 0), so the hero keeps the live island
-  instead of a static image (a server-only render would leave the lazy page as
-  a skeleton). The hero window is a preview: it sits in an `inert` wrapper (no
-  focus, no clicks; the demo label stays outside it), so keyboard users go from
-  the hero CTAs straight to the Capture chapter. Below 768px it shows the
-  window's top part with `overflow: clip` and a fade.
-- **JS budget.** At most 150 KB gzip loaded when the first window hydrates.
-  Measured: 83.9 KB at hero hydration (react-dom client 65.7 KB, Dropdown
-  7.3 KB, AppTour 3.9 KB, LibraryPage 3.9 KB, react 3.0 KB, the rest under
-  2 KB each), 87.8 KB once the Capture chapter is visible. Re-measure after
-  changes: collect the `.js` responses until the hero island hydrates and gzip
-  (`-9`) the matching files in `dist/`.
+- **Hero.** Headline, description and calls to action only; the first app window
+  appears in the Capture chapter.
+- **JS budget.** At most 150 KB gzip loaded when the first chapter window hydrates.
+  Measure JavaScript responses when Capture becomes visible and gzip (-9) the
+  matching files in dist/.
 - **Visual direction.** Raycast-like pacing, own assets only: near-black
   `canvas`, gradient chapter headlines (`text-chapter text-gradient`), each
   window on a `.glass-panel` backdrop with an accent glow, three short feature
   blocks per chapter, glass cards for Performance and More features, and a
   self-made SVG sphere-and-ring behind the final CTA. Motion is limited to
-  `.reveal`, the hero fade-in and a slow CTA float, all off under reduced
+  `.reveal` and a slow CTA float, all off under reduced
   motion.
 
 ## Design system
