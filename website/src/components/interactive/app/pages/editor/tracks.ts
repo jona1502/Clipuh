@@ -1,5 +1,5 @@
 import type { IconName } from "../../ui/Icon";
-import type { TrackDef } from "../../../editor/model";
+import type { WaveKind } from "../../../editor/model";
 import type { TrackId } from "./editorState";
 
 export interface EditorTrack {
@@ -8,7 +8,7 @@ export interface EditorTrack {
   icon: IconName;
   /** Accent token for the lane; the window accent unless set. */
   colorVar?: string;
-  wave?: { seed: number; kind: TrackDef["kind"] };
+  wave?: { seed: number; kind: WaveKind };
 }
 
 /** Video plus three audio tracks, as in the mockup. */

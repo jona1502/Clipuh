@@ -1,55 +1,17 @@
-/** Pure model for the editor demo. All times are integer tenths of a second. */
+/**
+ * Pure helpers for the Editor page (app/pages/editor): trim limits, keyboard
+ * steps and generated waveforms. All times are integer tenths of a second.
+ */
 
-export const DURATION = 300;
 export const MIN_TRIM = 10;
 export const STEP = 1;
 export const BIG_STEP = 10;
 
-export type TrackId = "game" | "discord" | "desktop" | "mic";
-
-export interface TrackDef {
-  id: TrackId;
-  name: string;
-  /** Not available in the app yet; shown tagged "Planned". */
-  planned: boolean;
-  seed: number;
-  kind: "steady" | "bursty" | "game";
-}
-
-export const TRACKS: readonly TrackDef[] = [
-  { id: "game", name: "Game audio", planned: true, seed: 11, kind: "game" },
-  { id: "discord", name: "Discord", planned: true, seed: 23, kind: "bursty" },
-  {
-    id: "desktop",
-    name: "Desktop audio",
-    planned: false,
-    seed: 37,
-    kind: "steady",
-  },
-  {
-    id: "mic",
-    name: "Microphone",
-    planned: false,
-    seed: 53,
-    kind: "bursty",
-  },
-];
+/** Shape of a generated waveform (see makeWave). */
+export type WaveKind = "steady" | "bursty" | "game";
 
 export function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
-}
-
-/** 74 -> "0:07.4" */
-export function formatTime(tenths: number): string {
-  const t = Math.max(0, Math.round(tenths));
-  const minutes = Math.floor(t / 600);
-  const seconds = Math.floor(t / 10) % 60;
-  return `${minutes}:${String(seconds).padStart(2, "0")}.${t % 10}`;
-}
-
-/** 175 -> "17.5 s" */
-export function formatSeconds(tenths: number): string {
-  return `${(tenths / 10).toFixed(1)} s`;
 }
 
 function mulberry32(seed: number): () => number {
@@ -65,11 +27,7 @@ function mulberry32(seed: number): () => number {
 export const BARS = 72;
 
 /** Deterministic pseudo waveform, values in 0.06..1. */
-export function makeWave(
-  seed: number,
-  kind: TrackDef["kind"],
-  n = BARS,
-): number[] {
+export function makeWave(seed: number, kind: WaveKind, n = BARS): number[] {
   const rand = mulberry32(seed);
   const out: number[] = [];
   if (kind === "bursty") {
