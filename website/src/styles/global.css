@@ -1,5 +1,6 @@
 @import "tailwindcss";
 @import "./tokens.css";
+@import "./app-window.css";
 
 /* Self-hosted Inter (OFL-1.1), latin subset, variable weight. Vite bundles
    and hashes the woff2; BaseLayout preloads the same file. */
