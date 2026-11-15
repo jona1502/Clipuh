@@ -68,6 +68,8 @@ pub(crate) struct Notice {
     pub progress: bool,
     /// Important enough for a native desktop notification.
     pub desktop: bool,
+    /// Never plays the notification sound (informational hints).
+    pub silent: bool,
 }
 
 impl Notice {
@@ -87,6 +89,7 @@ impl Notice {
             action: None,
             progress: false,
             desktop: false,
+            silent: false,
         }
     }
 
@@ -102,6 +105,11 @@ impl Notice {
 
     pub fn progress(mut self) -> Self {
         self.progress = true;
+        self
+    }
+
+    pub fn silent(mut self) -> Self {
+        self.silent = true;
         self
     }
 }

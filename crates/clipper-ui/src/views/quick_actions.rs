@@ -39,7 +39,7 @@ fn notice_sound(
     native_delivered: bool,
     quiet_time: bool,
 ) -> bool {
-    if !allowed(notice, settings) || !settings.sound || notice.progress {
+    if !allowed(notice, settings) || !settings.sound || notice.progress || notice.silent {
         return false;
     }
     if notice.category == Category::ClipSave {
@@ -270,7 +270,9 @@ impl ClipperWindow {
                         "clipuh is still running",
                         "Instant Replay keeps running. Use the tray icon to reopen or exit.",
                     )
-                    .desktop();
+                    .desktop()
+                    // A hint, not an event: closing the window makes no sound.
+                    .silent();
                     this.notify_user(notice, cx);
                 }
             });
@@ -627,6 +629,22 @@ mod tests {
         assert!(notice_sound(&manual, &settings, false, false, false));
         let replay = Notice::new("replay", Category::Replay, Severity::Success, "Started", "");
         assert!(!notice_sound(&replay, &settings, true, false, false));
+    }
+
+    #[test]
+    fn silent_desktop_notice_never_sounds() {
+        let settings = clipper_storage::NotificationSettings::default();
+        let hint = Notice::new(
+            "tray-hint",
+            Category::Action,
+            Severity::Info,
+            "clipuh is still running",
+            "",
+        )
+        .desktop();
+        // Window hidden in the tray, native notification delivered.
+        assert!(notice_sound(&hint, &settings, false, true, false));
+        assert!(!notice_sound(&hint.silent(), &settings, false, true, false));
     }
 
     #[test]
