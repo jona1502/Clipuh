@@ -1,4 +1,7 @@
 #![forbid(unsafe_code)]
+// Release builds are GUI programs: no console window opens with the app, and
+// closing one cannot kill it. Debug builds keep the console for development.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 #[cfg(windows)]
 use gpui::actions;
