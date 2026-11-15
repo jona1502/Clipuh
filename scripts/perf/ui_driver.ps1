@@ -1,6 +1,6 @@
 # GUI driver for UI smoothness measurements (dot-source it).
 #
-# Starts clipper-app with GPUI's built-in frame timing (ZED_MEASUREMENTS=1:
+# Starts clipuh.exe with GPUI's built-in frame timing (ZED_MEASUREMENTS=1:
 # one "frame duration: <t>" line on stderr per drawn frame, covering layout,
 # paint and present), positions the window, sends shortcuts and synthetic
 # mouse-wheel input, and summarizes the frame log per scenario.

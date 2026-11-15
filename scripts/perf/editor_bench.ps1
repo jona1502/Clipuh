@@ -3,7 +3,7 @@
 # timeline to locate the white playhead line over time, while GPUI logs frame
 # durations. Also drags across the video track (scrub) for the scrubbing scenario.
 #
-#   pwsh scripts/perf/editor_bench.ps1 -Exe target/release/clipper-app.exe -Label after
+#   pwsh scripts/perf/editor_bench.ps1 -Exe target/release/clipuh.exe -Label after
 #
 # Layout coordinates assume the 1600x1000 window set by ui_driver.ps1 and a
 # clip with three audio tracks; adjust -StripY for other clips.

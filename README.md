@@ -202,8 +202,8 @@ The workspace lives in `crates/`. The application package is `clipper-app`; inte
 names keep the `clipper-` prefix.
 
 ```text
-cargo run -p clipper-app                         # debug build, with a console window
-cargo build --release --locked -p clipper-app    # optimized build in target\release\
+cargo run -p clipper-app --bin clipuh                         # debug build, with a console window
+cargo build --release --locked -p clipper-app --bin clipuh    # target/release/clipuh.exe
 ```
 
 Quality gates (the same as CI):
@@ -231,7 +231,8 @@ Design and validation notes are in [docs/](docs/).
 
 The version is defined once, as `workspace.package.version` in [Cargo.toml](Cargo.toml), and
 every crate inherits it. Changes are recorded in [CHANGELOG.md](CHANGELOG.md); version and
-tagging rules are in [docs/versioning.md](docs/versioning.md).
+tagging rules are in [docs/versioning.md](docs/versioning.md). Release build and publishing
+procedures are in [docs/release.md](docs/release.md).
 
 ## License
 
