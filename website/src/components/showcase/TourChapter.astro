@@ -16,7 +16,10 @@ const { id, copy } = Astro.props;
   id={id}
   aria-labelledby={id === "capture" ? undefined : `${id}-title`}
   aria-label={id === "capture" ? "Capture" : undefined}
-  class="py-section relative isolate overflow-x-clip"
+  class:list={[
+    "relative isolate overflow-x-clip",
+    id === "capture" ? "pb-section pt-8 md:pt-12" : "py-section",
+  ]}
 >
   <Container>
     {id !== "capture" && (
