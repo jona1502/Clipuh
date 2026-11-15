@@ -98,6 +98,28 @@ test("hotkey record", async ({ page }) => {
   await expect(row).toContainText("Alt + K");
 });
 
+test("Tab and Shift+Tab leave hotkey recording", async ({ page }) => {
+  const win = await settingsWindow(page);
+  const row = hotkeyRow(win, "Start / Stop Recording");
+  const change = row.getByRole("button", { name: /^Change/ });
+
+  // Tab moves focus on, records nothing and ends recording.
+  await change.click();
+  await expect(change).toHaveAttribute("aria-pressed", "true");
+  await page.keyboard.press("Tab");
+  await expect(change).not.toBeFocused();
+  await expect(change).toHaveAttribute("aria-pressed", "false");
+  await expect(row).toContainText("Alt + R");
+
+  // Shift+Tab moves focus back, never recorded as "Shift + Tab".
+  await change.click();
+  await page.keyboard.press("Shift+Tab");
+  await expect(change).not.toBeFocused();
+  await expect(change).toHaveAttribute("aria-pressed", "false");
+  await expect(row).toContainText("Alt + R");
+  await expect(row).not.toContainText("Tab");
+});
+
 test("hotkey conflict keeps combo", async ({ page }) => {
   const win = await settingsWindow(page);
   const row = hotkeyRow(win, "Start / Stop Recording");

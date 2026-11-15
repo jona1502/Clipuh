@@ -53,6 +53,9 @@ export function HotkeyRow({
     const root = windowRef.current;
     if (!recording || !root) return;
     const onKey = (e: KeyboardEvent) => {
+      // Bare Tab / Shift+Tab is never recorded: let it move focus so keyboard
+      // users can leave the row (onBlur then ends recording).
+      if (e.key === "Tab" && !e.ctrlKey && !e.altKey && !e.metaKey) return;
       e.preventDefault();
       e.stopPropagation();
       if (e.key === "Escape") {
