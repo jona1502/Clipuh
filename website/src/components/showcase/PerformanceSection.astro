@@ -1,6 +1,6 @@
 ---
-import FeatureSection from "@/components/feature/FeatureSection.astro";
-import DemoFrame from "@/components/feature/DemoFrame.astro";
+import Container from "@/components/ui/Container.astro";
+import StatusBadge from "@/components/feature/StatusBadge.astro";
 import { featureIds, performance } from "@/data/features";
 
 // Main path: 2-column grid at every width (compact boxes below sm).
@@ -21,93 +21,145 @@ const steps = [
   "Clip",
 ];
 const box =
-  "border-border bg-surface-raised rounded-lg border px-3 py-2 sm:px-4 sm:py-3";
+  "border-glass-border bg-surface-raised/70 rounded-lg border px-3 py-2 sm:px-4 sm:py-3";
 ---
 
-<FeatureSection id={featureIds.performance} copy={performance}>
-  <DemoFrame
-    slot="demo"
-    label="Architecture overview"
-    title="Capture pipeline"
-    minHeight="0"
-  >
-    <div
-      class="flex flex-col gap-4 p-4 sm:gap-6 sm:p-6"
-      role="group"
-      aria-label="Capture pipeline diagram"
-      aria-describedby="pipeline-steps"
-    >
-      <ol class="grid grid-cols-2 gap-2 sm:gap-3" aria-hidden="true">
-        {main.map((s, i) => (
-          <li class="relative">
-            <div
-              class:list={[
-                box,
-                s.name === "GPU encoder" && "border-accent/50",
-                s.name === "Clip" && "bg-accent-subtle border-transparent",
-              ]}
-            >
-              <p class="text-small font-semibold">
-                <span class="text-text-muted mr-2 tabular-nums">{i + 1}</span>
-                {s.name}
-              </p>
-              <p class="text-caption text-text-muted mt-0.5">{s.note}</p>
+<section
+  id={featureIds.performance}
+  aria-labelledby={`${featureIds.performance}-title`}
+  class="py-section relative isolate overflow-x-clip"
+>
+  <Container>
+    <div class="reveal mx-auto flex max-w-3xl flex-col items-center gap-5 text-center">
+      <div class="flex flex-wrap items-center justify-center gap-3">
+        <p class="text-caption text-accent-hover font-semibold tracking-widest uppercase">
+          {performance.eyebrow}
+        </p>
+        <StatusBadge status={performance.status} />
+      </div>
+      <h2
+        id={`${featureIds.performance}-title`}
+        class="text-chapter text-gradient pb-1"
+      >
+        {performance.title}
+      </h2>
+      <p class="text-lead text-text-secondary max-w-2xl">
+        {performance.description}
+      </p>
+    </div>
+
+    <div class="mt-10 grid gap-4 md:mt-14 lg:grid-cols-5">
+      <figure class="glass-panel reveal m-0 min-w-0 rounded-2xl lg:col-span-3">
+        <figcaption class="border-glass-border flex flex-wrap items-center gap-x-3 gap-y-1 border-b px-4 py-2.5">
+          <span
+            class="text-caption bg-surface-raised text-text-secondary rounded-sm px-2 py-0.5 font-semibold tracking-wide uppercase"
+            data-demo-label
+          >
+            Architecture overview
+          </span>
+          <span class="text-small text-text-secondary">Capture pipeline</span>
+        </figcaption>
+        <div
+          class="flex flex-col gap-4 p-4 sm:gap-6 sm:p-6"
+          role="group"
+          aria-label="Capture pipeline diagram"
+          aria-describedby="pipeline-steps"
+        >
+          <ol class="grid grid-cols-2 gap-2 sm:gap-3" aria-hidden="true">
+            {main.map((s, i) => (
+              <li class="relative">
+                <div
+                  class:list={[
+                    box,
+                    s.name === "GPU encoder" && "border-accent/50",
+                    s.name === "Clip" && "bg-accent-subtle border-transparent",
+                  ]}
+                >
+                  <p class="text-small font-semibold">
+                    <span class="text-text-muted mr-2 tabular-nums">
+                      {i + 1}
+                    </span>
+                    {s.name}
+                  </p>
+                  <p class="text-caption text-text-muted mt-0.5">{s.note}</p>
+                </div>
+              </li>
+            ))}
+          </ol>
+
+          <div class="border-border border-t pt-4 sm:pt-5" aria-hidden="true">
+            <p class="text-caption text-text-muted mb-3 font-semibold tracking-widest uppercase">
+              Audio branch
+            </p>
+            <div class="flex flex-col gap-1 sm:flex-row sm:items-center sm:gap-2">
+              <div class:list={[box, "sm:flex-1"]}>
+                <p class="text-small font-semibold">Desktop + Mic</p>
+                <p class="text-caption text-text-muted mt-0.5">Audio sources</p>
+              </div>
+              <svg
+                viewBox="0 0 24 24"
+                class="text-text-muted size-4 shrink-0 self-center rotate-90 sm:rotate-0"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              >
+                <path d="M5 12h14M13 6l6 6-6 6"></path>
+              </svg>
+              <div class:list={[box, "sm:flex-1"]}>
+                <p class="text-small font-semibold">AAC</p>
+                <p class="text-caption text-text-muted mt-0.5">Encoded audio</p>
+              </div>
+              <svg
+                viewBox="0 0 24 24"
+                class="text-text-muted size-4 shrink-0 self-center rotate-90 sm:rotate-0"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              >
+                <path d="M5 12h14M13 6l6 6-6 6"></path>
+              </svg>
+              <div class:list={[box, "sm:flex-1"]}>
+                <p class="text-small font-semibold">Replay buffer</p>
+                <p class="text-caption text-text-muted mt-0.5">Next to video</p>
+              </div>
             </div>
+          </div>
+
+          <ol id="pipeline-steps" class="sr-only">
+            {steps.map((s) => (
+              <li>{s}</li>
+            ))}
+            <li>
+              Audio branch: desktop audio and microphone, encoded as AAC,
+              written into the replay buffer
+            </li>
+          </ol>
+        </div>
+      </figure>
+
+      <ul class="grid min-w-0 gap-4 sm:grid-cols-2 lg:col-span-2 lg:grid-cols-1">
+        {performance.points.map((point) => (
+          <li class="glass-panel reveal text-small text-text-secondary flex gap-3 rounded-2xl p-5">
+            <svg
+              viewBox="0 0 24 24"
+              class="text-accent-hover mt-0.5 size-5 shrink-0"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M5 12.5l4.5 4.5L19 7.5" />
+            </svg>
+            <span>{point}</span>
           </li>
         ))}
-      </ol>
-
-      <div class="border-border border-t pt-4 sm:pt-5" aria-hidden="true">
-        <p class="text-caption text-text-muted mb-3 font-semibold tracking-widest uppercase">
-          Audio branch
-        </p>
-        <div class="flex flex-col gap-1 sm:flex-row sm:items-center sm:gap-2">
-          <div class:list={[box, "sm:flex-1"]}>
-            <p class="text-small font-semibold">Desktop + Mic</p>
-            <p class="text-caption text-text-muted mt-0.5">Audio sources</p>
-          </div>
-          <svg
-            viewBox="0 0 24 24"
-            class="text-text-muted size-4 shrink-0 self-center rotate-90 sm:rotate-0"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="2"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-          >
-            <path d="M5 12h14M13 6l6 6-6 6"></path>
-          </svg>
-          <div class:list={[box, "sm:flex-1"]}>
-            <p class="text-small font-semibold">AAC</p>
-            <p class="text-caption text-text-muted mt-0.5">Encoded audio</p>
-          </div>
-          <svg
-            viewBox="0 0 24 24"
-            class="text-text-muted size-4 shrink-0 self-center rotate-90 sm:rotate-0"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="2"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-          >
-            <path d="M5 12h14M13 6l6 6-6 6"></path>
-          </svg>
-          <div class:list={[box, "sm:flex-1"]}>
-            <p class="text-small font-semibold">Replay buffer</p>
-            <p class="text-caption text-text-muted mt-0.5">Next to video</p>
-          </div>
-        </div>
-      </div>
-
-      <ol id="pipeline-steps" class="sr-only">
-        {steps.map((s) => (
-          <li>{s}</li>
-        ))}
-        <li>
-          Audio branch: desktop audio and microphone, encoded as AAC, written
-          into the replay buffer
-        </li>
-      </ol>
+      </ul>
     </div>
-  </DemoFrame>
-</FeatureSection>
+  </Container>
+</section>

@@ -16,44 +16,48 @@ const { id, copy } = Astro.props;
 <section
   id={id}
   aria-labelledby={`${id}-title`}
-  class="border-border/60 py-section relative isolate border-t"
+  class="py-section relative isolate overflow-x-clip"
 >
   <Container>
-    <div class="reveal mx-auto flex max-w-3xl flex-col items-center gap-4 text-center">
+    <div class="reveal mx-auto flex max-w-3xl flex-col items-center gap-5 text-center">
       <div class="flex flex-wrap items-center justify-center gap-3">
-        <p class="text-caption text-accent font-semibold tracking-widest uppercase">
+        <p class="text-caption text-accent-hover font-semibold tracking-widest uppercase">
           {copy.eyebrow}
         </p>
         <StatusBadge status={copy.status} />
       </div>
-      <h2
-        id={`${id}-title`}
-        class="from-text to-text-secondary bg-linear-to-b bg-clip-text text-transparent"
-      >
+      <h2 id={`${id}-title`} class="text-chapter text-gradient pb-1">
         {copy.title}
       </h2>
       <p class="text-lead text-text-secondary max-w-2xl">{copy.description}</p>
     </div>
 
-    <div class="relative mt-10 md:mt-14">
-      <!-- Soft accent glow behind the window, CSS only. -->
+    <div class="relative mt-10 md:mt-16">
+      <!-- Soft accent glow behind the glass backdrop, CSS only. -->
       <div
-        class="tour-glow pointer-events-none absolute inset-x-8 -inset-y-6 -z-10"
+        class="chapter-glow pointer-events-none absolute -inset-x-4 -inset-y-10 -z-10 md:-inset-x-12"
         aria-hidden="true"
       ></div>
-      <DemoFrame
-        label="Interactive demo · sample data"
-        minHeight="32rem"
-        class="tour-frame"
-      >
-        <AppTour client:visible initialPage={id} />
-      </DemoFrame>
+      <div class="glass-panel rounded-2xl p-1.5 sm:p-2.5 md:rounded-3xl md:p-4">
+        <DemoFrame
+          label="Interactive demo · sample data"
+          minHeight="32rem"
+          class="chapter-frame"
+        >
+          <AppTour client:visible initialPage={id} />
+        </DemoFrame>
+      </div>
     </div>
 
-    <ul class="mt-10 grid gap-6 sm:grid-cols-3 md:mt-12">
+    <ul
+      data-chapter-points
+      class="mt-10 grid gap-x-8 gap-y-6 sm:grid-cols-3 md:mt-14"
+    >
       {copy.points.map((point) => (
-        <li class="reveal flex flex-col gap-1.5">
-          <h3 class="text-body text-text font-semibold">{point.title}</h3>
+        <li class="reveal border-glass-border flex flex-col gap-1.5 border-t pt-4">
+          <h3 class="text-body text-text font-semibold tracking-tight">
+            {point.title}
+          </h3>
           <p class="text-small text-text-secondary">{point.body}</p>
         </li>
       ))}
@@ -62,18 +66,16 @@ const { id, copy } = Astro.props;
 </section>
 
 <style>
-  .tour-glow {
+  .chapter-glow {
     background: radial-gradient(
-      60% 55% at 50% 45%,
-      var(--color-accent-subtle),
-      transparent 70%
+      55% 50% at 50% 50%,
+      var(--color-glow-soft),
+      transparent 72%
     );
-    filter: blur(32px);
+    filter: blur(40px);
   }
-  :global(.tour-frame) {
-    /* Glass: 1px light top edge and inner highlight over the frame. */
-    box-shadow:
-      inset 0 1px 0 color-mix(in srgb, var(--color-text) 8%, transparent),
-      var(--shadow-lg);
+  :global(.chapter-frame) {
+    border-color: var(--color-glass-border);
+    box-shadow: var(--shadow-float);
   }
 </style>
