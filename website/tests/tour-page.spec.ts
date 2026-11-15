@@ -75,9 +75,14 @@ for (const width of widths) {
     // Every chapter heading is visible once scrolled to.
     for (const id of chapters) {
       const heading = page.locator(`#${id}-title`);
-      await heading.scrollIntoViewIfNeeded();
-      await expect(heading).toBeVisible();
-      await expect(heading).toHaveText(tourChapters[id].title);
+      if (id !== "capture") {
+        await heading.scrollIntoViewIfNeeded();
+        await expect(heading).toBeVisible();
+        await expect(heading).toHaveText(tourChapters[id].title);
+      } else {
+        await expect(heading).toHaveCount(0);
+        await page.locator("#capture").scrollIntoViewIfNeeded();
+      }
       await expect(
         page.locator(`#${id}`).getByText("Interactive demo · sample data"),
       ).toBeVisible();
@@ -134,9 +139,19 @@ test("chapter headings and copy are visible without JavaScript", async ({
   for (const id of chapters) {
     const copy = tourChapters[id];
     const section = page.locator(`#${id}`);
-    await expect(section.locator(`#${id}-title`)).toHaveText(copy.title);
-    await expect(section.locator(`#${id}-title`)).toBeVisible();
-    await expect(section.getByText(copy.description)).toBeVisible();
+    if (id !== "capture") {
+      await expect(section.locator(`#${id}-title`)).toHaveText(copy.title);
+      await expect(section.locator(`#${id}-title`)).toBeVisible();
+      await expect(section.getByText(copy.description)).toBeVisible();
+    } else {
+      await expect(section.getByText(copy.title, { exact: true })).toHaveCount(
+        0,
+      );
+      await expect(
+        section.getByText(copy.description, { exact: true }),
+      ).toHaveCount(0);
+      await expect(section).toHaveAttribute("aria-label", "Capture");
+    }
     for (const point of copy.points)
       await expect(
         section

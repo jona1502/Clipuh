@@ -14,18 +14,23 @@ const { id, copy } = Astro.props;
 
 <section
   id={id}
-  aria-labelledby={`${id}-title`}
+  aria-labelledby={id === "capture" ? undefined : `${id}-title`}
+  aria-label={id === "capture" ? "Capture" : undefined}
   class="py-section relative isolate overflow-x-clip"
 >
   <Container>
-    <div class="reveal mx-auto flex max-w-3xl flex-col items-center gap-5 text-center">
-      <h2 id={`${id}-title`} class="text-chapter text-gradient pb-1">
-        {copy.title}
-      </h2>
-      <p class="text-lead text-text-secondary max-w-2xl">{copy.description}</p>
-    </div>
+    {id !== "capture" && (
+      <div class="reveal mx-auto flex max-w-3xl flex-col items-center gap-5 text-center">
+        <h2 id={`${id}-title`} class="text-chapter text-gradient pb-1">
+          {copy.title}
+        </h2>
+        <p class="text-lead text-text-secondary max-w-2xl">
+          {copy.description}
+        </p>
+      </div>
+    )}
 
-    <div class="relative mt-10 md:mt-16">
+    <div class:list={["relative", id !== "capture" && "mt-10 md:mt-16"]}>
       <!-- Soft accent glow behind the glass backdrop, CSS only. -->
       <div
         class="chapter-glow pointer-events-none absolute -inset-x-4 -inset-y-10 -z-10 md:-inset-x-12"
