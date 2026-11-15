@@ -16,6 +16,12 @@
 //!   DTS is earlier than its PTS (B-frame reordering) is handled by
 //!   composition offsets plus an edit list (`media_time` below), so no
 //!   negative timestamps are ever written.
+//! - A clip never spans a video discontinuity (consecutive decode times more
+//!   than [`MAX_VIDEO_GAP`] apart, e.g. a clock jump or lost footage): it
+//!   starts at the first keyframe after the newest one, and is `NotReady`
+//!   until such a keyframe exists. Otherwise the gap would be written into
+//!   the file as a frozen frame lasting the whole gap, and audio after it,
+//!   which players decode back to back, would drift from the video.
 //! - Audio is trimmed to AAC frame granularity: every packet overlapping the
 //!   video range `[start, video_end)` is kept. The first packet may begin
 //!   before the video (`media_time` skips into it) or after it (`lead` is an
@@ -27,6 +33,11 @@ use std::sync::Arc;
 use crate::error::ReplayError;
 use crate::gop::Gop;
 use crate::packet::{CodecConfig, EncodedPacket, StreamLayout, Ticks};
+
+/// Largest gap between consecutive video decode times inside one clip. The
+/// recorder's constant frame rate grid never leaves gaps (empty slots are
+/// filled with repeats), so anything above a second is a discontinuity.
+pub const MAX_VIDEO_GAP: Ticks = crate::packet::TICKS_PER_SECOND;
 
 /// One track of a planned clip.
 #[derive(Clone, Debug)]
@@ -143,10 +154,17 @@ pub fn plan_clip(
     video.dedup_by_key(|packet| packet.dts);
 
     let target = end_pts.saturating_sub(requested);
+    // Decode time of the first frame after the newest discontinuity.
+    let contiguous_from = video
+        .windows(2)
+        .filter(|pair| pair[1].dts.saturating_sub(pair[0].dts) > MAX_VIDEO_GAP)
+        .map(|pair| pair[1].dts)
+        .next_back()
+        .unwrap_or(Ticks::MIN);
     let keyframes = || {
-        video
-            .iter()
-            .filter(|packet| packet.keyframe && packet.pts < end_pts)
+        video.iter().filter(|packet| {
+            packet.keyframe && packet.pts < end_pts && packet.dts >= contiguous_from
+        })
     };
     let start = keyframes()
         .filter(|packet| packet.pts <= target)
@@ -472,18 +490,23 @@ mod tests {
     #[test]
     fn negative_dts_lead_in_at_session_start_is_exportable() {
         // Encoder-derived B-frame dts at the very first frames: dts < 0 <= pts.
+        // The second GOP is moved to follow the first without a gap (the
+        // shared fixture leaves 1.4 s between them, a discontinuity).
         let gops: Vec<Arc<Gop>> = b_frame_gops()
             .iter()
-            .map(|g| {
+            .enumerate()
+            .map(|(index, g)| {
                 let mut g = (**g).clone();
+                let shift = if index == 1 { ms(1300) } else { 0 };
                 for packet in &mut g.packets {
-                    packet.dts -= ms(200);
+                    packet.dts -= ms(200) + shift;
+                    packet.pts -= shift;
                 }
                 Arc::new(g)
             })
             .collect();
         assert!(gops[0].packets[0].dts < 0);
-        let plan = plan_clip(&layout(0), &gops, ms(5000), ms(2900)).unwrap();
+        let plan = plan_clip(&layout(0), &gops, ms(5000), ms(1600)).unwrap();
         assert_eq!(plan.start_pts, ms(200));
         assert!(plan.video.media_time > 0);
         let mut out = Vec::new();
