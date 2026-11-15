@@ -492,6 +492,14 @@ impl Worker<'_> {
                 "replay stop: capture and encoder released in {:?}; {diagnostics:?}, capture delivered {delivered} frames",
                 started.elapsed()
             ));
+            // Aggregated A/V timing health (docs/quality/av-sync-audit.md).
+            log(format_args!(
+                "replay stop: a/v sync: {} audio re-anchors (largest {} frames at 48 kHz), {} repeated video frames, {} audio frames lost",
+                diagnostics.audio_resyncs,
+                diagnostics.audio_max_resync_frames,
+                diagnostics.repeated_frames,
+                diagnostics.audio_glitch_frames
+            ));
         }
         if report || (had_session && error.is_some()) {
             self.send(RecorderEvent::ReplayStopped { error });
