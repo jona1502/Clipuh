@@ -11,34 +11,107 @@ const url = download.available ? download.url : null;
 <section
   id={featureIds.cta}
   aria-labelledby={`${featureIds.cta}-title`}
-  class="border-border/60 pt-section pb-section border-t"
+  class="pt-section pb-section relative isolate overflow-hidden"
 >
   <Container>
-    <div class="cta-panel border-border relative isolate overflow-hidden rounded-xl border px-6 py-12 text-center md:px-12 md:py-16">
+    <div class="cta-panel glass-panel relative isolate overflow-hidden rounded-3xl px-6 pt-10 pb-12 text-center md:px-12 md:pt-12 md:pb-16">
+      <!--
+        Self-made 3D accent shape: a lit sphere inside a tilted ring, drawn in
+        SVG with accent-derived gradients. The ring's back half is drawn
+        before the sphere and its front half after, so it wraps around it.
+      -->
+      <div class="cta-shape mx-auto" aria-hidden="true">
+        <div class="cta-shape-glow"></div>
+        <svg viewBox="0 0 320 240" class="cta-shape-svg" focusable="false">
+          <defs>
+            <radialGradient id="cta-sphere" cx="0.36" cy="0.3" r="0.75">
+              <stop offset="0" class="stop-highlight"></stop>
+              <stop offset="0.35" class="stop-accent-hover"></stop>
+              <stop offset="0.75" class="stop-accent"></stop>
+              <stop offset="1" class="stop-shade"></stop>
+            </radialGradient>
+            <radialGradient id="cta-rim" cx="0.5" cy="0.5" r="0.5">
+              <stop offset="0.82" class="stop-clear"></stop>
+              <stop offset="1" class="stop-rim"></stop>
+            </radialGradient>
+            <linearGradient id="cta-ring" x1="0" y1="0" x2="1" y2="0">
+              <stop offset="0" class="stop-clear"></stop>
+              <stop offset="0.3" class="stop-accent-hover"></stop>
+              <stop offset="0.6" class="stop-highlight"></stop>
+              <stop offset="1" class="stop-clear"></stop>
+            </linearGradient>
+            <clipPath id="cta-back">
+              <rect x="0" y="0" width="320" height="120"></rect>
+            </clipPath>
+            <clipPath id="cta-front">
+              <rect x="0" y="120" width="320" height="120"></rect>
+            </clipPath>
+          </defs>
+          <g transform="rotate(-14 160 120)">
+            <ellipse
+              cx="160"
+              cy="120"
+              rx="146"
+              ry="34"
+              fill="none"
+              stroke="url(#cta-ring)"
+              stroke-width="5"
+              clip-path="url(#cta-back)"
+              opacity="0.55"
+            ></ellipse>
+          </g>
+          <circle cx="160" cy="120" r="78" fill="url(#cta-sphere)"></circle>
+          <circle cx="160" cy="120" r="78" fill="url(#cta-rim)"></circle>
+          <ellipse
+            cx="136"
+            cy="88"
+            rx="26"
+            ry="14"
+            class="cta-gloss"
+            transform="rotate(-30 136 88)"
+          ></ellipse>
+          <g transform="rotate(-14 160 120)">
+            <ellipse
+              cx="160"
+              cy="120"
+              rx="146"
+              ry="34"
+              fill="none"
+              stroke="url(#cta-ring)"
+              stroke-width="5"
+              clip-path="url(#cta-front)"
+            ></ellipse>
+          </g>
+        </svg>
+      </div>
+
       {!url && (
-        <p class="text-caption text-text-secondary border-border bg-surface/60 inline-flex items-center gap-2 rounded-full border px-3 py-1 font-semibold">
+        <p class="text-caption text-text-secondary border-glass-border bg-surface/60 relative mt-2 inline-flex items-center gap-2 rounded-full border px-3 py-1 font-semibold">
           <span class="bg-warning size-1.5 rounded-full" aria-hidden="true" />
           {download.platform} · {download.statusLabel}
         </p>
       )}
-      <h2 id={`${featureIds.cta}-title`} class="mx-auto mt-5 max-w-2xl">
+      <h2
+        id={`${featureIds.cta}-title`}
+        class="text-chapter text-gradient relative mx-auto mt-5 max-w-3xl pb-1"
+      >
         {finalCta.title}
       </h2>
-      <p class="text-lead text-text-secondary mx-auto mt-4 max-w-xl">
+      <p class="text-lead text-text-secondary relative mx-auto mt-4 max-w-xl">
         {finalCta.description}
       </p>
-      <div class="mt-8 flex flex-col items-center justify-center gap-3 sm:flex-row">
+      <div class="relative mt-8 flex flex-col items-center justify-center gap-3 sm:flex-row">
         {url && (
           <Button href={url} size="lg">
             Download for {download.platform}
           </Button>
         )}
         <Button
-          href={`#${featureIds.intro}`}
+          href={`#${sections.tour}`}
           variant={url ? "secondary" : "primary"}
           size="lg"
         >
-          Explore features
+          Take the tour
         </Button>
         <Button href={`#${sections.hero}`} variant="ghost" size="lg">
           Back to top
@@ -52,10 +125,71 @@ const url = download.available ? download.url : null;
   .cta-panel {
     background:
       radial-gradient(
-        42rem 18rem at 50% 0%,
-        color-mix(in srgb, var(--color-accent) 16%, transparent),
+        40rem 20rem at 50% 0%,
+        var(--color-glow-soft),
         transparent 70%
       ),
-      var(--color-surface);
+      var(--color-glass);
+  }
+  .cta-shape {
+    position: relative;
+    width: min(20rem, 80%);
+    aspect-ratio: 4 / 3;
+  }
+  .cta-shape-glow {
+    position: absolute;
+    inset: 15% 20%;
+    border-radius: 50%;
+    background: var(--color-glow);
+    filter: blur(40px);
+  }
+  .cta-shape-svg {
+    position: relative;
+    display: block;
+    width: 100%;
+    height: 100%;
+    overflow: visible;
+  }
+  .stop-highlight {
+    stop-color: var(--color-text);
+  }
+  .stop-accent-hover {
+    stop-color: var(--color-accent-hover);
+  }
+  .stop-accent {
+    stop-color: var(--color-accent);
+  }
+  .stop-shade {
+    stop-color: color-mix(
+      in srgb,
+      var(--color-accent) 35%,
+      var(--color-canvas)
+    );
+  }
+  .stop-rim {
+    stop-color: var(--color-accent-hover);
+    stop-opacity: 0.55;
+  }
+  .stop-clear {
+    stop-color: var(--color-accent);
+    stop-opacity: 0;
+  }
+  .cta-gloss {
+    fill: var(--color-text);
+    opacity: 0.35;
+    filter: blur(6px);
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    .cta-shape-svg {
+      animation: cta-float 6s ease-in-out infinite alternate;
+    }
+  }
+  @keyframes cta-float {
+    from {
+      transform: translateY(-4px) rotate(-1deg);
+    }
+    to {
+      transform: translateY(6px) rotate(1deg);
+    }
   }
 </style>

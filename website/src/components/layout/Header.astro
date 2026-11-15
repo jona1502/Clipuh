@@ -27,7 +27,7 @@ const badgeClass =
 
 <header
   data-site-header
-  class="bg-background-elevated border-border sticky top-0 z-40 border-b"
+  class="header-bar border-glass-border sticky top-0 z-40 border-b"
 >
   <Container class="flex h-(--spacing-header) items-center justify-between">
     <Logo href={withBase("#top")} />
@@ -95,6 +95,16 @@ const badgeClass =
 </header>
 
 <style>
+  /* Translucent bar over the canvas; opaque fallback without backdrop-filter. */
+  .header-bar {
+    background: var(--color-background-elevated);
+  }
+  @supports (backdrop-filter: blur(1px)) {
+    .header-bar {
+      background: color-mix(in srgb, var(--color-canvas) 72%, transparent);
+      backdrop-filter: blur(var(--blur-glass)) saturate(140%);
+    }
+  }
   /* Without JS: no toggle, panel is a static block of links under the bar. */
   .menu-button {
     display: none;

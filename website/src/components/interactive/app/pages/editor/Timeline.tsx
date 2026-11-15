@@ -606,7 +606,10 @@ export function Timeline(p: Props) {
         </div>
 
         {/* Lanes (scroll horizontally when zoomed or narrow) */}
-        <div className="min-w-0 overflow-x-auto overflow-y-hidden pb-1">
+        <div
+          data-timeline-lanes
+          className="min-w-0 overflow-x-auto overflow-y-hidden pb-1"
+        >
           <div
             className="relative min-w-[22rem] touch-pan-y px-1 select-none"
             style={{ width: `${zoom * 100}%` }}

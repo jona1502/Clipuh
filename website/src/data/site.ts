@@ -1,5 +1,3 @@
-import { featureIds } from "./features";
-
 /**
  * Site-wide content and metadata. Single source for name, copy, navigation
  * and download availability; components read from here instead of
@@ -9,9 +7,8 @@ import { featureIds } from "./features";
 /** Homepage section ids used as in-page navigation targets. */
 export const sections = {
   hero: "top",
-  features: "features",
-  /** The interactive demos start with the instant replay section. */
-  showcase: "instant-replay",
+  /** The app tour starts with the Capture chapter. */
+  tour: "capture",
   download: "download",
 } as const;
 
@@ -30,25 +27,17 @@ export const site = {
     "clipuh is a native game clipping app for Windows. Save the moments that matter instantly, control every audio source, and turn clips into highlights without leaving your game.",
 
   /**
-   * Primary navigation. Routes like /features do not exist yet, so links
-   * point at homepage sections that are rendered on the page. Never add a
-   * link whose target does not exist.
+   * Primary navigation: the four app tour chapters. Routes like /features
+   * do not exist yet, so links point at homepage sections that are rendered
+   * on the page. Never add a link whose target does not exist.
    */
   nav: [
-    { label: "Features", href: `#${sections.features}` },
-    {
-      label: "Showcase",
-      href: `#${sections.showcase}`,
-      spans: [
-        featureIds.replay,
-        featureIds.mixer,
-        featureIds.editor,
-        featureIds.performance,
-        featureIds.more,
-      ],
-    },
+    { label: "Capture", href: "#capture" },
+    { label: "Library", href: "#library" },
+    { label: "Editor", href: "#editor" },
+    { label: "Settings", href: "#settings" },
     { label: "Download", href: `#${sections.download}` },
-  ] satisfies NavLink[],
+  ] as NavLink[],
 
   /**
    * Download availability. No public release exists yet: `url` stays null
