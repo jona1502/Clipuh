@@ -4,6 +4,14 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+# The package keeps its internal name; the executable is clipuh.exe. Explicit
+# targets only, so no second `clipper-app` binary is inferred from src/main.rs.
+autobins = false
+
+[[bin]]
+name = "clipuh"
+path = "src/main.rs"
+
 [dependencies]
 clipper-ui.workspace = true
 clipper-diagnostics.workspace = true

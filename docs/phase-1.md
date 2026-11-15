@@ -62,7 +62,8 @@ The checked-in Cargo.lock fixes the resolved application dependency graph.
 GPUI 0.2.2 is pinned and enabled only on Windows. Linux GUI support is deferred;
 the non-Windows launcher must report that limitation explicitly.
 
-Run `cargo run -p clipper-app` on Windows. Quality gates:
+Run `cargo run -p clipper-app --bin clipuh` on Windows (the `clipper-app`
+package builds `clipuh.exe`). Quality gates:
 
 ```text
 cargo fmt --all -- --check
