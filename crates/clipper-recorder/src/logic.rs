@@ -37,6 +37,63 @@ pub fn partial_path(final_path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// Outcome of publishing a finished manual recording.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Published {
+    /// The recording is complete and visible under this name (the requested
+    /// one, or `<stem>_N.mp4` when another file took it meanwhile).
+    Saved(PathBuf),
+    /// Not published; the partial file is kept as it is (never deleted: it
+    /// may be the only copy of a long recording) and `reason` says why.
+    Kept { reason: String },
+}
+
+/// Publishes the finished recording at `partial` as `final_path`:
+/// structural MP4 check (the sink writer must have written its index),
+/// contents flushed to the device, then a commit that never replaces an
+/// existing file. Runs once per recording, after the encoder finished.
+pub fn publish_recording(partial: &Path, final_path: &Path) -> Published {
+    use clipper_replay::publish::{check_mp4, commit_no_replace};
+    let kept = |reason: String| Published::Kept { reason };
+    match check_mp4(partial) {
+        Ok(Ok(())) => {}
+        Ok(Err(incomplete)) => return kept(format!("it was not finalized ({})", incomplete.0)),
+        Err(error) => return kept(format!("it could not be checked ({error})")),
+    }
+    let synced = std::fs::OpenOptions::new()
+        .write(true)
+        .open(partial)
+        .and_then(|file| file.sync_all());
+    if let Err(error) = synced {
+        return kept(format!("it could not be written to the disk ({error})"));
+    }
+    let mut target = final_path.to_path_buf();
+    // At most two attempts: the chosen name, then a fresh unique one if
+    // another file appeared under it during the recording.
+    for _ in 0..2 {
+        match commit_no_replace(partial, &target) {
+            Ok(()) => return Published::Saved(target),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let (Some(dir), Some(name)) = (target.parent(), target.file_name()) else {
+                    return kept(format!("{} already exists", target.display()));
+                };
+                let name = unique_file_name(&name.to_string_lossy(), |candidate| {
+                    let path = dir.join(candidate);
+                    path.exists() || partial_path(&path).exists()
+                });
+                target = dir.join(name);
+            }
+            Err(error) => {
+                return kept(format!(
+                    "it could not be renamed to {} ({error})",
+                    target.display()
+                ));
+            }
+        }
+    }
+    kept(format!("{} already exists", final_path.display()))
+}
+
 /// Encoded size for a source of `source` pixels and a configured `target`
 /// size: preserves the source aspect ratio (no stretching), never upscales,
 /// and keeps both dimensions even as H.264/NV12 requires.
@@ -685,5 +742,94 @@ mod tests {
         life.begin_start().unwrap();
         life.started();
         assert!(life.is_recording());
+    }
+
+    // ------------------------------------------ manual recording publish --
+
+    fn publish_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "clipuh publish recording {name} ü {}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Smallest structurally complete MP4: ftyp, mdat, moov.
+    fn finished_mp4() -> Vec<u8> {
+        let mut out = Vec::new();
+        for (kind, body) in [(b"ftyp", 8usize), (b"mdat", 64), (b"moov", 32)] {
+            out.extend_from_slice(&((body + 8) as u32).to_be_bytes());
+            out.extend_from_slice(kind);
+            out.resize(out.len() + body, 0);
+        }
+        out
+    }
+
+    #[test]
+    fn finished_recording_is_published_under_its_name() {
+        let dir = publish_dir("ok");
+        let final_path = dir.join("Clipper_2026-11-15_21-30-00.mp4");
+        let partial = partial_path(&final_path);
+        std::fs::write(&partial, finished_mp4()).unwrap();
+        assert_eq!(
+            publish_recording(&partial, &final_path),
+            Published::Saved(final_path.clone())
+        );
+        assert!(!partial.exists());
+        assert_eq!(std::fs::read(&final_path).unwrap(), finished_mp4());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The old commit (`fs::rename`) replaced a file that took the final name
+    /// during the recording (e.g. a library clip renamed to it). Now that file
+    /// is kept and the recording gets the next free name.
+    #[test]
+    fn taken_name_is_never_overwritten() {
+        let dir = publish_dir("taken");
+        let final_path = dir.join("Clipper_2026-11-15_21-30-00.mp4");
+        let partial = partial_path(&final_path);
+        std::fs::write(&partial, finished_mp4()).unwrap();
+        std::fs::write(&final_path, b"renamed library clip").unwrap();
+        let second = dir.join("Clipper_2026-11-15_21-30-00_2.mp4");
+        assert_eq!(
+            publish_recording(&partial, &final_path),
+            Published::Saved(second.clone())
+        );
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"renamed library clip");
+        assert_eq!(std::fs::read(&second).unwrap(), finished_mp4());
+        assert!(!partial.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sink writer that stopped before writing its index (crash, device
+    /// gone) leaves no `moov`: not published, the data is kept for recovery.
+    #[test]
+    fn unfinalized_recording_is_kept_not_published() {
+        let dir = publish_dir("unfinalized");
+        let final_path = dir.join("Clipper_2026-11-15_21-30-00.mp4");
+        let partial = partial_path(&final_path);
+        let data = finished_mp4();
+        std::fs::write(&partial, &data[..data.len() - 40]).unwrap();
+        let Published::Kept { reason } = publish_recording(&partial, &final_path) else {
+            panic!("an unfinalized recording was published");
+        };
+        assert!(reason.starts_with("it was not finalized"), "{reason}");
+        assert!(partial.exists() && !final_path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_partial_is_reported_not_saved() {
+        let dir = publish_dir("missing");
+        let final_path = dir.join("Clipper_x.mp4");
+        let Published::Kept { reason } = publish_recording(&partial_path(&final_path), &final_path)
+        else {
+            panic!("published a file that does not exist");
+        };
+        assert!(reason.starts_with("it could not be checked"), "{reason}");
+        assert!(!final_path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

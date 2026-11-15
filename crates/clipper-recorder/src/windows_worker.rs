@@ -26,9 +26,9 @@ use clipper_replay::export::{ExportJob, ExportPrepare, Exporter, SavedClip};
 use windows::Win32::System::SystemInformation::GetLocalTime;
 
 use crate::logic::{
-    ClipNames, Counters, Lifecycle, StopOutcome, classify_stop, fit_output_size, partial_path,
-    replay_failure_text, replay_file_name, sweep_stale_partials, unique_file_name,
-    validate_replay_options,
+    ClipNames, Counters, Lifecycle, Published, StopOutcome, classify_stop, fit_output_size,
+    partial_path, publish_recording, replay_failure_text, replay_file_name, sweep_stale_partials,
+    unique_file_name, validate_replay_options,
 };
 use crate::recording_audio::{AudioPlan, AudioReporter, AudioTest, RecordingAudio};
 use crate::replay_session::{ReplaySession, WAKE_WAIT};
@@ -861,18 +861,28 @@ impl Worker<'_> {
                         "recording: audio track names not written: {error}"
                     ));
                 }
-                match fs::rename(&partial, &final_path) {
-                    Ok(()) => Ok(()),
-                    Err(error) => {
-                        // The partial file is complete and playable: keep it.
+                match publish_recording(&partial, &final_path) {
+                    Published::Saved(path) => {
+                        if path != final_path {
+                            log(format_args!(
+                                "recording: {} was taken meanwhile; saved as {}",
+                                final_path.display(),
+                                path.display()
+                            ));
+                        }
+                        Ok(path)
+                    }
+                    Published::Kept { reason } => {
+                        // Never deleted: it may be the only copy of the recording.
+                        log(format_args!("recording: not published: {reason}"));
                         self.lifecycle.stopped();
                         self.send(RecorderEvent::RecordingFailed {
-                        message: format!(
-                            "the recording is complete but could not be renamed to {} ({error}); it was kept as {}",
-                            final_path.display(),
-                            partial.display()
-                        ),
-                    });
+                            message: format!(
+                                "the recording could not be saved as {}: {reason}; the file was kept as {}",
+                                final_path.display(),
+                                partial.display()
+                            ),
+                        });
                         return;
                     }
                 }
@@ -881,12 +891,12 @@ impl Worker<'_> {
         };
         self.lifecycle.stopped();
         match outcome {
-            Ok(()) => {
+            Ok(path) => {
                 if let Some(message) = failure {
                     self.error(message);
                 }
                 self.send(RecorderEvent::RecordingFinished {
-                    path: final_path,
+                    path,
                     stats,
                     reason,
                 });
