@@ -9,8 +9,10 @@
  * crates/clipper-storage/src/config.rs (yellow is web-only, no app preset).
  */
 
+/* Swatch colors. ACCENTS[id].tokenVar in store.ts names these. Also on :root
+   so site swatches (More features) read the same values. */
+:root,
 [data-app-window] {
-  /* Swatch colors. ACCENTS[id].tokenVar in store.ts names these. */
   --app-accent-violet: #9b5cf6;
   --app-accent-blue: #3b82f6;
   --app-accent-cyan: #06b6d4;
@@ -18,7 +20,9 @@
   --app-accent-yellow: #eab308;
   --app-accent-orange: #f97316;
   --app-accent-pink: #ec4899;
+}
 
+[data-app-window] {
   /* The window root sets --color-accent inline (var(--app-accent-<id>)).
      Derived tokens must be re-declared here: values derived on :root were
      already resolved against the site accent. */
