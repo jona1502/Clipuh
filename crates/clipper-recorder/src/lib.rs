@@ -97,10 +97,16 @@ pub(crate) fn emit(endpoint: &RecorderEndpoint, event: RecorderEvent) {
     let _ = endpoint.events.send_blocking(event);
 }
 
-/// Diagnostics line on stderr, the app's log sink. Unlike `eprintln!` it never
-/// panics when stderr is closed, so logging cannot take the worker down.
+/// Diagnostics line for the app's log file. The release app has no console,
+/// so stderr would lose it; tools without a logger (examples, tests) still
+/// get it on stderr. Unlike `eprintln!` this never panics when stderr is
+/// closed, so logging cannot take the worker down.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn log(args: std::fmt::Arguments<'_>) {
+    if log::max_level() != log::LevelFilter::Off {
+        log::info!(target: "clipuh::replay", "{args}");
+        return;
+    }
     use std::io::Write;
     let _ = writeln!(std::io::stderr(), "clipuh replay: {args}");
 }
