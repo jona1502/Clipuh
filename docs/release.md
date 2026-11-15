@@ -21,14 +21,14 @@ at the old file; the setting then shows as off and turning it on again rewrites 
 
 ## Cutting a release
 
-1. Set `workspace.package.version` in `Cargo.toml` to the new version (for example `0.1.0`)
+1. Set `workspace.package.version` in `Cargo.toml` to the new version (for example `0.1.1`)
    and merge that change to `main` through a normal PR.
 2. Tag the merged commit on `main` and push the tag:
 
    ```text
    git switch main && git pull --ff-only
-   git tag -a v0.1.0 -m "clipuh v0.1.0"
-   git push origin v0.1.0
+   git tag -a v0.1.1 -m "clipuh v0.1.1"
+   git push origin v0.1.1
    ```
 
 3. The workflow then:
@@ -44,6 +44,10 @@ at the old file; the setting then shows as off and turning it on again rewrites 
 
    Publication is skipped if any earlier job fails. It also fails, without changing
    anything, if a release for the tag already exists.
+
+`v0.1.0` is already taken: a prerelease with a manually attached executable was published
+for it on 2026-11-15, before this workflow existed. Do not move that tag; the first release
+built by this workflow needs a new version.
 
 ### Accepted tags
 
@@ -75,7 +79,7 @@ PRs that touch the release workflow, `ci.yml`, `scripts/release/` or the `clippe
 manifest/build script run the workflow up to the packaged artifact (uploaded to the run for
 14 days), using the version currently in `Cargo.toml`. The publish job never runs for PRs.
 A real end-to-end publication has not been exercised yet; the first test should be a
-prerelease tag (for example `v0.1.0-rc.1` with that version in `Cargo.toml`) that can be
+prerelease tag (for example `v0.1.1-rc.1` with that version in `Cargo.toml`) that can be
 deleted afterwards.
 
 ## Hardware validation
