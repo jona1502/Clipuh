@@ -49,3 +49,16 @@ jobs:
       # Tests that need a GPU, a monitor or audio devices are #[ignore]d;
       # hosted runners have none. Run them locally with `-- --ignored`.
       - run: cargo test --workspace --locked
+
+  licenses:
+    name: Licenses
+    # Platform independent: cargo-about reads Cargo.lock for the Windows target.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Toolchain and components come from rust-toolchain.toml.
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install --locked cargo-about@0.9.3
+      # Fails on unknown or unaccepted licenses and on a stale notices file.
+      - run: scripts/licenses/generate-notices.sh --check
