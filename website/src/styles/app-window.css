@@ -1,0 +1,282 @@
+/*
+ * App tour window (src/components/interactive/app). Everything inside
+ * [data-app-window] reads the normal semantic tokens (bg-surface,
+ * text-text-secondary, ...); this file re-declares them per window theme and
+ * accent so a window can be light or recolored without touching the site.
+ *
+ * Values mirror crates/clipper-ui/src/theme/palette.rs (Base::DARK,
+ * Base::LIGHT, accent derivation) and the accent presets in
+ * crates/clipper-storage/src/config.rs (yellow is web-only, no app preset).
+ */
+
+/* Swatch colors. ACCENTS[id].tokenVar in store.ts names these. Also on :root
+   so site swatches (More features) read the same values. */
+:root,
+[data-app-window] {
+  --app-accent-violet: #9b5cf6;
+  --app-accent-blue: #3b82f6;
+  --app-accent-cyan: #06b6d4;
+  --app-accent-green: #22c55e;
+  --app-accent-yellow: #eab308;
+  --app-accent-orange: #f97316;
+  --app-accent-pink: #ec4899;
+}
+
+[data-app-window] {
+  /* The window root sets --color-accent inline (var(--app-accent-<id>)).
+     Derived tokens must be re-declared here: values derived on :root were
+     already resolved against the site accent. */
+  --color-accent: var(--app-accent-violet);
+  --color-accent-hover: color-mix(in srgb, var(--color-accent), white 12%);
+  --color-accent-subtle: color-mix(
+    in srgb,
+    var(--color-accent) 16%,
+    transparent
+  );
+  --color-focus-ring: color-mix(in srgb, var(--color-accent) 70%, transparent);
+  /* Sidebar color (Base::sidebar). */
+  --app-sidebar: var(--color-background-elevated);
+  --app-surface-active: #2c2d3f;
+  --app-text-disabled: #55556a;
+
+  container: app-window / inline-size;
+  color-scheme: dark;
+  background-color: var(--color-background);
+  color: var(--color-text);
+  font-size: var(--app-text-base);
+  line-height: 1.4;
+
+  /* Fluid type scale for the window: follows the window width so the
+     desktop layout keeps the mockup proportions, never below readable. */
+  --app-text-xs: clamp(0.6875rem, 0.95cqi, 0.8125rem);
+  --app-text-sm: clamp(0.75rem, 1.05cqi, 0.875rem);
+  --app-text-base: clamp(0.8125rem, 1.2cqi, 1rem);
+  --app-text-lg: clamp(0.875rem, 1.35cqi, 1.125rem);
+  --app-text-xl: clamp(1rem, 1.6cqi, 1.375rem);
+  --app-text-2xl: clamp(1.25rem, 2.2cqi, 1.875rem);
+}
+
+/* Base::LIGHT. Applies inside the window only, never to the site. */
+[data-app-window][data-theme="light"] {
+  color-scheme: light;
+  --color-background: #f3f3f6;
+  --color-background-elevated: #ebebf0;
+  --color-surface: #ffffff;
+  --color-surface-raised: #f6f6f9;
+  --color-surface-hover: #ececf2;
+  --color-border: #dcdce4;
+  --color-border-hover: #c6c6d2;
+  --color-text: #16161d;
+  --color-text-secondary: #4f4f60;
+  --color-text-muted: #676779;
+  --color-success: #15803d;
+  --color-warning: #b45309;
+  --color-error: #dc2626;
+  --app-surface-active: #e3e3eb;
+  --app-text-disabled: #a0a0ae;
+  /* Hover moves toward black on light; subtle alpha is 0.12. */
+  --color-accent-hover: color-mix(in srgb, var(--color-accent), black 12%);
+  --color-accent-subtle: color-mix(
+    in srgb,
+    var(--color-accent) 12%,
+    transparent
+  );
+  /* presentable_accent(): swatches below 3:1 on the light surfaces are
+     mixed toward the text color until they reach it. */
+  --app-accent-cyan: #0996af;
+  --app-accent-green: #1f994e;
+  --app-accent-yellow: #aa840e;
+  --app-accent-orange: #e26a17;
+}
+
+/* One block per AccentId (mockup swatch order). accent-foreground is white or
+   #111118, whichever has the higher WCAG contrast (palette.rs
+   foreground_for); every preset here, dark and light, picks ink. */
+[data-app-window][data-accent="violet"] {
+  --color-accent: var(--app-accent-violet);
+  --color-accent-foreground: #111118; /* white 4.00, ink 4.70 */
+}
+[data-app-window][data-accent="blue"] {
+  --color-accent: var(--app-accent-blue);
+  --color-accent-foreground: #111118; /* white 3.68, ink 5.11 */
+}
+[data-app-window][data-accent="cyan"] {
+  --color-accent: var(--app-accent-cyan);
+  --color-accent-foreground: #111118; /* white 2.43, ink 7.74 */
+}
+[data-app-window][data-accent="green"] {
+  --color-accent: var(--app-accent-green);
+  --color-accent-foreground: #111118; /* white 2.28, ink 8.25 */
+}
+[data-app-window][data-accent="yellow"] {
+  --color-accent: var(--app-accent-yellow);
+  --color-accent-foreground: #111118; /* white 1.92, ink 9.80 */
+}
+[data-app-window][data-accent="orange"] {
+  --color-accent: var(--app-accent-orange);
+  --color-accent-foreground: #111118; /* white 2.80, ink 6.71 */
+}
+[data-app-window][data-accent="pink"] {
+  --color-accent: var(--app-accent-pink);
+  --color-accent-foreground: #111118; /* white 3.53, ink 5.33 */
+}
+
+/* Type utilities for pages (font-size only). */
+.app-text-xs {
+  font-size: var(--app-text-xs);
+}
+.app-text-sm {
+  font-size: var(--app-text-sm);
+}
+.app-text-base {
+  font-size: var(--app-text-base);
+}
+.app-text-lg {
+  font-size: var(--app-text-lg);
+}
+.app-text-xl {
+  font-size: var(--app-text-xl);
+  letter-spacing: -0.01em;
+}
+.app-text-2xl {
+  font-size: var(--app-text-2xl);
+  letter-spacing: -0.02em;
+}
+
+/* ---- Layout -------------------------------------------------------------
+   Phone (< 48rem window width): sidebar is a top tab row, content stacks.
+   From 48rem: sidebar column. From 60rem: fixed ~16:9 desktop window like
+   the mockups; the page area scrolls inside if it ever overflows. */
+.app-layout {
+  display: flex;
+  flex-direction: column;
+  min-height: 32rem;
+}
+.app-sidebar {
+  background: var(--app-sidebar);
+  border-bottom: 1px solid var(--color-border);
+}
+.app-main {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 0.75rem;
+  padding: 0.75rem;
+}
+.app-page {
+  position: relative;
+  min-width: 0;
+  min-height: 24rem;
+  flex: 1;
+}
+.app-sidebar-desktop {
+  display: none;
+}
+
+@container app-window (min-width: 48rem) {
+  .app-layout {
+    display: grid;
+    grid-template-columns: clamp(9.5rem, 15%, 15rem) minmax(0, 1fr);
+  }
+  .app-sidebar {
+    border-bottom: 0;
+    border-right: 1px solid var(--color-border);
+  }
+  .app-sidebar-desktop {
+    display: flex;
+  }
+  .app-sidebar-mobile {
+    display: none;
+  }
+  .app-main {
+    padding: 0.5rem 1rem 1rem;
+  }
+}
+
+@container app-window (min-width: 60rem) {
+  .app-layout {
+    aspect-ratio: 1672 / 941;
+    min-height: 0;
+  }
+  .app-main {
+    min-height: 0;
+  }
+  .app-page {
+    min-height: 0;
+    overflow: auto;
+  }
+}
+
+/* Suspense skeleton: fills exactly the page area it stands in for. */
+.app-page-skeleton {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  grid-template-rows: auto 1fr 1fr;
+  gap: 0.75rem;
+}
+.app-page-skeleton > * {
+  border-radius: var(--radius-lg);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+}
+.app-page-skeleton > :first-child {
+  height: 2.5rem;
+  width: 40%;
+}
+
+/* Level meter segments. */
+.app-meter {
+  display: flex;
+  height: 0.75rem;
+  width: 100%;
+  gap: 2px;
+}
+.app-meter > span {
+  flex: 1;
+  border-radius: 1px;
+  background: var(--color-surface-hover);
+}
+.app-meter > span[data-on][data-zone="low"] {
+  background: var(--color-success);
+}
+.app-meter > span[data-on][data-zone="mid"] {
+  background: var(--color-warning);
+}
+.app-meter > span[data-on][data-zone="high"] {
+  background: var(--color-error);
+}
+
+/* Switch (role="switch"), mockup pill. */
+.app-switch {
+  position: relative;
+  display: inline-flex;
+  height: 1.75rem;
+  width: 3.25rem;
+  flex-shrink: 0;
+  align-items: center;
+  border-radius: 999px;
+  border: 1px solid var(--color-border-hover);
+  background: var(--color-surface-hover);
+  cursor: pointer;
+  transition: background-color 150ms var(--ease-out);
+}
+.app-switch::after {
+  content: "";
+  position: absolute;
+  left: 0.1875rem;
+  height: 1.25rem;
+  width: 1.25rem;
+  border-radius: 50%;
+  background: var(--color-text-secondary);
+  transition: transform 150ms var(--ease-out);
+}
+.app-switch[aria-checked="true"] {
+  border-color: transparent;
+  background: var(--color-accent);
+}
+.app-switch[aria-checked="true"]::after {
+  background: white;
+  transform: translateX(1.5rem);
+}

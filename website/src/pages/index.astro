@@ -1,21 +1,19 @@
 ---
 import BaseLayout from "@/layouts/BaseLayout.astro";
 import Hero from "@/components/sections/Hero.astro";
-import FeatureIntro from "@/components/showcase/FeatureIntro.astro";
-import ReplaySection from "@/components/showcase/ReplaySection.astro";
-import MixerSection from "@/components/showcase/MixerSection.astro";
-import EditorSection from "@/components/showcase/EditorSection.astro";
+import TourChapter from "@/components/showcase/TourChapter.astro";
 import PerformanceSection from "@/components/showcase/PerformanceSection.astro";
 import MoreFeatures from "@/components/showcase/MoreFeatures.astro";
 import FinalCta from "@/components/showcase/FinalCta.astro";
+import { tourChapters } from "@/data/features";
 ---
 
 <BaseLayout title="Native game clipping for Windows">
   <Hero />
-  <FeatureIntro />
-  <ReplaySection />
-  <MixerSection />
-  <EditorSection />
+  <TourChapter id="capture" copy={tourChapters.capture} />
+  <TourChapter id="library" copy={tourChapters.library} />
+  <TourChapter id="editor" copy={tourChapters.editor} />
+  <TourChapter id="settings" copy={tourChapters.settings} />
   <PerformanceSection />
   <MoreFeatures />
   <FinalCta />

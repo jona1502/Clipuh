@@ -23,85 +23,16 @@ export interface FeatureCopy {
   title: string;
   description: string;
   status: FeatureStatus;
-  /** Short facts rendered as a list next to the demo. */
+  /** Short facts rendered as cards next to the diagram. */
   points: string[];
 }
 
-/** Section ids. `features` is the first showcase section (header nav target). */
+/** Section ids of the non-chapter homepage sections. */
 export const featureIds = {
-  intro: "features",
-  replay: "instant-replay",
-  mixer: "audio-mixer",
-  editor: "editor",
   performance: "performance",
   more: "more-features",
   cta: "download",
 } as const;
-
-export const intro = {
-  eyebrow: "Features",
-  title: "Everything around the clip, in one native app",
-  description:
-    "clipuh keeps a rolling replay of your game, records audio sources on their own tracks, and lets you trim the result before you share it.",
-} as const;
-
-export const replay: FeatureCopy = {
-  id: featureIds.replay,
-  eyebrow: "Instant replay",
-  title: "Never miss the moment.",
-  description:
-    "Capture the moments that matter with a customizable hotkey and instant replay.",
-  status: "in-development",
-  points: [
-    "Rolling replay of the last 15 seconds to 5 minutes",
-    "Global hotkey saves the clip while you keep playing",
-    "Recent footage stays in RAM, older footage spills to a temporary SSD cache",
-  ],
-};
-
-export const mixer: FeatureCopy = {
-  id: featureIds.mixer,
-  eyebrow: "Audio",
-  title: "Your audio. Your control.",
-  description:
-    "Choose which sources end up in your clip, set their levels, and keep them on separate tracks for later.",
-  status: "in-development",
-  points: [
-    "Desktop audio and microphone with individual gain",
-    "Optional separate tracks next to the mixed track",
-    "Per-application sources like game and Discord are planned",
-  ],
-};
-
-/**
- * Mixer demo sources. `status` controls the "Planned" tag in the demo:
- * desktop + microphone exist in the app; game and Discord isolation do not
- * (they are part of desktop audio today).
- */
-export const mixerSources = [
-  { id: "game", label: "Game audio", status: "planned" },
-  { id: "discord", label: "Discord", status: "planned" },
-  { id: "desktop", label: "Desktop audio", status: "in-development" },
-  { id: "microphone", label: "Microphone", status: "in-development" },
-] as const satisfies ReadonlyArray<{
-  id: string;
-  label: string;
-  status: FeatureStatus;
-}>;
-
-export const editor: FeatureCopy = {
-  id: featureIds.editor,
-  eyebrow: "Editor",
-  title: "Make every clip yours.",
-  description:
-    "Trim a clip to the part that matters and export it as a new file. The original stays untouched.",
-  status: "in-development",
-  points: [
-    "Set in and out points on a preview timeline",
-    "Export copies the streams to a new file without re-encoding",
-    "A multi-track timeline with per-track mute is planned",
-  ],
-};
 
 export const performance: FeatureCopy = {
   id: featureIds.performance,
@@ -111,8 +42,8 @@ export const performance: FeatureCopy = {
     "clipuh is designed to stay out of the way: native code, encoding on the GPU and bounded memory for the replay buffer. These are design goals, not benchmark claims.",
   status: "in-development",
   points: [
-    "Native Rust application with a GPUI interface, no browser engine in the capture path",
-    "H.264 encoded on the GPU through NVENC, AMF or Quick Sync, with no software fallback",
+    "Native Rust application, no browser engine in the capture path",
+    "H.264 encoded on the GPU's hardware encoder, with no software fallback",
     "Replay buffer holds encoded frames only, within a configurable RAM budget",
     "Clips are saved by copying encoded data, not by re-encoding",
   ],
@@ -174,3 +105,108 @@ export const finalCta = {
   description:
     "There is no public build yet. Windows builds will be published here when they are ready.",
 } as const;
+
+/** App tour chapters: one homepage section per app page. */
+export type TourChapterId = "capture" | "library" | "editor" | "settings";
+
+export interface ChapterCopy {
+  /** Section id; equals the app page shown in the chapter window. */
+  id: TourChapterId;
+  eyebrow: string;
+  title: string;
+  description: string;
+  status: FeatureStatus;
+  /** Short feature blocks under the window. */
+  points: { title: string; body: string }[];
+}
+
+export const tourChapters: Record<TourChapterId, ChapterCopy> = {
+  capture: {
+    id: "capture",
+    eyebrow: "Capture",
+    title: "Never miss the moment.",
+    description:
+      "Pick a source, set the quality once, and let the replay buffer run in the background. One hotkey saves what just happened.",
+    status: "in-development",
+    points: [
+      {
+        title: "Instant replay",
+        body: "Keep the last 15 seconds to 5 minutes, ready to save.",
+      },
+      {
+        title: "Size estimate",
+        body: "See roughly how large a clip gets before you record it.",
+      },
+      {
+        title: "Audio mixer",
+        body: "Game, desktop and microphone, each with its own level.",
+      },
+    ],
+  },
+  library: {
+    id: "library",
+    eyebrow: "Library",
+    title: "Every clip, right where you left it.",
+    description:
+      "Saved clips land in one library. Search, sort and favorite them, or select a few and clean up in one go.",
+    status: "in-development",
+    points: [
+      {
+        title: "Tabs and search",
+        body: "Favorites, game clips and recordings, filtered as you type.",
+      },
+      {
+        title: "Bulk actions",
+        body: "Select several clips to delete, favorite or open them.",
+      },
+      {
+        title: "Grid or list",
+        body: "Browse by thumbnail or scan a compact list.",
+      },
+    ],
+  },
+  editor: {
+    id: "editor",
+    eyebrow: "Editor",
+    title: "Cut straight to the play.",
+    description:
+      "Trim a clip to the part that matters and export it as a new file. The original stays untouched.",
+    status: "in-development",
+    points: [
+      {
+        title: "Precise trim",
+        body: "Drag the handles or type exact start and end times.",
+      },
+      {
+        title: "Separate audio tracks",
+        body: "Game, desktop and microphone on their own lanes.",
+      },
+      {
+        title: "Export",
+        body: "Writes a new MP4 with the cut and the enabled audio.",
+      },
+    ],
+  },
+  settings: {
+    id: "settings",
+    eyebrow: "Settings",
+    title: "Set it up once. Then just play.",
+    description:
+      "Video, audio, replay, hotkeys, storage and appearance live on one page. Theme and accent apply as you pick them.",
+    status: "in-development",
+    points: [
+      {
+        title: "Quality presets",
+        body: "Resolution, frame rate, encoder and bitrate.",
+      },
+      {
+        title: "Your hotkeys",
+        body: "Record your own shortcut for saving a clip.",
+      },
+      {
+        title: "Your look",
+        body: "Dark, light or system theme with accent colors.",
+      },
+    ],
+  },
+};

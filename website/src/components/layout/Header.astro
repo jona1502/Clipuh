@@ -2,7 +2,7 @@
 import Button from "@/components/ui/Button.astro";
 import Container from "@/components/ui/Container.astro";
 import Logo from "./Logo.astro";
-import { site } from "@/data/site";
+import { site, type NavLink } from "@/data/site";
 import { withBase } from "@/lib/url";
 
 /*
@@ -14,7 +14,7 @@ import { withBase } from "@/lib/url";
  */
 const ctaHref = "#download";
 const ctaLabel = site.nav.find((l) => l.href === ctaHref)?.label ?? "Download";
-const links = site.nav.filter((l) => l.href !== ctaHref);
+const links: NavLink[] = site.nav.filter((l) => l.href !== ctaHref);
 const linkClass =
   "text-small text-text-secondary hover:text-text aria-[current=location]:text-text inline-flex min-h-11 items-center rounded-md px-3 font-medium transition-colors duration-150";
 const mobileLinkClass =
@@ -27,7 +27,7 @@ const badgeClass =
 
 <header
   data-site-header
-  class="bg-background-elevated border-border sticky top-0 z-40 border-b"
+  class="header-bar border-glass-border sticky top-0 z-40 border-b"
 >
   <Container class="flex h-(--spacing-header) items-center justify-between">
     <Logo href={withBase("#top")} />
@@ -95,6 +95,16 @@ const badgeClass =
 </header>
 
 <style>
+  /* Translucent bar over the canvas; opaque fallback without backdrop-filter. */
+  .header-bar {
+    background: var(--color-background-elevated);
+  }
+  @supports (backdrop-filter: blur(1px)) {
+    .header-bar {
+      background: color-mix(in srgb, var(--color-canvas) 72%, transparent);
+      backdrop-filter: blur(var(--blur-glass)) saturate(140%);
+    }
+  }
   /* Without JS: no toggle, panel is a static block of links under the bar. */
   .menu-button {
     display: none;
@@ -209,23 +219,25 @@ const badgeClass =
     const spans = a.dataset.navSpans?.split(" ").filter(Boolean) ?? [];
     groups.set(id, [id, ...spans]);
   }
-  const targets = new Map<string, HTMLElement>();
-  for (const ids of groups.values()) {
-    for (const id of ids) {
-      const el = document.getElementById(id);
-      if (el) targets.set(id, el);
-    }
-  }
+  // Every homepage section is observed, not only the linked ones: when the
+  // active band shows a section without a nav link (Performance, More
+  // features), no link is highlighted.
+  const sectionsInOrder = Array.from(
+    document.querySelectorAll<HTMLElement>("main > section[id]"),
+  );
+  const groupOf = (sectionId: string) => {
+    for (const [id, ids] of groups) if (ids.includes(sectionId)) return id;
+    return null;
+  };
 
-  if (targets.size && "IntersectionObserver" in window) {
+  if (sectionsInOrder.length && "IntersectionObserver" in window) {
     const visible = new Set<string>();
-    const order = [...groups.keys()];
     const apply = () => {
-      // Last link (in order) with a visible section wins, so the final section
-      // (Download) can become active while the one above is still in the band.
-      const active = order.findLast((id) =>
-        groups.get(id)?.some((s) => visible.has(s)),
-      );
+      // Last section (in page order) inside the band wins, so the final
+      // section (Download) can become active while the one above is still in
+      // the band. A section without a link clears the highlight.
+      const last = sectionsInOrder.findLast((el) => visible.has(el.id));
+      const active = last ? groupOf(last.id) : null;
       for (const a of links) {
         if (active && hashOf(a) === active)
           a.setAttribute("aria-current", "location");
@@ -243,6 +255,6 @@ const badgeClass =
       // Band across the upper-middle of the viewport, below the sticky header.
       { rootMargin: "-80px 0px -55% 0px" },
     );
-    targets.forEach((el) => io.observe(el));
+    sectionsInOrder.forEach((el) => io.observe(el));
   }
 </script>

@@ -1,0 +1,81 @@
+---
+import Container from "@/components/ui/Container.astro";
+import DemoFrame from "@/components/feature/DemoFrame.astro";
+import StatusBadge from "@/components/feature/StatusBadge.astro";
+import AppTour from "@/components/interactive/app/AppTour";
+import type { ChapterCopy, TourChapterId } from "@/data/features";
+
+interface Props {
+  id: TourChapterId;
+  copy: ChapterCopy;
+}
+
+const { id, copy } = Astro.props;
+---
+
+<section
+  id={id}
+  aria-labelledby={`${id}-title`}
+  class="py-section relative isolate overflow-x-clip"
+>
+  <Container>
+    <div class="reveal mx-auto flex max-w-3xl flex-col items-center gap-5 text-center">
+      <div class="flex flex-wrap items-center justify-center gap-3">
+        <p class="text-caption text-accent-hover font-semibold tracking-widest uppercase">
+          {copy.eyebrow}
+        </p>
+        <StatusBadge status={copy.status} />
+      </div>
+      <h2 id={`${id}-title`} class="text-chapter text-gradient pb-1">
+        {copy.title}
+      </h2>
+      <p class="text-lead text-text-secondary max-w-2xl">{copy.description}</p>
+    </div>
+
+    <div class="relative mt-10 md:mt-16">
+      <!-- Soft accent glow behind the glass backdrop, CSS only. -->
+      <div
+        class="chapter-glow pointer-events-none absolute -inset-x-4 -inset-y-10 -z-10 md:-inset-x-12"
+        aria-hidden="true"
+      ></div>
+      <div class="glass-panel rounded-2xl p-1.5 sm:p-2.5 md:rounded-3xl md:p-4">
+        <DemoFrame
+          label="Interactive demo · sample data"
+          minHeight="32rem"
+          class="chapter-frame"
+        >
+          <AppTour client:visible initialPage={id} />
+        </DemoFrame>
+      </div>
+    </div>
+
+    <ul
+      data-chapter-points
+      class="mt-10 grid gap-x-8 gap-y-6 sm:grid-cols-3 md:mt-14"
+    >
+      {copy.points.map((point) => (
+        <li class="reveal border-glass-border flex flex-col gap-1.5 border-t pt-4">
+          <h3 class="text-body text-text font-semibold tracking-tight">
+            {point.title}
+          </h3>
+          <p class="text-small text-text-secondary">{point.body}</p>
+        </li>
+      ))}
+    </ul>
+  </Container>
+</section>
+
+<style>
+  .chapter-glow {
+    background: radial-gradient(
+      55% 50% at 50% 50%,
+      var(--color-glow-soft),
+      transparent 72%
+    );
+    filter: blur(40px);
+  }
+  :global(.chapter-frame) {
+    border-color: var(--color-glass-border);
+    box-shadow: var(--shadow-float);
+  }
+</style>

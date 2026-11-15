@@ -1,5 +1,6 @@
 @import "tailwindcss";
 @import "./tokens.css";
+@import "./app-window.css";
 
 /* Self-hosted Inter (OFL-1.1), latin subset, variable weight. Vite bundles
    and hashes the woff2; BaseLayout preloads the same file. */
@@ -31,7 +32,7 @@
 @layer base {
   html {
     color-scheme: dark;
-    background-color: var(--color-background);
+    background-color: var(--color-canvas);
     color: var(--color-text);
     font-family: var(--font-sans);
     -webkit-font-smoothing: antialiased;
@@ -104,8 +105,8 @@
   }
 }
 
-/* ===== W2 demo + reveal =====================================================
-   Shared by feature sections and React demo islands (use via className). */
+/* ===== Reveal + slider ======================================================
+   .reveal for homepage sections; .demo-slider for the app's Slider. */
 
 /* Scroll reveal: CSS only, opacity + transform. Without animation-timeline
    support, or under prefers-reduced-motion, content is simply visible. */
@@ -130,39 +131,6 @@
     opacity: 1;
     transform: none;
   }
-}
-
-/* Toggle button (use with aria-pressed). 44px hit area. */
-.demo-toggle {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 0.5rem;
-  min-height: 2.75rem;
-  min-width: 2.75rem;
-  padding: 0 1rem;
-  border-radius: var(--radius-md);
-  border: 1px solid var(--color-border-hover);
-  background: var(--color-surface-raised);
-  color: var(--color-text);
-  font-size: var(--text-small);
-  font-weight: 500;
-  cursor: pointer;
-  transition:
-    background-color 150ms var(--ease-out),
-    border-color 150ms var(--ease-out);
-}
-.demo-toggle:hover {
-  background: var(--color-surface-hover);
-}
-.demo-toggle[aria-pressed="true"] {
-  background: var(--color-accent-subtle);
-  border-color: var(--color-accent);
-  color: var(--color-text);
-}
-.demo-toggle:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
 }
 
 /* Native range input, accent styled. Element height 2.75rem is the touch
@@ -218,18 +186,37 @@
   opacity: 0.5;
   cursor: not-allowed;
 }
-/* Replay buffer sheen: one bounded sweep per run, only while a save is in
-   progress (the element is mounted only then). No infinite animation. */
-@keyframes replay-sheen {
-  from {
-    transform: translateX(-100%);
+/* ===== end Reveal + slider ================================================= */
+
+/* ===== Tour: glass + glow ===================================================
+   Shared by the homepage sections. Tokens: --color-glass*, --color-glow*,
+   --shadow-glass, --blur-glass (tokens.css). In the components layer, so
+   utilities (rounded-*, hover:border-*) still override. */
+
+@layer components {
+  /* Glass panel: translucent surface tinted with the accent, blurred backdrop,
+     1px light top edge. Content stays readable without backdrop-filter. */
+  .glass-panel {
+    background:
+      linear-gradient(180deg, var(--color-glass-tint), transparent 60%),
+      var(--color-glass);
+    border: 1px solid var(--color-glass-border);
+    box-shadow: var(--shadow-glass);
+    -webkit-backdrop-filter: blur(var(--blur-glass));
+    backdrop-filter: blur(var(--blur-glass));
   }
-  to {
-    transform: translateX(100%);
+
+  /* Headline gradient: text to text-secondary, top to bottom. */
+  .text-gradient {
+    background: linear-gradient(
+      180deg,
+      var(--color-text) 30%,
+      var(--color-text-secondary)
+    );
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
   }
-}
-.replay-sheen {
-  animation: replay-sheen 0.5s linear 2;
 }
 
-/* ===== end W2 demo + reveal ================================================ */
+/* ===== end Tour: glass + glow ============================================== */

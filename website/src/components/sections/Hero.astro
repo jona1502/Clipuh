@@ -1,27 +1,47 @@
 ---
 import Button from "@/components/ui/Button.astro";
 import Container from "@/components/ui/Container.astro";
-import AppPreview from "@/components/sections/AppPreview.astro";
+import DemoFrame from "@/components/feature/DemoFrame.astro";
+import AppTour from "@/components/interactive/app/AppTour";
 import { sections, site } from "@/data/site";
 
 const { download } = site;
 const directUrl = download.available ? download.url : null;
 const downloadHref = directUrl ?? `#${sections.download}`;
+
+/*
+ * Hero window: the Library page, as an island on client:idle (the Capture
+ * chapter follows right below). The server render is visible immediately
+ * (no layout shift) and the headline stays the LCP element. The window is a
+ * preview: it sits in an `inert` wrapper, so it takes no focus or clicks and
+ * keyboard users go from the CTAs straight to the Capture chapter. The demo
+ * label stays outside the inert part. A server-only render is not an option:
+ * the lazy page would stay a skeleton.
+ */
 ---
 
 <section
   id={sections.hero}
   class="pb-section relative isolate overflow-hidden pt-16 md:pt-24"
 >
-  <!-- Restrained accent glow + faint grid, CSS only -->
   <div
     class="hero-bg pointer-events-none absolute inset-0 -z-10"
     aria-hidden="true"
   ></div>
 
   <Container>
-    <div class="mx-auto flex max-w-3xl flex-col items-center text-center">
-      <h1 class="text-display">{site.tagline}</h1>
+    <div class="mx-auto flex max-w-4xl flex-col items-center text-center">
+      <a
+        href={`#${sections.download}`}
+        class="glass-panel text-caption text-text-secondary hover:text-text inline-flex min-h-9 items-center gap-2 rounded-full px-3.5 font-semibold transition-colors"
+      >
+        <span
+          class="bg-warning size-1.5 rounded-full"
+          aria-hidden="true"
+        ></span>
+        In development · {download.platform}
+      </a>
+      <h1 class="text-display text-gradient mt-6 pb-1">{site.tagline}</h1>
       <p class="text-lead text-text-secondary mt-5 max-w-2xl">
         Instantly save your favorite gaming moments, manage your audio sources,
         and turn clips into highlights, without leaving your game.
@@ -35,14 +55,28 @@ const downloadHref = directUrl ?? `#${sections.download}`;
             </span>
           )}
         </Button>
-        <Button href={`#${sections.features}`} variant="secondary" size="lg">
-          Explore {site.name}
+        <Button href={`#${sections.tour}`} variant="secondary" size="lg">
+          Take the tour
         </Button>
       </div>
     </div>
 
-    <div class="hero-in mx-auto mt-14 max-w-5xl md:mt-20">
-      <AppPreview eager />
+    <div class="hero-in relative mx-auto mt-14 max-w-6xl md:mt-20">
+      <div
+        class="hero-glow pointer-events-none absolute -inset-x-6 -top-16 bottom-1/3 -z-10 md:-inset-x-16"
+        aria-hidden="true"
+      ></div>
+      <div class="hero-window">
+        <DemoFrame
+          label="Interactive demo · sample data"
+          minHeight="32rem"
+          class="hero-frame"
+        >
+          <div inert class="hero-preview">
+            <AppTour client:idle initialPage="library" windowLabel="Preview" />
+          </div>
+        </DemoFrame>
+      </div>
     </div>
   </Container>
 </section>
@@ -51,13 +85,13 @@ const downloadHref = directUrl ?? `#${sections.download}`;
   .hero-bg {
     background:
       radial-gradient(
-        60rem 28rem at 50% -8%,
-        color-mix(in srgb, var(--color-accent) 22%, transparent),
+        64rem 30rem at 50% -10%,
+        var(--color-glow),
         transparent 70%
       ),
       radial-gradient(
-        40rem 24rem at 85% 30%,
-        color-mix(in srgb, var(--color-accent) 8%, transparent),
+        40rem 24rem at 90% 40%,
+        var(--color-glow-soft),
         transparent 70%
       );
   }
@@ -69,23 +103,57 @@ const downloadHref = directUrl ?? `#${sections.download}`;
       linear-gradient(var(--color-border) 1px, transparent 1px),
       linear-gradient(90deg, var(--color-border) 1px, transparent 1px);
     background-size: 64px 64px;
-    opacity: 0.25;
+    opacity: 0.22;
     mask-image: radial-gradient(
-      ellipse 70% 60% at 50% 0%,
+      ellipse 70% 55% at 50% 0%,
       #000,
       transparent 75%
     );
   }
+  /* Accent light behind the window. */
+  .hero-glow {
+    background: radial-gradient(
+      50% 60% at 50% 40%,
+      var(--color-glow),
+      transparent 75%
+    );
+    filter: blur(56px);
+  }
+  .hero-window :global(.hero-frame) {
+    background: var(--color-glass);
+    border-color: var(--color-glass-border);
+    box-shadow:
+      inset 0 1px 0 var(--color-glass-highlight),
+      var(--shadow-float);
+  }
+  /* Phones: the stacked window is tall, so the hero shows its top part
+     and fades out; the full windows follow in the chapters. overflow: clip
+     (not hidden) is no scroll container, so nothing can scroll it. */
+  @media (max-width: 767px) {
+    .hero-window {
+      max-height: 34rem;
+      overflow: clip;
+      mask-image: linear-gradient(180deg, #000 70%, transparent);
+    }
+  }
+  /* From md: a faint reflection under the floating window (WebKit/Blink;
+     other engines show only the shadow). */
+  @media (min-width: 768px) {
+    .hero-window {
+      -webkit-box-reflect: below 14px
+        linear-gradient(transparent 80%, rgb(0 0 0 / 0.22));
+    }
+  }
   @media (prefers-reduced-motion: no-preference) {
-    /* Preview only: the headline block is never hidden, so LCP is not delayed. */
+    /* Window only: the headline is never hidden, so LCP is not delayed. */
     .hero-in {
-      animation: hero-in 600ms var(--ease-out) 100ms both;
+      animation: hero-in 700ms var(--ease-out) 120ms both;
     }
   }
   @keyframes hero-in {
     from {
       opacity: 0;
-      transform: translateY(12px);
+      transform: translateY(24px);
     }
   }
 </style>
