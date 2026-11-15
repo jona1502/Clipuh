@@ -197,3 +197,30 @@ for (const width of [375, 1440]) {
     await context.close();
   });
 }
+
+test("header highlight follows the chapters and clears past them", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await page.goto("/");
+  const nav = page.getByRole("navigation", { name: "Primary", exact: true });
+  const scrollTo = (id: string) =>
+    page.evaluate((id) => {
+      const el = document.getElementById(id)!;
+      window.scrollTo(0, el.getBoundingClientRect().top + scrollY - 90);
+    }, id);
+
+  await scrollTo("settings");
+  await expect(
+    nav.getByRole("link", { name: "Settings", exact: true }),
+  ).toHaveAttribute("aria-current", "location");
+
+  await scrollTo("performance");
+  await expect(nav.locator("[aria-current]")).toHaveCount(0);
+
+  await scrollTo("library");
+  await expect(
+    nav.getByRole("link", { name: "Library", exact: true }),
+  ).toHaveAttribute("aria-current", "location");
+});

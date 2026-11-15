@@ -219,23 +219,25 @@ const badgeClass =
     const spans = a.dataset.navSpans?.split(" ").filter(Boolean) ?? [];
     groups.set(id, [id, ...spans]);
   }
-  const targets = new Map<string, HTMLElement>();
-  for (const ids of groups.values()) {
-    for (const id of ids) {
-      const el = document.getElementById(id);
-      if (el) targets.set(id, el);
-    }
-  }
+  // Every homepage section is observed, not only the linked ones: when the
+  // active band shows a section without a nav link (Performance, More
+  // features), no link is highlighted.
+  const sectionsInOrder = Array.from(
+    document.querySelectorAll<HTMLElement>("main > section[id]"),
+  );
+  const groupOf = (sectionId: string) => {
+    for (const [id, ids] of groups) if (ids.includes(sectionId)) return id;
+    return null;
+  };
 
-  if (targets.size && "IntersectionObserver" in window) {
+  if (sectionsInOrder.length && "IntersectionObserver" in window) {
     const visible = new Set<string>();
-    const order = [...groups.keys()];
     const apply = () => {
-      // Last link (in order) with a visible section wins, so the final section
-      // (Download) can become active while the one above is still in the band.
-      const active = order.findLast((id) =>
-        groups.get(id)?.some((s) => visible.has(s)),
-      );
+      // Last section (in page order) inside the band wins, so the final
+      // section (Download) can become active while the one above is still in
+      // the band. A section without a link clears the highlight.
+      const last = sectionsInOrder.findLast((el) => visible.has(el.id));
+      const active = last ? groupOf(last.id) : null;
       for (const a of links) {
         if (active && hashOf(a) === active)
           a.setAttribute("aria-current", "location");
@@ -253,6 +255,6 @@ const badgeClass =
       // Band across the upper-middle of the viewport, below the sticky header.
       { rootMargin: "-80px 0px -55% 0px" },
     );
-    targets.forEach((el) => io.observe(el));
+    sectionsInOrder.forEach((el) => io.observe(el));
   }
 </script>
