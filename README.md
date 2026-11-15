@@ -221,7 +221,7 @@ After changing dependencies, regenerate the third-party notices (see
 [docs/licensing.md](docs/licensing.md)):
 
 ```text
-cargo install --locked cargo-about@0.9.3
+cargo install --locked --features cli cargo-about@0.9.3
 scripts/licenses/generate-notices.sh
 ```
 

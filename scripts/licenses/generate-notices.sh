@@ -18,7 +18,7 @@ cd "$root"
 installed="$(cargo-about --version 2>/dev/null | awk '{print $2}')" || true
 if [[ "$installed" != "$CARGO_ABOUT_VERSION" ]]; then
   echo "error: cargo-about $CARGO_ABOUT_VERSION is required (found: ${installed:-none})" >&2
-  echo "       cargo install --locked cargo-about@$CARGO_ABOUT_VERSION" >&2
+  echo "       cargo install --locked --features cli cargo-about@$CARGO_ABOUT_VERSION" >&2
   exit 1
 fi
 

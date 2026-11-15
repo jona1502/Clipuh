@@ -47,7 +47,7 @@ license text (including the copyright notices shipped in each crate). It is gene
   on the lockfile, the configuration and the template.
 
 ```text
-cargo install --locked cargo-about@0.9.3
+cargo install --locked --features cli cargo-about@0.9.3
 scripts/licenses/generate-notices.sh          # after changing dependencies
 scripts/licenses/generate-notices.sh --check  # what CI runs
 ```
