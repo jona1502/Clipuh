@@ -85,12 +85,6 @@ const url = download.available ? download.url : null;
         </svg>
       </div>
 
-      {!url && (
-        <p class="text-caption text-text-secondary border-glass-border bg-surface/60 relative mt-2 inline-flex items-center gap-2 rounded-full border px-3 py-1 font-semibold">
-          <span class="bg-warning size-1.5 rounded-full" aria-hidden="true" />
-          {download.platform} · {download.statusLabel}
-        </p>
-      )}
       <h2
         id={`${featureIds.cta}-title`}
         class="text-chapter text-gradient relative mx-auto mt-5 max-w-3xl pb-1"
