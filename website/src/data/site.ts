@@ -1,3 +1,5 @@
+import { featureIds, tourChapters } from "./features";
+
 /**
  * Site-wide content and metadata. Single source for name, copy, navigation
  * and download availability; components read from here instead of
@@ -8,8 +10,8 @@
 export const sections = {
   hero: "top",
   /** The app tour starts with the Capture chapter. */
-  tour: "capture",
-  download: "download",
+  tour: tourChapters.capture.id,
+  download: featureIds.cta,
 } as const;
 
 export interface NavLink {
@@ -32,12 +34,12 @@ export const site = {
    * on the page. Never add a link whose target does not exist.
    */
   nav: [
-    { label: "Capture", href: "#capture" },
-    { label: "Library", href: "#library" },
-    { label: "Editor", href: "#editor" },
-    { label: "Settings", href: "#settings" },
+    ...Object.values(tourChapters).map((c) => ({
+      label: c.eyebrow,
+      href: `#${c.id}`,
+    })),
     { label: "Download", href: `#${sections.download}` },
-  ] as NavLink[],
+  ] satisfies NavLink[],
 
   /**
    * Download availability. No public release exists yet: `url` stays null

@@ -2,7 +2,7 @@
 import Button from "@/components/ui/Button.astro";
 import Container from "@/components/ui/Container.astro";
 import Logo from "./Logo.astro";
-import { site } from "@/data/site";
+import { site, type NavLink } from "@/data/site";
 import { withBase } from "@/lib/url";
 
 /*
@@ -14,7 +14,7 @@ import { withBase } from "@/lib/url";
  */
 const ctaHref = "#download";
 const ctaLabel = site.nav.find((l) => l.href === ctaHref)?.label ?? "Download";
-const links = site.nav.filter((l) => l.href !== ctaHref);
+const links: NavLink[] = site.nav.filter((l) => l.href !== ctaHref);
 const linkClass =
   "text-small text-text-secondary hover:text-text aria-[current=location]:text-text inline-flex min-h-11 items-center rounded-md px-3 font-medium transition-colors duration-150";
 const mobileLinkClass =
