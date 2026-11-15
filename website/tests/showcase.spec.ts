@@ -120,7 +120,7 @@ for (const width of widths) {
     await separate.click();
     await expect(separate).toHaveAttribute("aria-pressed", "false");
 
-    const editor = page.locator("#editor");
+    const editor = page.locator("#clip-editor");
     await editor.scrollIntoViewIfNeeded();
     await expect(editor.locator("astro-island")).not.toHaveAttribute("ssr");
     for (const source of [
@@ -278,7 +278,7 @@ test("reduced motion keeps replay and editor functional", async ({ page }) => {
   await expect(replay.getByRole("status")).toHaveText(
     "Clip saved, last 1 minute. Demo clip 1.",
   );
-  const editor = page.locator("#editor");
+  const editor = page.locator("#clip-editor");
   await editor.scrollIntoViewIfNeeded();
   await editor
     .getByRole("button", { name: "Jump to trim end", exact: true })

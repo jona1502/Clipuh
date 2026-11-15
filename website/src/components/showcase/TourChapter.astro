@@ -1,0 +1,79 @@
+---
+import Container from "@/components/ui/Container.astro";
+import DemoFrame from "@/components/feature/DemoFrame.astro";
+import StatusBadge from "@/components/feature/StatusBadge.astro";
+import AppTour from "@/components/interactive/app/AppTour";
+import type { ChapterCopy, TourChapterId } from "@/data/features";
+
+interface Props {
+  id: TourChapterId;
+  copy: ChapterCopy;
+}
+
+const { id, copy } = Astro.props;
+---
+
+<section
+  id={id}
+  aria-labelledby={`${id}-title`}
+  class="border-border/60 py-section relative isolate border-t"
+>
+  <Container>
+    <div class="reveal mx-auto flex max-w-3xl flex-col items-center gap-4 text-center">
+      <div class="flex flex-wrap items-center justify-center gap-3">
+        <p class="text-caption text-accent font-semibold tracking-widest uppercase">
+          {copy.eyebrow}
+        </p>
+        <StatusBadge status={copy.status} />
+      </div>
+      <h2
+        id={`${id}-title`}
+        class="from-text to-text-secondary bg-linear-to-b bg-clip-text text-transparent"
+      >
+        {copy.title}
+      </h2>
+      <p class="text-lead text-text-secondary max-w-2xl">{copy.description}</p>
+    </div>
+
+    <div class="relative mt-10 md:mt-14">
+      <!-- Soft accent glow behind the window, CSS only. -->
+      <div
+        class="tour-glow pointer-events-none absolute inset-x-8 -inset-y-6 -z-10"
+        aria-hidden="true"
+      ></div>
+      <DemoFrame
+        label="Interactive demo · sample data"
+        minHeight="32rem"
+        class="tour-frame"
+      >
+        <AppTour client:visible initialPage={id} />
+      </DemoFrame>
+    </div>
+
+    <ul class="mt-10 grid gap-6 sm:grid-cols-3 md:mt-12">
+      {copy.points.map((point) => (
+        <li class="reveal flex flex-col gap-1.5">
+          <h3 class="text-body text-text font-semibold">{point.title}</h3>
+          <p class="text-small text-text-secondary">{point.body}</p>
+        </li>
+      ))}
+    </ul>
+  </Container>
+</section>
+
+<style>
+  .tour-glow {
+    background: radial-gradient(
+      60% 55% at 50% 45%,
+      var(--color-accent-subtle),
+      transparent 70%
+    );
+    filter: blur(32px);
+  }
+  :global(.tour-frame) {
+    /* Glass: 1px light top edge and inner highlight over the frame. */
+    box-shadow:
+      inset 0 1px 0 color-mix(in srgb, var(--color-text) 8%, transparent),
+      var(--shadow-lg);
+  }
+</style>
