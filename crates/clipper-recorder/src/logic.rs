@@ -5,7 +5,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clipper_core::recording::{RecordingStats, ReplayOptions, ReplayStatus, ReplayTier};
 use clipper_core::{Command, Core, CoreError, Event, State};
@@ -139,6 +139,294 @@ pub fn replay_failure_text(message: &str) -> String {
             first.to_lowercase().chain(chars).collect()
         }
         _ => trimmed.to_owned(),
+    }
+}
+
+// ------------------------------------------------- failures and recovery --
+
+/// What failed, as far as recovery is concerned (see
+/// `docs/quality/capture-encoder-recovery.md`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailureKind {
+    /// The captured window or monitor is gone: needs the user (never switch
+    /// to another source on their behalf).
+    SourceLost,
+    /// The D3D11 device was removed or reset (driver update/crash, TDR, GPU
+    /// unplugged). Every GPU resource of the session is invalid; a new session
+    /// on a new device may work once the driver is back.
+    DeviceLost,
+    /// The hardware encoder failed or stopped producing output.
+    EncoderFailure,
+    /// Unsupported hardware, format or settings: retrying cannot help.
+    Configuration,
+    /// Anything else (audio device lost, buffer error, clock gap): no retry.
+    Other,
+}
+
+// HRESULTs (as u32) with a known meaning for recovery.
+const DXGI_ERROR_DEVICE_REMOVED: u32 = 0x887A_0005;
+const DXGI_ERROR_DEVICE_HUNG: u32 = 0x887A_0006;
+const DXGI_ERROR_DEVICE_RESET: u32 = 0x887A_0007;
+const DXGI_ERROR_DRIVER_INTERNAL_ERROR: u32 = 0x887A_0020;
+const D3DDDIERR_DEVICEREMOVED: u32 = 0x8876_0870;
+const DXGI_ERROR_UNSUPPORTED: u32 = 0x887A_0004;
+const RO_E_CLOSED: u32 = 0x8000_0013;
+const HRESULT_INVALID_WINDOW_HANDLE: u32 = 0x8007_0578;
+const E_NOTIMPL: u32 = 0x8000_4001;
+const MF_E_INVALIDMEDIATYPE: u32 = 0xC00D_36B4;
+const MF_E_UNSUPPORTED_D3D_TYPE: u32 = 0xC00D_6D76;
+
+/// Classifies an HRESULT; `None` when the code alone does not say (the
+/// caller then uses the failing component's default).
+pub fn classify_hresult(code: u32) -> Option<FailureKind> {
+    match code {
+        DXGI_ERROR_DEVICE_REMOVED
+        | DXGI_ERROR_DEVICE_HUNG
+        | DXGI_ERROR_DEVICE_RESET
+        | DXGI_ERROR_DRIVER_INTERNAL_ERROR
+        | D3DDDIERR_DEVICEREMOVED => Some(FailureKind::DeviceLost),
+        RO_E_CLOSED | HRESULT_INVALID_WINDOW_HANDLE => Some(FailureKind::SourceLost),
+        DXGI_ERROR_UNSUPPORTED | E_NOTIMPL | MF_E_INVALIDMEDIATYPE | MF_E_UNSUPPORTED_D3D_TYPE => {
+            Some(FailureKind::Configuration)
+        }
+        _ => None,
+    }
+}
+
+/// A classified runtime failure: `detail` is the technical text for the log,
+/// [`Failure::message`] the sentence fragment for the UI.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Failure {
+    pub kind: FailureKind,
+    pub detail: String,
+    pub code: Option<u32>,
+}
+
+impl Failure {
+    pub fn new(kind: FailureKind, detail: impl Into<String>) -> Self {
+        Self {
+            kind,
+            detail: replay_failure_text(&detail.into()),
+            code: None,
+        }
+    }
+
+    /// From a Windows error of a component whose failures default to
+    /// `default` when the code is not specific.
+    pub fn from_code(default: FailureKind, code: u32, detail: impl Into<String>) -> Self {
+        Self {
+            code: Some(code),
+            ..Self::new(classify_hresult(code).unwrap_or(default), detail)
+        }
+    }
+
+    /// Lowercase fragment for "Replay stopped: ...". GPU and encoder failures
+    /// get an explanation instead of a raw HRESULT text.
+    pub fn message(&self) -> String {
+        let code = self
+            .code
+            .map(|code| format!(" (0x{code:08X})"))
+            .unwrap_or_default();
+        match self.kind {
+            FailureKind::DeviceLost => {
+                format!("the GPU device was lost (graphics driver reset or GPU removed){code}")
+            }
+            FailureKind::EncoderFailure => format!("the hardware video encoder failed{code}"),
+            _ => self.detail.clone(),
+        }
+    }
+}
+
+/// Waits before automatic restart attempts: one per attempt.
+const RECOVERY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(10),
+];
+
+/// A restarted session must run this long before a new failure starts a
+/// fresh budget; earlier failures count against the same one (no flapping).
+pub const RECOVERY_STABLE_AFTER: Duration = Duration::from_secs(60);
+
+/// Automatic restarts allowed per failure kind. Only failures that a new
+/// session on a new device can fix are retried; the restart uses the user's
+/// original source and settings, never another source.
+pub fn max_recovery_attempts(kind: FailureKind) -> usize {
+    match kind {
+        FailureKind::DeviceLost => RECOVERY_DELAYS.len(),
+        FailureKind::EncoderFailure => 1,
+        FailureKind::SourceLost | FailureKind::Configuration | FailureKind::Other => 0,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryDecision {
+    /// Restart attempt `attempt` of `of` is scheduled after `delay`.
+    Retry {
+        attempt: usize,
+        of: usize,
+        delay: Duration,
+    },
+    /// No (further) automatic restart: the user has to start again.
+    GiveUp,
+    /// A duplicate or stale report, or recovery is shut down: nothing changes.
+    Ignored,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RecoveryState {
+    #[default]
+    Idle,
+    Waiting {
+        due: Instant,
+    },
+    Attempting,
+}
+
+/// Bounded automatic restart of the replay session, driven by the recorder
+/// worker (single thread): at most one pending or running attempt, explicit
+/// cancellation by user commands and shutdown, and a generation number that
+/// makes reports about an older attempt harmless.
+#[derive(Debug, Default)]
+pub struct Recovery {
+    state: RecoveryState,
+    generation: u64,
+    attempts: usize,
+    recovered_at: Option<Instant>,
+    shut_down: bool,
+}
+
+impl Recovery {
+    /// A running session failed.
+    pub fn on_failure(&mut self, kind: FailureKind, now: Instant) -> RecoveryDecision {
+        if self.shut_down || self.state != RecoveryState::Idle {
+            return RecoveryDecision::Ignored;
+        }
+        // A failure soon after an automatic restart continues that budget.
+        let flapping = self
+            .recovered_at
+            .is_some_and(|at| now.duration_since(at) < RECOVERY_STABLE_AFTER);
+        if !flapping {
+            self.attempts = 0;
+        }
+        self.schedule(kind, now)
+    }
+
+    fn schedule(&mut self, kind: FailureKind, now: Instant) -> RecoveryDecision {
+        let of = max_recovery_attempts(kind);
+        if self.attempts >= of {
+            self.state = RecoveryState::Idle;
+            self.attempts = 0;
+            self.recovered_at = None;
+            return RecoveryDecision::GiveUp;
+        }
+        let delay = RECOVERY_DELAYS[self.attempts.min(RECOVERY_DELAYS.len() - 1)];
+        self.attempts += 1;
+        self.generation += 1;
+        self.state = RecoveryState::Waiting { due: now + delay };
+        RecoveryDecision::Retry {
+            attempt: self.attempts,
+            of,
+            delay,
+        }
+    }
+
+    /// When the worker must wake up for the pending attempt.
+    pub fn next_due(&self) -> Option<Instant> {
+        match self.state {
+            RecoveryState::Waiting { due } => Some(due),
+            _ => None,
+        }
+    }
+
+    pub fn is_pending(&self) -> bool {
+        self.state != RecoveryState::Idle
+    }
+
+    /// Starts the pending attempt if it is due; returns its generation.
+    pub fn take_due(&mut self, now: Instant) -> Option<u64> {
+        match self.state {
+            RecoveryState::Waiting { due } if now >= due => {
+                self.state = RecoveryState::Attempting;
+                Some(self.generation)
+            }
+            _ => None,
+        }
+    }
+
+    /// The attempt `generation` started a new session. `false` for a stale
+    /// report (the attempt was cancelled meanwhile): the caller must not keep
+    /// the session.
+    pub fn attempt_succeeded(&mut self, generation: u64, now: Instant) -> bool {
+        if self.shut_down
+            || generation != self.generation
+            || self.state != RecoveryState::Attempting
+        {
+            return false;
+        }
+        self.state = RecoveryState::Idle;
+        self.recovered_at = Some(now);
+        true
+    }
+
+    /// The attempt `generation` could not start a session.
+    pub fn attempt_failed(
+        &mut self,
+        generation: u64,
+        kind: FailureKind,
+        now: Instant,
+    ) -> RecoveryDecision {
+        if self.shut_down
+            || generation != self.generation
+            || self.state != RecoveryState::Attempting
+        {
+            return RecoveryDecision::Ignored;
+        }
+        self.state = RecoveryState::Idle;
+        self.schedule(kind, now)
+    }
+
+    /// The user took over (stop, new start, recording): drop any pending or
+    /// running attempt. Idempotent.
+    pub fn cancel(&mut self) {
+        self.state = RecoveryState::Idle;
+        self.generation += 1;
+        self.attempts = 0;
+        self.recovered_at = None;
+    }
+
+    /// Application shutdown: no attempt ever again. Idempotent.
+    pub fn shutdown(&mut self) {
+        self.cancel();
+        self.shut_down = true;
+    }
+}
+
+/// The encoder must answer submitted video with output within this time.
+pub const ENCODER_STALL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Detects a hardware encoder that silently stops producing output (without
+/// an error), which would otherwise leave the replay "running" with a buffer
+/// that no longer grows. Event driven: two `Option` updates per service step.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OutputWatchdog {
+    waiting_since: Option<Instant>,
+}
+
+impl OutputWatchdog {
+    /// Video is due from the encoder (frames were submitted or are waiting).
+    pub fn expect_output(&mut self, now: Instant) {
+        self.waiting_since.get_or_insert(now);
+    }
+
+    /// The encoder produced video output.
+    pub fn output(&mut self) {
+        self.waiting_since = None;
+    }
+
+    pub fn stalled(&self, now: Instant) -> bool {
+        self.waiting_since
+            .is_some_and(|since| now.duration_since(since) >= ENCODER_STALL_TIMEOUT)
     }
 }
 
@@ -685,5 +973,303 @@ mod tests {
         life.begin_start().unwrap();
         life.started();
         assert!(life.is_recording());
+    }
+
+    // ------------------------------------------------- failures and recovery --
+
+    fn secs(value: u64) -> Duration {
+        Duration::from_secs(value)
+    }
+
+    /// Runs one due attempt at `now`; returns its generation.
+    fn attempt(recovery: &mut Recovery, now: Instant) -> u64 {
+        let due = recovery.next_due().expect("an attempt must be pending");
+        assert!(now >= due, "attempt run before it was due");
+        recovery.take_due(now).expect("due attempt")
+    }
+
+    #[test]
+    fn hresults_are_classified_by_meaning_not_by_failure() {
+        use FailureKind::*;
+        for code in [
+            0x887A_0005,
+            0x887A_0006,
+            0x887A_0007,
+            0x887A_0020,
+            0x8876_0870,
+        ] {
+            assert_eq!(classify_hresult(code), Some(DeviceLost), "{code:#X}");
+        }
+        assert_eq!(classify_hresult(0x8000_0013), Some(SourceLost));
+        assert_eq!(classify_hresult(0x8007_0578), Some(SourceLost));
+        assert_eq!(classify_hresult(0xC00D_36B4), Some(Configuration));
+        // E_FAIL and E_OUTOFMEMORY say nothing about the cause.
+        assert_eq!(classify_hresult(0x8000_4005), None);
+        assert_eq!(classify_hresult(0x8007_000E), None);
+        let lost = Failure::from_code(
+            EncoderFailure,
+            0x887A_0005,
+            "Encoder failed: device removed",
+        );
+        assert_eq!(lost.kind, DeviceLost);
+        assert_eq!(
+            lost.message(),
+            "the GPU device was lost (graphics driver reset or GPU removed) (0x887A0005)"
+        );
+        assert_eq!(lost.detail, "encoder failed: device removed");
+        let generic = Failure::from_code(EncoderFailure, 0x8000_4005, "encoder failed: E_FAIL");
+        assert_eq!(generic.kind, EncoderFailure);
+        assert_eq!(
+            generic.message(),
+            "the hardware video encoder failed (0x80004005)"
+        );
+        let closed = Failure::new(SourceLost, "The capture source was closed.");
+        assert_eq!(closed.message(), "the capture source was closed");
+    }
+
+    /// TEST A + G: a recoverable failure schedules exactly one restart; once it
+    /// succeeds recovery is idle again.
+    #[test]
+    fn device_loss_is_restarted_once_after_a_delay() {
+        let t0 = Instant::now();
+        let mut recovery = Recovery::default();
+        assert!(!recovery.is_pending());
+        let decision = recovery.on_failure(FailureKind::DeviceLost, t0);
+        assert_eq!(
+            decision,
+            RecoveryDecision::Retry {
+                attempt: 1,
+                of: 3,
+                delay: secs(2)
+            }
+        );
+        assert_eq!(
+            recovery.take_due(t0 + secs(1)),
+            None,
+            "not before the delay"
+        );
+        let generation = attempt(&mut recovery, t0 + secs(2));
+        assert_eq!(
+            recovery.next_due(),
+            None,
+            "no second attempt while one runs"
+        );
+        assert!(recovery.attempt_succeeded(generation, t0 + secs(3)));
+        assert!(!recovery.is_pending());
+    }
+
+    /// TEST B + D: source loss and configuration errors are never retried.
+    #[test]
+    fn source_loss_and_configuration_errors_need_the_user() {
+        let t0 = Instant::now();
+        for kind in [
+            FailureKind::SourceLost,
+            FailureKind::Configuration,
+            FailureKind::Other,
+        ] {
+            let mut recovery = Recovery::default();
+            assert_eq!(
+                recovery.on_failure(kind, t0),
+                RecoveryDecision::GiveUp,
+                "{kind:?}"
+            );
+            assert!(!recovery.is_pending());
+        }
+    }
+
+    /// TEST C: a restart after device loss whose new device cannot be created
+    /// yet (driver still resetting) is retried with growing delays, and the
+    /// source vanishing meanwhile ends recovery at once.
+    #[test]
+    fn device_loss_backs_off_and_stops_when_the_source_is_gone() {
+        let t0 = Instant::now();
+        let mut recovery = Recovery::default();
+        recovery.on_failure(FailureKind::DeviceLost, t0);
+        let generation = attempt(&mut recovery, t0 + secs(2));
+        assert_eq!(
+            recovery.attempt_failed(generation, FailureKind::DeviceLost, t0 + secs(2)),
+            RecoveryDecision::Retry {
+                attempt: 2,
+                of: 3,
+                delay: secs(5)
+            }
+        );
+        let generation = attempt(&mut recovery, t0 + secs(7));
+        assert_eq!(
+            recovery.attempt_failed(generation, FailureKind::SourceLost, t0 + secs(7)),
+            RecoveryDecision::GiveUp
+        );
+        assert!(!recovery.is_pending());
+    }
+
+    /// TEST H: repeated failures end in GiveUp after the bounded attempts.
+    #[test]
+    fn retries_are_bounded() {
+        let t0 = Instant::now();
+        let mut recovery = Recovery::default();
+        let mut now = t0;
+        let mut decision = recovery.on_failure(FailureKind::DeviceLost, now);
+        let mut attempts = 0;
+        while let RecoveryDecision::Retry { delay, .. } = decision {
+            attempts += 1;
+            now += delay;
+            let generation = attempt(&mut recovery, now);
+            decision = recovery.attempt_failed(generation, FailureKind::DeviceLost, now);
+        }
+        assert_eq!(decision, RecoveryDecision::GiveUp);
+        assert_eq!(attempts, 3);
+        assert_eq!(now - t0, secs(2 + 5 + 10));
+        // Encoder failures get a single restart.
+        let mut recovery = Recovery::default();
+        recovery.on_failure(FailureKind::EncoderFailure, t0);
+        let generation = attempt(&mut recovery, t0 + secs(2));
+        assert_eq!(
+            recovery.attempt_failed(generation, FailureKind::EncoderFailure, t0 + secs(2)),
+            RecoveryDecision::GiveUp
+        );
+    }
+
+    /// A restarted session that fails again before it ran stably counts
+    /// against the same budget: no endless restart loop.
+    #[test]
+    fn flapping_sessions_cannot_restart_forever() {
+        let t0 = Instant::now();
+        let mut recovery = Recovery::default();
+        let mut now = t0;
+        let mut restarts = 0;
+        loop {
+            match recovery.on_failure(FailureKind::DeviceLost, now) {
+                RecoveryDecision::Retry { delay, .. } => {
+                    now += delay;
+                    let generation = attempt(&mut recovery, now);
+                    assert!(recovery.attempt_succeeded(generation, now));
+                    restarts += 1;
+                    now += secs(10); // fails again 10 s after each restart
+                }
+                RecoveryDecision::GiveUp => break,
+                RecoveryDecision::Ignored => panic!("unexpected"),
+            }
+            assert!(restarts <= 3);
+        }
+        assert_eq!(restarts, 3);
+        // A session that ran stably gets a fresh budget.
+        let mut recovery = Recovery::default();
+        recovery.on_failure(FailureKind::DeviceLost, t0);
+        let generation = attempt(&mut recovery, t0 + secs(2));
+        recovery.attempt_succeeded(generation, t0 + secs(2));
+        assert!(matches!(
+            recovery.on_failure(
+                FailureKind::DeviceLost,
+                t0 + secs(2) + RECOVERY_STABLE_AFTER
+            ),
+            RecoveryDecision::Retry { attempt: 1, .. }
+        ));
+    }
+
+    /// TEST I + Q + R: a user stop cancels the pending attempt; cancel is
+    /// idempotent; a later explicit start and failure start a fresh budget.
+    #[test]
+    fn user_stop_cancels_and_a_new_start_is_clean() {
+        let t0 = Instant::now();
+        let mut recovery = Recovery::default();
+        recovery.on_failure(FailureKind::DeviceLost, t0);
+        recovery.cancel();
+        recovery.cancel();
+        assert_eq!(
+            recovery.take_due(t0 + secs(60)),
+            None,
+            "cancelled attempt ran"
+        );
+        assert!(!recovery.is_pending());
+        assert!(matches!(
+            recovery.on_failure(FailureKind::DeviceLost, t0 + secs(61)),
+            RecoveryDecision::Retry { attempt: 1, .. }
+        ));
+    }
+
+    /// TEST I (running attempt) + L: an attempt cancelled while it ran reports
+    /// back stale; its session must not be kept, and a newer attempt's
+    /// generation is not confused with it.
+    #[test]
+    fn stale_attempt_reports_are_ignored() {
+        let t0 = Instant::now();
+        let mut recovery = Recovery::default();
+        recovery.on_failure(FailureKind::DeviceLost, t0);
+        let old = attempt(&mut recovery, t0 + secs(2));
+        recovery.cancel();
+        assert!(
+            !recovery.attempt_succeeded(old, t0 + secs(3)),
+            "stale success kept"
+        );
+        assert_eq!(
+            recovery.attempt_failed(old, FailureKind::DeviceLost, t0 + secs(3)),
+            RecoveryDecision::Ignored
+        );
+        recovery.on_failure(FailureKind::DeviceLost, t0 + secs(4));
+        let new = attempt(&mut recovery, t0 + secs(6));
+        assert_ne!(old, new);
+        assert!(!recovery.attempt_succeeded(old, t0 + secs(6)));
+        assert!(recovery.attempt_succeeded(new, t0 + secs(6)));
+    }
+
+    /// TEST J + R: after shutdown nothing is ever scheduled or kept.
+    #[test]
+    fn shutdown_ends_recovery_for_good() {
+        let t0 = Instant::now();
+        let mut recovery = Recovery::default();
+        recovery.on_failure(FailureKind::DeviceLost, t0);
+        let generation = attempt(&mut recovery, t0 + secs(2));
+        recovery.shutdown();
+        recovery.shutdown();
+        assert!(!recovery.attempt_succeeded(generation, t0 + secs(3)));
+        assert_eq!(
+            recovery.on_failure(FailureKind::DeviceLost, t0 + secs(4)),
+            RecoveryDecision::Ignored
+        );
+        assert_eq!(recovery.next_due(), None);
+    }
+
+    /// TEST K: the same failure reported twice (pump error and source-closed
+    /// signal in one step) schedules one restart only.
+    #[test]
+    fn duplicate_failures_start_one_recovery() {
+        let t0 = Instant::now();
+        let mut recovery = Recovery::default();
+        assert!(matches!(
+            recovery.on_failure(FailureKind::DeviceLost, t0),
+            RecoveryDecision::Retry { attempt: 1, .. }
+        ));
+        assert_eq!(
+            recovery.on_failure(FailureKind::DeviceLost, t0),
+            RecoveryDecision::Ignored
+        );
+        assert_eq!(
+            recovery.on_failure(FailureKind::EncoderFailure, t0 + secs(1)),
+            RecoveryDecision::Ignored
+        );
+        assert_eq!(recovery.next_due(), Some(t0 + secs(2)));
+    }
+
+    /// TEST E: an encoder that stops answering is detected after the timeout;
+    /// normal latency and a quiet (not yet started) encoder are not.
+    #[test]
+    fn watchdog_detects_a_silent_encoder() {
+        let t0 = Instant::now();
+        let mut watchdog = OutputWatchdog::default();
+        assert!(!watchdog.stalled(t0 + secs(3600)), "nothing expected yet");
+        for step in 0..1000u32 {
+            let now = t0 + Duration::from_millis(u64::from(step) * 16);
+            watchdog.expect_output(now);
+            if step % 3 == 2 {
+                watchdog.output(); // ~50 ms encoder latency
+            }
+            assert!(!watchdog.stalled(now));
+        }
+        let quiet = t0 + secs(20);
+        watchdog.output();
+        watchdog.expect_output(quiet);
+        watchdog.expect_output(quiet + secs(4));
+        assert!(!watchdog.stalled(quiet + secs(4)));
+        assert!(watchdog.stalled(quiet + ENCODER_STALL_TIMEOUT));
     }
 }
