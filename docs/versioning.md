@@ -28,13 +28,13 @@ the website and is not the app version.
 Git tags are the version with a `v` prefix: `v0.1.0`, `v0.2.0-rc.1`. A release tag must point
 at a commit on `main` whose `Cargo.toml` has exactly that version.
 
-The first public version is **0.1.0** (tag `v0.1.0`). `Cargo.toml` already declares it.
+`Cargo.toml` declares **0.1.0**, which has been published as a prerelease (see below).
 
 ## Preparing a release
 
 1. **Version:** confirm `workspace.package.version` is the version to release, or bump it
    through a normal PR.
-2. **Blockers:** the release checklist items for the release are done. For 0.1.0 these include
+2. **Blockers:** the release checklist items for the release are done. For the first workflow-built release these include
    the project license decision and asset provenance ([licensing.md](licensing.md)), shipping
    `THIRD_PARTY_NOTICES.md` with the binary, and the release workflow itself.
 3. **Checks:** CI is green on `main`, and the hardware tests passed on a real Windows machine:
@@ -49,25 +49,24 @@ The first public version is **0.1.0** (tag `v0.1.0`). `Cargo.toml` already decla
    ```text
    git switch main
    git pull --ff-only
-   git tag -a v0.1.0 -m "clipuh v0.1.0"
+   git tag -a v0.1.1 -m "clipuh v0.1.1"
    ```
 
-7. **Push** only that tag: `git push origin v0.1.0`. Pushing the tag is what starts the
+7. **Push** only that tag: `git push origin v0.1.1`. Pushing the tag is what starts the
    release workflow; merging PRs never releases.
 8. **Watch** the release workflow run: tag/version validation, checks, Windows build,
    publication.
 9. **Check the artifacts** on the GitHub Release: download the ZIP, verify the SHA-256,
    unzip and start `clipuh.exe` on a clean machine, check the version shown in the sidebar.
 
-### Existing `v0.1.0` tag
+### The existing 0.1.0 prerelease
 
-A lightweight `v0.1.0` tag already exists on `origin`. It points at `a7c45d9` (PR #53) and was
-created before the release workflow and this changelog existed. Check on GitHub whether a
-Release is attached to it. Tag pushes are what trigger releases, so before releasing 0.1.0
-the owner has to decide deliberately between:
+`v0.1.0` is a lightweight tag on `a7c45d9` (PR #53). A GitHub prerelease "clipuh v0.1.0" was
+published for it on 2026-11-15 with a manually attached `clipuh-v0.1.0-windows-x64.exe`, before
+the automated release workflow and this changelog existed.
 
-- deleting the existing tag (`git push origin :refs/tags/v0.1.0`, plus locally
-  `git tag -d v0.1.0`) and recreating it on the final release commit with the steps above, or
-- leaving it and releasing the first public build under a new version (for example `0.1.1`).
-
-Never move or recreate a tag after a release was published from it.
+Because a release was published from it, do not move or recreate the `v0.1.0` tag. The next
+release, including the first one built by the automated workflow, needs a new version: bump
+`workspace.package.version` (for example to `0.1.1` or `0.2.0`) through a normal PR, then
+follow the steps above. Replacing the existing prerelease instead (deleting both the release
+and the tag) is possible but is a deliberate decision for the repository owner.

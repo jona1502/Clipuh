@@ -8,8 +8,11 @@ process: [docs/versioning.md](docs/versioning.md).
 
 ## [Unreleased]
 
-No version has been released yet. Everything below is planned to ship as **0.1.0**, the first
-release; this section becomes `## [0.1.0] - <date>` when it is published.
+## [0.1.0] - 2026-11-15
+
+First prerelease: a GitHub prerelease in the private repository for tag `v0.1.0` (`a7c45d9`),
+with a manually attached `clipuh-v0.1.0-windows-x64.exe`, published before the automated
+release workflow existed.
 
 ### Added
 
@@ -51,4 +54,5 @@ release; this section becomes `## [0.1.0] - <date>` when it is published.
 - Opening files and folders no longer blocks the UI. (#48)
 - Timeline scrolling, audio track order and the initial window size. (#52)
 
-[Unreleased]: https://github.com/jona1502/Clipuh/commits/main
+[Unreleased]: https://github.com/jona1502/Clipuh/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/jona1502/Clipuh/releases/tag/v0.1.0
