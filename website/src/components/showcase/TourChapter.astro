@@ -1,7 +1,6 @@
 ---
 import Container from "@/components/ui/Container.astro";
 import DemoFrame from "@/components/feature/DemoFrame.astro";
-import StatusBadge from "@/components/feature/StatusBadge.astro";
 import AppTour from "@/components/interactive/app/AppTour";
 import type { ChapterCopy, TourChapterId } from "@/data/features";
 
@@ -20,14 +19,6 @@ const { id, copy } = Astro.props;
 >
   <Container>
     <div class="reveal mx-auto flex max-w-3xl flex-col items-center gap-5 text-center">
-      {id !== "capture" && id !== "settings" && id !== "library" && (
-        <div class="flex flex-wrap items-center justify-center gap-3">
-          <p class="text-caption text-accent-hover font-semibold tracking-widest uppercase">
-            {copy.eyebrow}
-          </p>
-          <StatusBadge status={copy.status} />
-        </div>
-      )}
       <h2 id={`${id}-title`} class="text-chapter text-gradient pb-1">
         {copy.title}
       </h2>
