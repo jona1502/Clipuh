@@ -104,7 +104,9 @@ pub(crate) fn emit(endpoint: &RecorderEndpoint, event: RecorderEvent) {
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn log(args: std::fmt::Arguments<'_>) {
     if log::max_level() != log::LevelFilter::Off {
-        log::info!(target: "clipuh::replay", "{args}");
+        // Default target (`clipper_recorder`): the app's logger only passes
+        // `clipper*` targets.
+        log::info!("{args}");
         return;
     }
     use std::io::Write;
