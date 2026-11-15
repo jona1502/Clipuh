@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useId, useRef, useState } from "react";
 import {
   dispatch,
   useApp,
@@ -74,6 +74,7 @@ export default function SettingsPage({ windowRef }: PageProps) {
   const capture = useApp((s) => s.capture);
   const s = useApp((st) => st.settings);
   const rootRef = useRef<HTMLDivElement>(null);
+  const clipLocationId = useId();
   const [current, setCurrent] = useState("video");
   const [recording, setRecording] = useState<string | null>(null);
   const setS = (patch: Partial<SettingsState>) =>
@@ -311,12 +312,12 @@ export default function SettingsPage({ windowRef }: PageProps) {
           >
             <Row
               label="Clip Location"
-              htmlFor="settings-clip-location"
+              htmlFor={clipLocationId}
               plannedId="settings.clipLocation"
             >
               <span className="relative flex min-w-0 flex-[1_1_9rem] items-center">
                 <input
-                  id="settings-clip-location"
+                  id={clipLocationId}
                   type="text"
                   value={s.clipLocation}
                   onChange={(e) => setS({ clipLocation: e.target.value })}

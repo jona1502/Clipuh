@@ -1,3 +1,4 @@
+import { useId } from "react";
 import {
   ACCENTS,
   dispatch,
@@ -50,6 +51,9 @@ function LivePreview() {
 
 export function AppearanceCard() {
   const { theme, accent } = useApp((s) => s.settings);
+  const uid = useId();
+  const themeLabel = `${uid}-theme-label`;
+  const accentLabel = `${uid}-accent-label`;
   const set = (patch: Partial<SettingsState>) =>
     dispatch({ type: "settings/set", patch });
 
@@ -64,7 +68,7 @@ export function AppearanceCard() {
         <div className="flex min-w-0 flex-1 flex-col gap-3">
           <div data-element="settings.theme" className="flex flex-col gap-2">
             <span
-              id="settings-theme-label"
+              id={themeLabel}
               className="app-text-base flex items-center gap-1.5 text-text"
             >
               Theme
@@ -72,7 +76,7 @@ export function AppearanceCard() {
             </span>
             <div
               role="radiogroup"
-              aria-labelledby="settings-theme-label"
+              aria-labelledby={themeLabel}
               className="flex flex-wrap gap-2"
             >
               {THEMES.map((t) => (
@@ -92,7 +96,7 @@ export function AppearanceCard() {
           </div>
           <div data-element="settings.accent" className="flex flex-col gap-2">
             <span
-              id="settings-accent-label"
+              id={accentLabel}
               className="app-text-base flex items-center gap-1.5 text-text"
             >
               Accent Color
@@ -100,7 +104,7 @@ export function AppearanceCard() {
             </span>
             <div
               role="radiogroup"
-              aria-labelledby="settings-accent-label"
+              aria-labelledby={accentLabel}
               className="flex flex-wrap gap-2"
             >
               {(Object.keys(ACCENTS) as AccentId[]).map((id) => (

@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { useId, type ReactNode } from "react";
 import type { ElementId } from "@/data/appStatus";
 import { Icon, type IconName } from "../../ui/Icon";
 import { PlannedBadge } from "../../ui/PlannedBadge";
@@ -19,10 +19,11 @@ export function Card({
   children: ReactNode;
   className?: string;
 }) {
+  const titleId = useId();
   return (
     <section
       data-settings-panel={id}
-      aria-labelledby={`settings-${id}-title`}
+      aria-labelledby={titleId}
       className={`flex min-w-0 flex-col gap-3 rounded-xl border border-border bg-surface p-4${className ? ` ${className}` : ""}`}
     >
       <header className="flex items-center gap-3">
@@ -31,7 +32,7 @@ export function Card({
         </span>
         <div className="min-w-0">
           <h4
-            id={`settings-${id}-title`}
+            id={titleId}
             className="app-text-lg leading-tight font-semibold text-text"
           >
             {title}
