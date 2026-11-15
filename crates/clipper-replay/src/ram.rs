@@ -65,6 +65,16 @@ impl RamTier {
                 packet.track, self.track_count
             )));
         }
+        // The packet contract (`packet.rs`): presentation times are never
+        // negative and durations positive. Accepting one such packet would
+        // make every clip containing it unexportable for the whole replay
+        // window, so it is rejected here (the recorder counts and drops it).
+        if packet.pts < 0 || packet.duration <= 0 {
+            return Err(ReplayError::Invalid(format!(
+                "packet on track {} with pts {} and duration {}",
+                packet.track, packet.pts, packet.duration
+            )));
+        }
         if packet.is_video()
             && let Some(last) = self.last_video_dts
             && packet.dts <= last
