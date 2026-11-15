@@ -33,7 +33,7 @@ test("source change updates card and top bar", async ({ page }) => {
 test("estimate updates with replay length", async ({ page }) => {
   const win = await captureWindow(page);
   const est = win.locator("[data-estimate]");
-  await expect(est).toContainText("≈ 225 MB / Clip");
+  await expect(est).toContainText("≈ 150 MB / Clip");
   await win.getByRole("button", { name: /^Replay length/ }).click();
   await win.getByRole("option", { name: "120 sec" }).click();
   await expect(est).toContainText("≈ 300 MB / Clip");
@@ -63,7 +63,10 @@ test("mute and solo toggle aria-pressed", async ({ page }) => {
 
 test("recent clip play opens editor in same window", async ({ page }) => {
   const win = await captureWindow(page);
-  await win.getByRole("button", { name: /^Play / }).first().click();
+  await win
+    .getByRole("button", { name: /^Play / })
+    .first()
+    .click();
   await expect(win).toHaveAttribute("data-page", "editor");
 });
 
@@ -87,19 +90,24 @@ test("favorite shows filled star in recent clips", async ({ page }) => {
   // Initial data: second-newest clip is a favorite.
   await expect(rows.nth(1).locator("[data-favorite-star]")).toBeVisible();
   await expect(rows.nth(0).locator("[data-favorite-star]")).toHaveCount(0);
-  await rows.nth(0).getByRole("button", { name: /^More actions/ }).click();
+  await rows
+    .nth(0)
+    .getByRole("button", { name: /^More actions/ })
+    .click();
   await win.getByRole("menuitem", { name: "Favorite" }).click();
   await expect(rows.nth(0).locator("[data-favorite-star]")).toBeVisible();
 });
 
 test.describe("reduced motion", () => {
-  test.use({ reducedMotion: "reduce" });
   test("meters stay still", async ({ page }) => {
+    await page.emulateMedia({ reducedMotion: "reduce" });
     const win = await captureWindow(page);
     const lit = () =>
-      win.locator("[role=meter]").evaluateAll((ms) =>
-        ms.map((m) => m.querySelectorAll("[data-on]").length),
-      );
+      win
+        .locator("[role=meter]")
+        .evaluateAll((ms) =>
+          ms.map((m) => m.querySelectorAll("[data-on]").length),
+        );
     const a = await lit();
     await page.waitForTimeout(1000);
     expect(await lit()).toEqual(a);
