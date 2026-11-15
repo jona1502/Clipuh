@@ -51,6 +51,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     use clipper_diagnostics::log;
+    use clipper_platform::windows::single_instance::{self, Instance};
+
+    // One clipuh per user session: a second start (autostart plus a manual
+    // launch) would run a second replay, tray icon and hotkey. It hands over
+    // to the running instance before touching the log file or settings.
+    // Debug builds use their own name so a dev build runs next to the app.
+    let instance_name = if cfg!(debug_assertions) {
+        "clipuh-debug"
+    } else {
+        "clipuh"
+    };
+    let instance = single_instance::acquire(instance_name);
+    if let Ok(Instance::AlreadyRunning(activator)) = &instance {
+        if let Err(error) = activator.activate() {
+            eprintln!("clipuh is already running and could not be activated: {error}");
+        }
+        return Ok(());
+    }
 
     // File logging first, at the default level, so a broken settings file is
     // logged too. A logging failure never prevents startup.
@@ -67,6 +85,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         env!("CARGO_PKG_VERSION"),
         std::process::id()
     );
+    // Without the lock clipuh still starts: refusing to run would be worse
+    // than a possible second instance.
+    let instance_lock = match instance {
+        Ok(Instance::Primary(lock)) => Some(lock),
+        Ok(Instance::AlreadyRunning(_)) => None,
+        Err(error) => {
+            log::warn!("single-instance lock unavailable: {error}");
+            None
+        }
+    };
 
     // Previous startup policy, superseded to preserve explicit audio device selection:
     // A broken or outdated settings file must not prevent startup. The file is
@@ -184,6 +212,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     log::info!("clipuh shut down");
     clipper_diagnostics::shutdown();
+    // Released last: a new start may begin only once this one is gone.
+    drop(instance_lock);
 
     if !window_opened.get() {
         return Err(std::io::Error::other("GPUI could not open the main window").into());
