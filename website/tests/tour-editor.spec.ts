@@ -46,12 +46,16 @@ test("play/pause: space toggles playback and the time advances", async ({
   const before = parseClock((await time.textContent()) ?? "");
   await win.locator("[data-editor-preview]").click();
   await page.keyboard.press("Space");
-  await expect(win.getByRole("button", { name: "Pause" })).toBeVisible();
+  await expect(
+    win.getByRole("button", { name: "Pause", exact: true }),
+  ).toBeVisible();
   await expect
     .poll(async () => parseClock((await time.textContent()) ?? ""))
     .toBeGreaterThan(before);
   await page.keyboard.press("Space");
-  await expect(win.getByRole("button", { name: "Play" })).toBeVisible();
+  await expect(
+    win.getByRole("button", { name: "Play", exact: true }),
+  ).toBeVisible();
 });
 
 test("play/pause: reduced motion never auto-advances, skip still works", async ({
