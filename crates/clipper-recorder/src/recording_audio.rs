@@ -593,6 +593,12 @@ impl RecordingAudio {
             + self.mixer.late_frames()
     }
 
+    /// Mixer re-anchors of all sources (device clock drift against QPC or a
+    /// timestamp discontinuity), for the session diagnostics.
+    pub fn resync_stats(&self) -> clipper_audio::mixer::ResyncStats {
+        self.mixer.resync_stats()
+    }
+
     /// Reads and throws away pending audio (no video yet, nothing to align
     /// it to) so the capture rings never back up. Reports source failure.
     pub fn discard(&mut self) -> Result<(), String> {

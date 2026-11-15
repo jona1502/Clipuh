@@ -61,6 +61,13 @@ pub struct ReplayDiagnostics {
     pub audio_glitch_frames: u64,
     /// Packets the buffer rejected (timestamps not increasing).
     pub invalid_packets: u64,
+    /// Video slots filled with a repeat of the previous frame (static scene,
+    /// dropped or late capture frames).
+    pub repeated_frames: u64,
+    /// Audio packets re-anchored to their QPC time by the mixer (drift or
+    /// discontinuity) and the largest such correction in 48 kHz frames.
+    pub audio_resyncs: u64,
+    pub audio_max_resync_frames: u64,
 }
 
 pub struct ReplaySession {
@@ -252,11 +259,18 @@ impl ReplaySession {
     }
 
     pub fn diagnostics(&self) -> ReplayDiagnostics {
+        let resync = self
+            .audio
+            .as_ref()
+            .map(RecordingAudio::resync_stats)
+            .unwrap_or_default();
         ReplayDiagnostics {
             audio_glitch_frames: self
                 .audio
                 .as_ref()
                 .map_or(0, RecordingAudio::glitched_frames),
+            audio_resyncs: resync.count,
+            audio_max_resync_frames: resync.max_frames,
             ..self.diagnostics
         }
     }
@@ -421,6 +435,7 @@ impl ReplaySession {
         match outcome {
             SubmitOutcome::Submitted => {
                 self.counters.encoded += 1;
+                self.diagnostics.repeated_frames += 1;
                 self.meter.record();
                 self.timeline.advance();
                 Ok(true)

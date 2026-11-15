@@ -8,6 +8,8 @@
 //! when no frames arrive.
 #![deny(unsafe_code)]
 
+#[cfg(test)]
+mod av_sync_tests;
 mod logic;
 #[cfg(windows)]
 mod recording_audio;

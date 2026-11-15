@@ -7,6 +7,24 @@ use clipper_core::recording::NoiseGateSettings;
 const BLOCK: usize = 480;
 const CAPACITY: usize = SAMPLE_RATE as usize;
 
+/// A packet whose QPC position is within this many frames (2 ms) of where the
+/// previous packet of its source ended continues that source seamlessly.
+/// Beyond it the packet is placed at its QPC position instead (a re-anchor):
+/// the gap is rendered as silence or the overlap overwrites, so device clock
+/// drift against QPC never accumulates past this bound.
+pub const CONTINUITY_FRAMES: i64 = 96;
+
+/// Re-anchors of all sources so far (see [`CONTINUITY_FRAMES`]). Device clock
+/// drift shows as a steady rate of small re-anchors, a discontinuity as a
+/// large one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResyncStats {
+    /// Packets placed at their QPC position instead of continuing their source.
+    pub count: u64,
+    /// Largest |QPC position - continued position| of a re-anchor, in frames.
+    pub max_frames: u64,
+}
+
 struct Track {
     samples: Vec<[f32; 2]>,
     positions: Vec<i64>,
@@ -16,6 +34,7 @@ struct Track {
     step: f32,
     received: u64,
     next_position: Option<i64>,
+    resync: ResyncStats,
     gate: NoiseGate,
     peak: f32,
 }
@@ -81,6 +100,7 @@ impl TimelineMixer {
                     step: 0.0,
                     received: 0,
                     next_position: None,
+                    resync: ResyncStats::default(),
                     gate: NoiseGate::default(),
                     peak: 0.0,
                 })
@@ -136,6 +156,16 @@ impl TimelineMixer {
         self.late
     }
 
+    /// Re-anchors summed over all sources (diagnostics, no per-packet log).
+    pub fn resync_stats(&self) -> ResyncStats {
+        self.tracks
+            .iter()
+            .fold(ResyncStats::default(), |total, track| ResyncStats {
+                count: total.count + track.resync.count,
+                max_frames: total.max_frames.max(track.resync.max_frames),
+            })
+    }
+
     /// Starts the timeline at `qpc` without rendering the span before it.
     /// Samples older than that point are ignored without counting as late.
     pub fn skip_to(&mut self, qpc: i64) {
@@ -167,10 +197,15 @@ impl TimelineMixer {
             / i128::from(TICKS_PER_SECOND)) as i64;
         // Packet-clock jitter below 2 ms preserves sample continuity. Larger
         // clock offsets are corrected against QPC instead of accumulating drift.
-        let first = track
-            .next_position
-            .filter(|next| (*next - first).abs() <= 96)
-            .unwrap_or(first);
+        let first = match track.next_position {
+            Some(next) if (next - first).abs() <= CONTINUITY_FRAMES => next,
+            Some(next) => {
+                track.resync.count += 1;
+                track.resync.max_frames = track.resync.max_frames.max(next.abs_diff(first));
+                first
+            }
+            None => first,
+        };
         track.next_position = Some(first.saturating_add((samples.len() / channels) as i64));
         for (offset, frame) in samples.chunks_exact(channels).enumerate() {
             let position = first.saturating_add(offset as i64);
