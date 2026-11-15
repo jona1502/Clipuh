@@ -80,6 +80,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Err(error) = &logging {
         eprintln!("clipuh: file logging unavailable: {error}");
     }
+    // Every panic reaches the log; one on the UI thread ends the app, so the
+    // user gets a box instead of a window that just vanishes. Background
+    // threads only log: the UI reports a stopped recorder itself.
+    clipper_diagnostics::install_panic_hook(|report| {
+        if report.thread != "main" {
+            return;
+        }
+        let text = format!(
+            "clipuh stopped because of an internal error.\n\n{}\n\nThe log files in {} contain the details.",
+            report.summary(),
+            clipper_diagnostics::default_log_dir().display()
+        );
+        clipper_platform::windows::dialog::show_error("clipuh", &text);
+    });
     log::info!(
         "clipuh {} starting (pid {})",
         env!("CARGO_PKG_VERSION"),
