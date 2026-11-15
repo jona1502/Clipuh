@@ -14,14 +14,16 @@ the Rust workspace (no Cargo involvement in either direction).
 
 Run from `/website` (Node >= 22.23.4, npm):
 
-| Command           | Purpose                                         |
-| ----------------- | ----------------------------------------------- |
-| `npm install`     | Install dependencies                            |
-| `npm run dev`     | Dev server at http://localhost:4321             |
-| `npm run build`   | Static production build into `dist/`            |
-| `npm run preview` | Serve the production build locally              |
-| `npm run check`   | Astro/TypeScript diagnostics + formatting check |
-| `npm run format`  | Format with Prettier                            |
+| Command                | Purpose                                             |
+| ---------------------- | --------------------------------------------------- |
+| `npm install`          | Install dependencies                                |
+| `npm run dev`          | Dev server at http://localhost:4321                 |
+| `npm run build`        | Static production build into `dist/`                |
+| `npm run preview`      | Serve the production build locally                  |
+| `npm run test:unit`    | Vitest unit tests (store, editor state, app status) |
+| `npm run test:browser` | Playwright browser specs (needs a build first)      |
+| `npm run check`        | Astro/TypeScript diagnostics + formatting check     |
+| `npm run format`       | Format with Prettier                                |
 
 ## Structure
 
@@ -30,7 +32,7 @@ website/
 ├── public/                 static files served as-is (favicons, clipuh logo)
 ├── src/
 │   ├── components/
-│   │   ├── ui/             Button, Container, SectionHeading
+│   │   ├── ui/             Button, Container
 │   │   ├── feature/        DemoFrame, BentoCard, StatusBadge, status.ts
 │   │   ├── layout/         Header (chapter nav), Footer, Logo
 │   │   ├── sections/       Hero
@@ -106,8 +108,15 @@ nav links to the four chapters (mobile menu below 768px).
 
 ## Design system
 
-Single theme (dark only) in `src/styles/tokens.css`, a Tailwind v4 `@theme`
-block, so every token is also a utility. Never use raw hex in components.
+Site chrome is dark only: one theme in `src/styles/tokens.css`, a Tailwind v4
+`@theme` block, so every token is also a utility. App windows theme themselves:
+each `[data-app-window]` re-declares the same tokens per light/dark theme and
+accent in `src/styles/app-window.css` (driven by the shared Settings store), so
+a window can be light or recolored without touching the site. The accent
+swatch variables `--app-accent-*` also live on `:root` for site swatches.
+Never use raw hex in components. The one exception is the generated clip
+thumbnail illustrations in `interactive/app/thumbs.tsx`, which keep their own
+fixed scene palette (they are artwork, not UI).
 
 ### Color tokens
 
@@ -154,7 +163,7 @@ matching style by default in `global.css`.
   for the white-to-secondary headline gradient, `.glass-panel` for glass
   surfaces.
 - Breakpoints are Tailwind defaults (`md` 768, `lg` 1024, `xl` 1280). Design and
-  QA at 375, 430, 768, 1280, 1440, 1920. Mobile first.
+  QA at 375, 430, 768, 1024, 1280, 1440, 1920. Mobile first.
 
 ### Font
 
@@ -181,21 +190,12 @@ All accept `class` and pass remaining attributes to the root element.
 <Container size="narrow" as="section" id="faq">
   ...
 </Container>
-<SectionHeading
-  eyebrow="Features"
-  title="Capture everything"
-  description="..."
-  level={2}
-  align="center"
-/>
 ```
 
 - `Button`: `href?`, `variant?: "primary" | "secondary" | "ghost"` (primary),
   `size?: "md" | "lg"` (md, 40px; lg 44px), `disabled?`, `type?` (button);
   slots: default, `icon`.
 - `Container`: `size?: "page" | "narrow"`, `as?: HTMLTag` (div). Padding 16/24/32px.
-- `SectionHeading`: `title`, `eyebrow?`, `description?`, `level?: 1 | 2 | 3` (2),
-  `align?: "left" | "center"` (left).
 
 ## Feature components
 
