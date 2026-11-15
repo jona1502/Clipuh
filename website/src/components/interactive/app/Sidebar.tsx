@@ -48,21 +48,25 @@ function NavButtons({
 
 /**
  * App sidebar: logo, the four pages, storage meter. Below the 48rem window
- * width it renders as a top tab row instead (no logo or meter).
+ * width it renders as a top tab row instead (no logo or meter). The unused
+ * copy is display:none, so only one nav landmark per window is exposed.
  */
 export function Sidebar({
   page,
   onNavigate,
+  label,
 }: {
   page: PageId;
   onNavigate(p: PageId): void;
+  /** Landmark name; unique per window (e.g. "Capture window pages"). */
+  label: string;
 }) {
   const { usedGb, totalGb } = useApp((s) => s.storage);
   const pct = Math.round((usedGb / totalGb) * 100);
   return (
     <aside className="app-sidebar" data-app-shell-chrome="sidebar">
       {/* Phone: tab row. */}
-      <nav aria-label="App pages" className="app-sidebar-mobile p-1.5">
+      <nav aria-label={label} className="app-sidebar-mobile p-1.5">
         <ul className="flex gap-1">
           <NavButtons page={page} onNavigate={onNavigate} compact />
         </ul>
@@ -79,7 +83,7 @@ export function Sidebar({
           />
           <span className="app-text-2xl font-bold tracking-tight">clipuh</span>
         </div>
-        <nav aria-label="App pages">
+        <nav aria-label={label}>
           <ul className="flex flex-col gap-1.5">
             <NavButtons page={page} onNavigate={onNavigate} compact={false} />
           </ul>

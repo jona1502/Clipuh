@@ -31,13 +31,13 @@ test("sidebar switches only its own window", async ({ page }) => {
   const capture = await chapterWindow(page, "capture");
   const before = await page.evaluate(() => window.scrollY);
   await capture
-    .getByRole("navigation", { name: "App pages" })
+    .getByRole("navigation", { name: "Capture window pages" })
     .getByRole("button", { name: "Library", exact: true })
     .click();
   await expect(capture).toHaveAttribute("data-page", "library");
   await expect(
     capture
-      .getByRole("navigation", { name: "App pages" })
+      .getByRole("navigation", { name: "Capture window pages" })
       .getByRole("button", { name: "Library", exact: true }),
   ).toHaveAttribute("aria-current", "page");
   await expect(page.locator("#library [data-app-window]")).toHaveAttribute(
@@ -124,4 +124,63 @@ test("dropdown near the window bottom opens upward inside the window", async ({
     expect(box.y).toBeGreaterThanOrEqual(w.y);
     expect(box.y + box.height).toBeLessThanOrEqual(w.y + w.height);
   }
+});
+
+/** Hydrates every chapter window and returns its locator. */
+async function hydrateAllWindows(page: Page) {
+  for (const id of pages) await chapterWindow(page, id);
+  return page.locator("[data-app-window]");
+}
+
+test("windows on the same page share no DOM ids", async ({ page }) => {
+  await page.goto("/");
+  const wins = await hydrateAllWindows(page);
+  // Two windows on Settings (+ Capture/Library/Editor windows).
+  await page
+    .locator("#capture")
+    .getByRole("navigation", { name: "Capture window pages" })
+    .getByRole("button", { name: "Settings", exact: true })
+    .click();
+  await expect(page.locator("#capture [data-app-window]")).toHaveAttribute(
+    "data-page",
+    "settings",
+  );
+  await expect(
+    page.locator("#capture [data-settings-panel='appearance']"),
+  ).toBeVisible();
+  await expect(
+    page.locator("#settings [data-settings-panel='appearance']"),
+  ).toBeVisible();
+  expect(await wins.count()).toBeGreaterThan(1);
+  const dupes = await page.evaluate(() => {
+    const seen = new Map<string, number>();
+    for (const el of document.querySelectorAll("[id]"))
+      seen.set(el.id, (seen.get(el.id) ?? 0) + 1);
+    return [...seen].filter(([, n]) => n > 1).map(([id]) => id);
+  });
+  expect(dupes).toEqual([]);
+});
+
+test("each window exposes one uniquely named pages landmark", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await hydrateAllWindows(page);
+  for (const id of pages) {
+    await expect(
+      page
+        .locator(`#${id} [data-app-window]`)
+        .getByRole("navigation", { name: /window pages$/ }),
+    ).toHaveCount(1);
+  }
+  const names = await page
+    .locator("[data-app-window]")
+    .evaluateAll((els) =>
+      els.flatMap((w) =>
+        [...w.querySelectorAll("nav")]
+          .filter((n) => getComputedStyle(n).display !== "none")
+          .map((n) => n.getAttribute("aria-label")),
+      ),
+    );
+  expect(new Set(names).size).toBe(names.length);
 });

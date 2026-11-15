@@ -11,7 +11,7 @@ import {
 import { Sidebar } from "./Sidebar";
 import { TopBar } from "./TopBar";
 import { ACCENTS, useApp, type PageId } from "./store";
-import type { PageProps } from "./types";
+import { PAGE_LABELS, type PageProps } from "./types";
 import { Icon, type IconName } from "./ui/Icon";
 
 // Each page is its own chunk, fetched when a window first shows it.
@@ -58,7 +58,14 @@ const CHROME: { icon: IconName; label: string }[] = [
  * page. Each window keeps its own page; data and settings come from the
  * shared store, so every window on the site stays in sync.
  */
-export function AppShell({ initialPage }: { initialPage: PageId }) {
+export function AppShell({
+  initialPage,
+  windowLabel,
+}: {
+  initialPage: PageId;
+  /** Names the window in landmarks; defaults to the initial page label. */
+  windowLabel?: string;
+}) {
   const [page, setPage] = useState<PageId>(initialPage);
   const [notice, setNotice] = useState("");
   const windowRef = useRef<HTMLDivElement>(null);
@@ -88,7 +95,11 @@ export function AppShell({ initialPage }: { initialPage: PageId }) {
       className="relative w-full overflow-hidden"
     >
       <div className="app-layout">
-        <Sidebar page={page} onNavigate={navigate} />
+        <Sidebar
+          page={page}
+          onNavigate={navigate}
+          label={`${windowLabel ?? PAGE_LABELS[initialPage]} window pages`}
+        />
         <div className="app-main">
           <div
             className="-mb-1 hidden justify-end gap-1 @min-[48rem]/app-window:flex"

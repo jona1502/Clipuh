@@ -220,7 +220,7 @@ test("rename: the pencil edits the title in the store", async ({ page }) => {
   // Another window reads the same store (Library page lands at integration).
   const other = await chapterWindow(page, "capture");
   await other
-    .getByRole("navigation", { name: "App pages" })
+    .getByRole("navigation", { name: "Capture window pages" })
     .getByRole("button", { name: "Editor", exact: true })
     .click();
   await expect(other.locator("[data-editor-title]")).toHaveText(
