@@ -1,6 +1,6 @@
 # UI smoothness benchmark: frame-time statistics per scenario.
 #
-#   pwsh scripts/perf/ui_bench.ps1 -Exe target/release/clipper-app.exe -Label after
+#   pwsh scripts/perf/ui_bench.ps1 -Exe target/release/clipuh.exe -Label after
 #
 # Uses the user's normal config (whatever replay state it has). Scenarios:
 # idle on Library, Settings wheel scroll, Settings touchpad-style scroll,

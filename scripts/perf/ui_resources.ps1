@@ -1,8 +1,8 @@
-# Process CPU and GPU engine usage of clipper-app per UI scenario:
+# Process CPU and GPU engine usage of clipuh.exe per UI scenario:
 # idle (Settings, no input), continuous Settings wheel scrolling, Editor
 # playback. Uses gpu_sample.ps1 (Windows GPU Engine counters).
 #
-#   pwsh scripts/perf/ui_resources.ps1 -Exe target/release/clipper-app.exe -Label after
+#   pwsh scripts/perf/ui_resources.ps1 -Exe target/release/clipuh.exe -Label after
 param([string]$Exe, [string]$Label = '', [string]$Clip = '00-46-56', [int]$Seconds = 8)
 . "$PSScriptRoot/ui_driver.ps1"
 $sampler = "$PSScriptRoot/gpu_sample.ps1"
