@@ -256,3 +256,31 @@ test("narrow widths: no horizontal page scroll", async ({ page }) => {
     expect(overflow).toBeLessThanOrEqual(0);
   }
 });
+
+test("reset trim is refused on a locked track", async ({ page }) => {
+  const win = await editorWindow(page);
+  const handle = win.getByRole("slider", { name: "Video start" });
+  await handle.focus();
+  await page.keyboard.press("Shift+ArrowRight");
+  await expectField(win, "Start", 10);
+  await win.getByRole("button", { name: "Lock Video", exact: true }).click();
+  await win.getByRole("button", { name: "Video options" }).click();
+  await win.getByRole("menuitem", { name: "Reset trim" }).click();
+  await expect(win.getByText("This track is locked.")).toBeVisible();
+  await expectField(win, "Start", 10);
+});
+
+test("Ctrl+Z on a focused trim handle reverts the arrow trim", async ({
+  page,
+}) => {
+  const win = await editorWindow(page);
+  const before = await fieldTenths(win, "Start");
+  const handle = win.getByRole("slider", { name: "Video start" });
+  await handle.focus();
+  await page.keyboard.press("ArrowRight");
+  await expectField(win, "Start", before + 1);
+  await page.keyboard.press("Control+z");
+  await expectField(win, "Start", before);
+  await page.keyboard.press("Control+y");
+  await expectField(win, "Start", before + 1);
+});

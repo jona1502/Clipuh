@@ -336,7 +336,7 @@ function ExportPanel(p: Props) {
   const bitrate = useApp((s) => s.settings.bitrateMbps);
   const [res, setRes] = useState<ExportRes>("source");
   const lenSec = (p.trim.end - p.trim.start) / 10;
-  const mb = estimateClipMb(lenSec, res === "720p" ? bitrate / 2 : bitrate);
+  const mb = estimateClipMb(lenSec, bitrate);
   return (
     <div className="flex flex-col gap-3">
       <div className="grid grid-cols-[5.5rem_minmax(0,1fr)] items-center gap-2">

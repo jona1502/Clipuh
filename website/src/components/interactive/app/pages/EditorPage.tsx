@@ -25,9 +25,12 @@ const EXPORT_TICK_MS = 110;
 const START_PLAYHEAD = 124;
 const LOCKED_MSG = "The video track is locked.";
 
-/** Keys typed into these stay with the control (Space, Ctrl+Z). */
+/** Space on these stays with the control. */
 const INTERACTIVE =
   "input, textarea, select, button, a[href], [contenteditable], [role=slider], [role=tab], [role=option], [role=menuitem], [role=listbox]";
+
+/** Text fields keep their own Ctrl+Z / Ctrl+Y. */
+const TEXT_ENTRY = "input, textarea, [contenteditable]";
 
 const allFlags = (): Record<TrackId, TrackFlags> => ({
   video: { ...NO_FLAGS },
@@ -126,6 +129,11 @@ function EditorBody({ clip, windowRef }: PageProps & { clip: Clip }) {
     setPlaying(true);
   }, [reduced, notify, playing, trim.start, trim.end]);
 
+  // Reduced motion switched on mid-play: stop, never leave "Pause" stuck.
+  useEffect(() => {
+    if (reduced) setPlaying(false);
+  }, [reduced]);
+
   useEffect(() => {
     if (!playing || reduced) return;
     const from = playheadRef.current;
@@ -168,13 +176,17 @@ function EditorBody({ clip, windowRef }: PageProps & { clip: Clip }) {
     const win = windowRef.current;
     if (!win) return;
     const onKey = (e: KeyboardEvent) => {
-      if ((e.target as HTMLElement | null)?.closest(INTERACTIVE)) return;
+      const target = e.target as HTMLElement | null;
       const mod = e.ctrlKey || e.metaKey;
       const key = e.key.toLowerCase();
-      if (e.key === " " && !mod && !e.altKey) togglePlay();
-      else if (mod && key === "z") (e.shiftKey ? redo : undo)();
-      else if (mod && key === "y") redo();
-      else return;
+      if (e.key === " " && !mod && !e.altKey) {
+        if (target?.closest(INTERACTIVE)) return;
+        togglePlay();
+      } else if (mod && (key === "z" || key === "y")) {
+        if (target?.closest(TEXT_ENTRY)) return;
+        if (key === "y" || e.shiftKey) redo();
+        else undo();
+      } else return;
       e.preventDefault();
     };
     win.addEventListener("keydown", onKey);
@@ -338,7 +350,10 @@ function EditorBody({ clip, windowRef }: PageProps & { clip: Clip }) {
           onDragEnd={dragEnd}
           onSeek={seek}
           onSplitAt={onSplitAt}
-          onResetTrim={(id) => edit((d) => resetTrim(d, id))}
+          onResetTrim={(id) => {
+            if (flags[id].locked) notify("This track is locked.");
+            else edit((d) => resetTrim(d, id));
+          }}
           notify={notify}
         />
       </div>
