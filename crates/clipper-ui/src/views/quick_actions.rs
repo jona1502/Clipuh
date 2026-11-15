@@ -278,6 +278,12 @@ impl ClipperWindow {
         });
     }
 
+    /// Shows the main window (also when hidden in the tray) and brings it to
+    /// the front, e.g. when clipuh is started a second time.
+    pub fn bring_to_front(&self, window: &mut Window) {
+        self.show_main(window);
+    }
+
     fn show_main(&self, window: &mut Window) {
         if let Some(hwnd) = self.feedback.main_hwnd {
             tray::show_window(hwnd);

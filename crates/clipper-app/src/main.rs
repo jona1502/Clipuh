@@ -141,6 +141,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let tray_link = tray
         .as_ref()
         .map(|(tray, commands)| (tray.handle(), commands.clone()));
+    // A later start of clipuh asks this one to show its window.
+    let (activations_tx, activations) = async_channel::bounded::<()>(1);
+    let activation_listener =
+        instance_lock
+            .as_ref()
+            .and_then(|lock| match lock.listen(activations_tx) {
+                Ok(listener) => Some(listener),
+                Err(error) => {
+                    log::warn!("activation requests unavailable: {error}");
+                    None
+                }
+            });
     let window_opened = Rc::new(Cell::new(false));
     let window_opened_in_callback = Rc::clone(&window_opened);
 
@@ -195,6 +207,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 main_window.set(Some(handle.into()));
                 window_opened_in_callback.set(true);
                 cx.activate(true);
+                let activations = activations.clone();
+                cx.spawn(async move |cx| {
+                    while activations.recv().await.is_ok() {
+                        let shown = handle.update(cx, |view, window, _| {
+                            view.bring_to_front(window);
+                        });
+                        if shown.is_err() {
+                            return;
+                        }
+                    }
+                })
+                .detach();
             }
             Err(error) => {
                 log::error!("main window could not be opened: {error}");
@@ -206,6 +230,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Remove the tray icon and release the global hotkey first so no save is
     // queued during shutdown, then join the recorder worker (finalizing any
     // active recording).
+    drop(activation_listener);
     drop(tray);
     drop(hotkey);
     drop(recorder);
