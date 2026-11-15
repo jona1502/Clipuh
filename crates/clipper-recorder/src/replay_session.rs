@@ -12,10 +12,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, sync_channel};
 use std::time::{Duration, Instant};
 
-use clipper_capture::windows::{CaptureSession, CapturedFrame};
+use clipper_capture::windows::{CaptureError, CaptureSession, CapturedFrame};
 use clipper_core::pipeline::{FramePacer, RateMeter};
 use clipper_core::recording::{CaptureSource, RecorderEndpoint, ReplayOptions, ReplayStatus};
-use clipper_encoder::backends::media_foundation::{EncoderConfig, MediaFoundation, SubmitOutcome};
+use clipper_encoder::backends::media_foundation::{
+    EncoderConfig, EncoderError, MediaFoundation, SubmitOutcome,
+};
 use clipper_encoder::backends::packet_encoder::PacketEncoder;
 use clipper_platform::windows::D3DContext;
 use clipper_replay::EncodedPacket;
@@ -24,8 +26,8 @@ use clipper_replay::error::ReplayError;
 use clipper_replay::hybrid::{ReplayBuffer, ReplayConfig, ReplaySnapshot};
 
 use crate::logic::{
-    Counters, SlotTimeline, fit_output_size, repeat_lag_ticks, replay_failure_text, replay_status,
-    replay_warning, valid_replay_duration,
+    Counters, Failure, FailureKind, OutputWatchdog, SlotTimeline, fit_output_size,
+    repeat_lag_ticks, replay_status, replay_warning, valid_replay_duration,
 };
 use crate::recording_audio::{AudioPlan, AudioReporter, RecordingAudio};
 use crate::windows_worker::{encoder_message, round_up_even, signal_handler};
@@ -48,6 +50,37 @@ const MAX_CLOCK_GAP_TICKS: i64 = 10_000_000;
 struct PendingFrame {
     frame: CapturedFrame,
     slot: i64,
+}
+
+/// Capture errors: a vanished source is `SourceLost`; Windows errors are
+/// classified by HRESULT (device removal) and are otherwise not retried.
+pub(crate) fn capture_failure(error: &CaptureError) -> Failure {
+    match error {
+        CaptureError::SourceUnavailable(_) => {
+            Failure::new(FailureKind::SourceLost, error.to_string())
+        }
+        CaptureError::Unsupported => Failure::new(FailureKind::Configuration, error.to_string()),
+        CaptureError::Windows(win) => {
+            Failure::from_code(FailureKind::Other, win.code().0 as u32, error.to_string())
+        }
+    }
+}
+
+/// Encoder errors: settings the hardware rejects are `Configuration`; Windows
+/// errors are `EncoderFailure` unless the HRESULT says the device was lost.
+pub(crate) fn encoder_failure(error: &EncoderError) -> Failure {
+    match error {
+        EncoderError::Windows(win) => Failure::from_code(
+            FailureKind::EncoderFailure,
+            win.code().0 as u32,
+            encoder_message(error),
+        ),
+        _ => Failure::new(FailureKind::Configuration, encoder_message(error)),
+    }
+}
+
+fn other_failure(message: impl Into<String>) -> Failure {
+    Failure::new(FailureKind::Other, message)
 }
 
 /// Internal health counters of a session (logged when it stops).
@@ -92,6 +125,8 @@ pub struct ReplaySession {
     /// Session time of the first submitted frame.
     video_start: Option<i64>,
     diagnostics: ReplayDiagnostics,
+    /// Detects an encoder that silently stops producing video.
+    watchdog: OutputWatchdog,
     packets: Vec<EncodedPacket>,
     pub wake: Receiver<()>,
     source_closed: Arc<AtomicBool>,
@@ -103,10 +138,15 @@ impl ReplaySession {
         mf: &MediaFoundation,
         source: &CaptureSource,
         options: &ReplayOptions,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, Failure> {
         let recording = &options.recording;
-        let d3d = D3DContext::new()
-            .map_err(|error| format!("could not create the GPU device: {error}"))?;
+        let d3d = D3DContext::new().map_err(|error| {
+            Failure::from_code(
+                FailureKind::Other,
+                error.code().0 as u32,
+                format!("could not create the GPU device: {error}"),
+            )
+        })?;
 
         let (wake_tx, wake) = sync_channel::<()>(1);
         let source_closed = Arc::new(AtomicBool::new(false));
@@ -115,7 +155,7 @@ impl ReplaySession {
             source,
             signal_handler(wake_tx.clone(), Arc::clone(&source_closed)),
         )
-        .map_err(|error| replay_failure_text(&error.to_string()))?;
+        .map_err(|error| capture_failure(&error))?;
         // Optional (Windows 11 24H2+); older builds keep the WGC default.
         let _ = capture.set_target_fps(recording.fps);
 
@@ -137,13 +177,12 @@ impl ReplaySession {
         let plan = AudioPlan::for_session(&recording.audio, Some(source));
         let audio_reporter = AudioReporter::new(plan.idle_states());
         let encoder = PacketEncoder::create_with_labels(mf, &d3d, &config, &plan.labels())
-            .map_err(|error| replay_failure_text(&encoder_message(&error)))?;
+            .map_err(|error| encoder_failure(&error))?;
         let encoder_name = encoder.name().to_owned();
 
         // Initialize expensive GPU/codec resources before audio starts,
         // otherwise hardware encoder discovery can overflow the audio rings.
-        let mut audio = RecordingAudio::start(plan, wake_tx)
-            .map_err(|message| replay_failure_text(&message))?;
+        let mut audio = RecordingAudio::start(plan, wake_tx).map_err(other_failure)?;
         if let Some(audio) = &mut audio {
             audio.set_tolerant(true);
         }
@@ -178,6 +217,7 @@ impl ReplaySession {
             timeline: SlotTimeline::new(interval),
             video_start: None,
             diagnostics: ReplayDiagnostics::default(),
+            watchdog: OutputWatchdog::default(),
             packets: Vec::with_capacity(64),
             wake,
             source_closed,
@@ -291,14 +331,14 @@ impl ReplaySession {
     }
 
     /// One bounded service step: frames, repeated frames, audio, packets.
-    pub fn pump(&mut self) -> Result<(), String> {
+    pub fn pump(&mut self) -> Result<(), Failure> {
         let interval = self.pacer.interval();
         if self.video_start.is_none()
             && !self.encoder.has_frame()
             && self.pending.is_none()
             && self.started.elapsed() > FIRST_FRAME_TIMEOUT
         {
-            return Err("the capture source delivered no frames".into());
+            return Err(other_failure("the capture source delivered no frames"));
         }
         let mut repeats_left = MAX_REPEATS_PER_PUMP;
         let mut pulled = 0;
@@ -310,7 +350,7 @@ impl ReplaySession {
                 let Some(frame) = self
                     .capture
                     .try_next_frame()
-                    .map_err(|error| replay_failure_text(&error.to_string()))?
+                    .map_err(|error| capture_failure(&error))?
                 else {
                     break;
                 };
@@ -324,7 +364,7 @@ impl ReplaySession {
                     if !self.encoder.has_frame() {
                         self.encoder
                             .stage(frame.texture(), frame.content_size())
-                            .map_err(|error| replay_failure_text(&encoder_message(&error)))?;
+                            .map_err(|error| encoder_failure(&error))?;
                     }
                     continue;
                 };
@@ -351,10 +391,22 @@ impl ReplaySession {
                 audio.pump(&mut self.encoder, false, self.timeline.end_ticks())
             };
             if let Err(message) = result {
-                return Err(replay_failure_text(&message));
+                return Err(other_failure(message));
             }
         }
-        self.drain_packets()
+        if self.video_start.is_some() {
+            // Video is due from now on: real frames or static-scene repeats
+            // are submitted at the frame rate, so output must follow.
+            self.watchdog.expect_output(Instant::now());
+        }
+        self.drain_packets()?;
+        if self.watchdog.stalled(Instant::now()) {
+            return Err(Failure::new(
+                FailureKind::EncoderFailure,
+                "the video encoder stopped producing output",
+            ));
+        }
+        Ok(())
     }
 
     /// Starts the video (and audio) timeline at `slot`.
@@ -373,7 +425,7 @@ impl ReplaySession {
     /// Submits the held real frame once the slots before it are filled with
     /// repeats. `Ok(false)`: out of budget or the encoder is busy, the frame
     /// stays pending for the next iteration.
-    fn flush_pending(&mut self, interval: i64, repeats_left: &mut usize) -> Result<bool, String> {
+    fn flush_pending(&mut self, interval: i64, repeats_left: &mut usize) -> Result<bool, Failure> {
         let Some(pending) = self.pending.take() else {
             return Ok(true);
         };
@@ -402,7 +454,7 @@ impl ReplaySession {
                 self.timeline.time_of(slot),
                 interval,
             )
-            .map_err(|error| replay_failure_text(&encoder_message(&error)))?;
+            .map_err(|error| encoder_failure(&error))?;
         match outcome {
             SubmitOutcome::Submitted => {
                 self.counters.encoded += 1;
@@ -421,7 +473,7 @@ impl ReplaySession {
 
     /// Fills the next slot with the last frame. `Ok(false)` when the encoder
     /// is busy.
-    fn submit_repeat(&mut self, interval: i64) -> Result<bool, String> {
+    fn submit_repeat(&mut self, interval: i64) -> Result<bool, Failure> {
         if !self.encoder.has_frame() {
             // Nothing to repeat (cannot happen once video started).
             self.timeline.advance();
@@ -431,7 +483,7 @@ impl ReplaySession {
         let outcome = self
             .encoder
             .submit_repeat(time, interval)
-            .map_err(|error| replay_failure_text(&encoder_message(&error)))?;
+            .map_err(|error| encoder_failure(&error))?;
         match outcome {
             SubmitOutcome::Submitted => {
                 self.counters.encoded += 1;
@@ -446,7 +498,11 @@ impl ReplaySession {
 
     /// Re-submits the last frame while WGC is silent, up to real time minus a
     /// small lag, so the timeline keeps moving at the configured frame rate.
-    fn fill_static_scene(&mut self, interval: i64, repeats_left: &mut usize) -> Result<(), String> {
+    fn fill_static_scene(
+        &mut self,
+        interval: i64,
+        repeats_left: &mut usize,
+    ) -> Result<(), Failure> {
         let now = clipper_audio::windows::qpc_now_ticks() - self.origin;
         // Only meaningful once video exists: without a first frame the video
         // end stays 0 and the clocks cannot be compared.
@@ -454,7 +510,7 @@ impl ReplaySession {
             && self.audio.is_some()
             && now - AUDIO_LAG_TICKS - self.timeline.end_ticks() > MAX_CLOCK_GAP_TICKS
         {
-            return Err("the audio and video clocks drifted apart".into());
+            return Err(other_failure("the audio and video clocks drifted apart"));
         }
         if self.pending.is_some() || !self.encoder.has_frame() {
             return Ok(());
@@ -473,21 +529,26 @@ impl ReplaySession {
         Ok(())
     }
 
-    fn drain_packets(&mut self) -> Result<(), String> {
+    fn drain_packets(&mut self) -> Result<(), Failure> {
         self.encoder
             .poll(&mut self.packets)
-            .map_err(|error| replay_failure_text(&encoder_message(&error)))?;
+            .map_err(|error| encoder_failure(&error))?;
         if self.packets.is_empty() {
             return Ok(());
         }
+        if self.packets.iter().any(|packet| packet.track == 0) {
+            self.watchdog.output();
+        }
         if self.buffer.is_none() {
             // The encoder guarantees the layout before its first packet.
-            let layout = self
-                .encoder
-                .layout()
-                .ok_or("the encoder produced packets without a stream layout")?;
+            let layout = self.encoder.layout().ok_or_else(|| {
+                Failure::new(
+                    FailureKind::EncoderFailure,
+                    "the encoder produced packets without a stream layout",
+                )
+            })?;
             let buffer = ReplayBuffer::new(self.config.clone(), layout)
-                .map_err(|error| replay_failure_text(&error.to_string()))?;
+                .map_err(|error| other_failure(error.to_string()))?;
             self.buffer = Some(buffer);
         }
         let Some(buffer) = self.buffer.as_mut() else {
@@ -498,7 +559,7 @@ impl ReplaySession {
                 Ok(()) => {}
                 // Timestamps not increasing: lose this packet, keep recording.
                 Err(ReplayError::Invalid(_)) => self.diagnostics.invalid_packets += 1,
-                Err(error) => return Err(replay_failure_text(&error.to_string())),
+                Err(error) => return Err(other_failure(error.to_string())),
             }
         }
         Ok(())

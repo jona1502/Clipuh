@@ -26,12 +26,12 @@ use clipper_replay::export::{ExportJob, ExportPrepare, Exporter, SavedClip};
 use windows::Win32::System::SystemInformation::GetLocalTime;
 
 use crate::logic::{
-    ClipNames, Counters, Lifecycle, StopOutcome, classify_stop, fit_output_size, partial_path,
-    replay_failure_text, replay_file_name, sweep_stale_partials, unique_file_name,
-    validate_replay_options,
+    ClipNames, Counters, Failure, FailureKind, Lifecycle, Recovery, RecoveryDecision, StopOutcome,
+    classify_hresult, classify_stop, fit_output_size, max_recovery_attempts, partial_path,
+    replay_file_name, sweep_stale_partials, unique_file_name, validate_replay_options,
 };
 use crate::recording_audio::{AudioPlan, AudioReporter, AudioTest, RecordingAudio};
-use crate::replay_session::{ReplaySession, WAKE_WAIT};
+use crate::replay_session::{ReplaySession, WAKE_WAIT, encoder_failure};
 use crate::{emit, log};
 
 const MAX_WAIT: Duration = Duration::from_millis(250);
@@ -159,6 +159,11 @@ struct Worker<'a> {
     clip_names: ClipNames,
     /// Folder of the running replay's clips.
     replay_output: PathBuf,
+    /// Source and settings of the last replay the user started: what an
+    /// automatic restart uses (never another source).
+    replay_request: Option<(CaptureSource, ReplayOptions)>,
+    /// Bounded automatic restart after GPU device loss or encoder failure.
+    recovery: Recovery,
     /// Set before shutdown joins the exporter: late completion events must
     /// not block on a UI queue nobody drains.
     shutting_down: Arc<AtomicBool>,
@@ -191,6 +196,8 @@ pub fn run(endpoint: &RecorderEndpoint) {
         next_save: 1,
         clip_names: ClipNames::default(),
         replay_output: PathBuf::new(),
+        replay_request: None,
+        recovery: Recovery::default(),
         shutting_down: Arc::new(AtomicBool::new(false)),
         media_foundation: None,
         _com: com,
@@ -199,9 +206,27 @@ pub fn run(endpoint: &RecorderEndpoint) {
     let mut running = true;
     while running {
         if worker.recording.is_none() && worker.audio_test.is_none() && worker.replay.is_none() {
-            match endpoint.commands.recv() {
-                Ok(command) => running = worker.handle(command),
-                Err(_) => break,
+            // Idle: block on commands, but no longer than a pending automatic
+            // replay restart.
+            let command = match worker.recovery.next_due() {
+                Some(due) => {
+                    match endpoint
+                        .commands
+                        .recv_timeout(due.saturating_duration_since(Instant::now()))
+                    {
+                        Ok(command) => Some(command),
+                        Err(RecvTimeoutError::Timeout) => None,
+                        Err(RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+                None => match endpoint.commands.recv() {
+                    Ok(command) => Some(command),
+                    Err(_) => break,
+                },
+            };
+            match command {
+                Some(command) => running = worker.handle(command),
+                None => worker.service_recovery(),
             }
             continue;
         }
@@ -224,6 +249,7 @@ pub fn run(endpoint: &RecorderEndpoint) {
             }
         }
     }
+    worker.recovery.shutdown();
     worker.stop_recording(StopReason::Shutdown, None);
     worker.stop_replay(None, false);
     worker.stop_audio_test(None);
@@ -309,6 +335,20 @@ impl Worker<'_> {
 
     /// Returns `false` when the worker must exit.
     fn handle(&mut self, command: RecorderCommand) -> bool {
+        // The user takes over: a pending automatic replay restart is dropped.
+        if matches!(
+            command,
+            RecorderCommand::StartReplay { .. }
+                | RecorderCommand::StopReplay
+                | RecorderCommand::StartRecording { .. }
+                | RecorderCommand::StartAudioTest { .. }
+                | RecorderCommand::Shutdown
+        ) {
+            if self.recovery.is_pending() {
+                log(format_args!("replay recovery: cancelled by a user command"));
+            }
+            self.recovery.cancel();
+        }
         match command {
             RecorderCommand::StartAudioTest {
                 options,
@@ -336,6 +376,7 @@ impl Worker<'_> {
             }
             RecorderCommand::StopAudioTest => self.stop_audio_test(None),
             RecorderCommand::Shutdown => {
+                self.recovery.shutdown();
                 self.stop_audio_test(None);
                 self.stop_recording(StopReason::Shutdown, None);
                 self.stop_replay(None, false);
@@ -427,13 +468,78 @@ impl Worker<'_> {
         }
         match self.try_start_replay(source, options) {
             Ok(replay) => {
-                let encoder = replay.encoder_name().to_owned();
-                self.replay_output = options.recording.output_directory.clone();
-                self.sweep_stale_partials();
-                self.replay = Some(replay);
-                self.send(RecorderEvent::ReplayStarted { encoder });
+                self.replay_request = Some((source.clone(), options.clone()));
+                self.install_replay(replay);
             }
-            Err(message) => self.send(stopped(message)),
+            Err(failure) => {
+                log(format_args!(
+                    "replay start failed: {:?} {}{}",
+                    failure.kind,
+                    failure.detail,
+                    code_text(failure.code)
+                ));
+                self.send(stopped(failure.message()));
+            }
+        }
+    }
+
+    fn install_replay(&mut self, replay: ReplaySession) {
+        let encoder = replay.encoder_name().to_owned();
+        if let Some((_, options)) = &self.replay_request {
+            self.replay_output = options.recording.output_directory.clone();
+        }
+        self.sweep_stale_partials();
+        self.replay = Some(replay);
+        self.send(RecorderEvent::ReplayStarted { encoder });
+    }
+
+    /// Runs a due automatic replay restart: the same source and settings on a
+    /// new GPU device, encoder and buffer (nothing of the failed session is
+    /// reused). The UI sees `ReplayStarted` on success, and one final
+    /// `ReplayStopped` when the bounded attempts are exhausted.
+    fn service_recovery(&mut self) {
+        let now = Instant::now();
+        let Some(generation) = self.recovery.take_due(now) else {
+            return;
+        };
+        let busy = self.replay.is_some() || self.recording.is_some() || self.audio_test.is_some();
+        let Some((source, options)) = self.replay_request.clone().filter(|_| !busy) else {
+            self.recovery.cancel();
+            return;
+        };
+        log(format_args!(
+            "replay recovery: restarting (generation {generation})"
+        ));
+        let started = Instant::now();
+        match self.try_start_replay(&source, &options) {
+            Ok(replay) => {
+                if self.recovery.attempt_succeeded(generation, Instant::now()) {
+                    log(format_args!(
+                        "replay recovery: running again after {:?}",
+                        started.elapsed()
+                    ));
+                    self.install_replay(replay);
+                }
+            }
+            Err(failure) => {
+                let decision =
+                    self.recovery
+                        .attempt_failed(generation, failure.kind, Instant::now());
+                log(format_args!(
+                    "replay recovery: restart failed: {:?} {}{}; {decision:?}",
+                    failure.kind,
+                    failure.detail,
+                    code_text(failure.code)
+                ));
+                if decision == RecoveryDecision::GiveUp {
+                    self.send(RecorderEvent::ReplayStopped {
+                        error: Some(format!(
+                            "{}; it could not be restarted automatically",
+                            failure.message()
+                        )),
+                    });
+                }
+            }
         }
     }
 
@@ -441,17 +547,19 @@ impl Worker<'_> {
         &mut self,
         source: &CaptureSource,
         options: &ReplayOptions,
-    ) -> Result<ReplaySession, String> {
+    ) -> Result<ReplaySession, Failure> {
         if let Some(message) = &self.init_error {
-            return Err(replay_failure_text(message));
+            return Err(Failure::new(FailureKind::Configuration, message.clone()));
         }
         if self.media_foundation.is_none() {
-            let mf = MediaFoundation::start()
-                .map_err(|error| replay_failure_text(&encoder_message(&error)))?;
+            let mf = MediaFoundation::start().map_err(|error| encoder_failure(&error))?;
             self.media_foundation = Some(mf);
         }
         let Some(mf) = self.media_foundation.as_ref() else {
-            return Err("Media Foundation is not available".into());
+            return Err(Failure::new(
+                FailureKind::Configuration,
+                "Media Foundation is not available",
+            ));
         };
         ReplaySession::start(mf, source, options)
     }
@@ -514,13 +622,16 @@ impl Worker<'_> {
             Ok(()) | Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => std::thread::sleep(Duration::from_millis(10)),
         }
-        if let Err(message) = replay.pump() {
-            self.fail_replay(message);
+        if let Err(failure) = replay.pump() {
+            self.fail_replay(failure);
             return;
         }
         replay.report_audio(self.endpoint);
         if replay.source_closed() {
-            self.fail_replay("the capture source was closed".into());
+            self.fail_replay(Failure::new(
+                FailureKind::SourceLost,
+                "the capture source was closed",
+            ));
             return;
         }
         if replay.status_due() {
@@ -534,9 +645,31 @@ impl Worker<'_> {
     }
 
     /// Fatal runtime error: first try to keep the footage by saving the
-    /// configured duration as an automatic save, then tear the session down.
-    fn fail_replay(&mut self, message: String) {
+    /// configured duration as an automatic save (from this session's buffer
+    /// only), then tear the whole session down (capture, encoder, audio,
+    /// buffer, GPU device). Device loss and encoder failures may schedule a
+    /// bounded automatic restart; everything else waits for the user.
+    fn fail_replay(&mut self, failure: Failure) {
+        let decision = self.recovery.on_failure(failure.kind, Instant::now());
+        log(format_args!(
+            "replay failed: {:?} {}{}; recovery: {decision:?}",
+            failure.kind,
+            failure.detail,
+            code_text(failure.code)
+        ));
         self.queue_save(true);
+        let message = match decision {
+            RecoveryDecision::Retry { delay, .. } => format!(
+                "{}; restarting automatically in {} s",
+                failure.message(),
+                delay.as_secs()
+            ),
+            RecoveryDecision::GiveUp if max_recovery_attempts(failure.kind) > 0 => format!(
+                "{}; it could not be restarted automatically",
+                failure.message()
+            ),
+            _ => failure.message(),
+        };
         self.stop_replay(Some(message), true);
     }
 
@@ -1073,8 +1206,20 @@ pub(crate) fn encoder_message(error: &EncoderError) -> String {
     match error {
         EncoderError::DiskFull => "not enough disk space to keep recording".into(),
         EncoderError::AccessDenied => "no permission to write the output file".into(),
+        // A GPU reset during a manual recording: explain it, keep the code.
+        EncoderError::Windows(win)
+            if classify_hresult(win.code().0 as u32) == Some(FailureKind::DeviceLost) =>
+        {
+            Failure::from_code(FailureKind::DeviceLost, win.code().0 as u32, String::new())
+                .message()
+        }
         other => other.to_string(),
     }
+}
+
+fn code_text(code: Option<u32>) -> String {
+    code.map(|code| format!(" (0x{code:08X})"))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
