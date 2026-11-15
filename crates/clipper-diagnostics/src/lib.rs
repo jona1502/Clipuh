@@ -2,6 +2,7 @@
 
 mod export;
 mod logger;
+mod panic;
 mod sanitize;
 
 pub use export::{ExportSummary, SystemInfo, export_zip};
@@ -10,6 +11,7 @@ pub use logger::{
     DiagnosticsError, LogConfig, Verbosity, current_verbosity, default_log_dir, flush, init,
     log_dir, set_verbosity, shutdown,
 };
+pub use panic::{PanicReport, install_panic_hook};
 pub use sanitize::sanitize;
 
 #[doc(hidden)]

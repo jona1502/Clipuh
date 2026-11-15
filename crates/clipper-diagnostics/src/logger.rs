@@ -203,6 +203,19 @@ pub fn flush() {
     }
 }
 
+/// [`flush`] that never blocks: skipped while another thread holds the state
+/// (a panic hook must not deadlock on a lock its own thread may hold).
+pub(crate) fn try_flush() {
+    let state = match STATE.try_lock() {
+        Ok(state) => state,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return,
+    };
+    if let Some(s) = state.as_ref() {
+        s.handle.flush();
+    }
+}
+
 pub fn log_dir() -> Option<PathBuf> {
     lock().as_ref().map(|s| s.dir.clone())
 }

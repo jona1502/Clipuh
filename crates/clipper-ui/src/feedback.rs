@@ -129,7 +129,7 @@ pub(crate) fn notices(event: &RecorderEvent, before: &Before<'_>) -> Vec<Notice>
             C::Capture,
             S::Error,
             "Recorder stopped",
-            "Restart clipuh to capture again.",
+            "Restart clipuh to capture again. The log files have the details.",
         )
         .desktop()),
         _ => Vec::new(),

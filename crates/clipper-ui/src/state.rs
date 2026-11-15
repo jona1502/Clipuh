@@ -384,7 +384,7 @@ impl RecordingState {
             RecorderEvent::Stopped => {
                 self.replay.reset();
                 self.reset_run();
-                self.error = Some("The recorder stopped. Restart Clipper to record again.".into());
+                self.error = Some("The recorder stopped. Restart clipuh to record again; the log files have the details.".into());
             }
         }
     }

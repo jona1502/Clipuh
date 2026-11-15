@@ -1,10 +1,12 @@
 //! Windows platform primitives: COM apartment and the shared D3D11 device.
 #![allow(unsafe_code)]
 
+pub mod dialog;
 pub mod disk;
 pub mod hotkey;
 pub mod notify;
 pub mod shell;
+pub mod single_instance;
 pub mod startup;
 pub mod system_info;
 pub mod tray;

@@ -799,6 +799,7 @@ dependencies = [
  "clipper-encoder",
  "clipper-platform",
  "clipper-replay",
+ "log",
  "windows",
 ]
 

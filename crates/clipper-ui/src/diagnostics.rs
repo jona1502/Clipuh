@@ -103,7 +103,7 @@ pub(crate) fn log_event(event: &RecorderEvent) {
             log::debug!("capture sources listed: {}", sources.len())
         }
         RecorderEvent::ReplayStatus(status) => log_replay_status(status),
-        RecorderEvent::Stopped => log::info!("recorder stopped"),
+        RecorderEvent::Stopped => log::warn!("recorder stopped"),
         RecorderEvent::AudioLevels(_)
         | RecorderEvent::AudioTestStarted
         | RecorderEvent::AudioTestFinished { error: None, .. }
