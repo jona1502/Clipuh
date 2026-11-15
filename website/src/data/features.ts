@@ -69,25 +69,25 @@ export const mixer: FeatureCopy = {
   points: [
     "Desktop audio and microphone with individual gain",
     "Optional separate tracks next to the mixed track",
-    "Per-application sources like game and Discord are planned",
+    "Per-application sources like the game or Discord, each with mute and solo",
   ],
 };
 
 /**
  * Mixer demo sources. `status` controls the "Planned" tag in the demo:
- * desktop + microphone exist in the app; game and Discord isolation do not
- * (they are part of desktop audio today).
+ * the app has game, application (e.g. Discord), desktop and microphone
+ * sources (AudioSourceType in clipper-storage, views/audio.rs).
  */
-export const mixerSources = [
-  { id: "game", label: "Game audio", status: "planned" },
-  { id: "discord", label: "Discord", status: "planned" },
-  { id: "desktop", label: "Desktop audio", status: "in-development" },
-  { id: "microphone", label: "Microphone", status: "in-development" },
-] as const satisfies ReadonlyArray<{
-  id: string;
+export const mixerSources: ReadonlyArray<{
+  id: "game" | "discord" | "desktop" | "microphone";
   label: string;
   status: FeatureStatus;
-}>;
+}> = [
+  { id: "game", label: "Game audio", status: "in-development" },
+  { id: "discord", label: "Discord", status: "in-development" },
+  { id: "desktop", label: "Desktop audio", status: "in-development" },
+  { id: "microphone", label: "Microphone", status: "in-development" },
+];
 
 export const editor: FeatureCopy = {
   id: featureIds.editor,
@@ -98,8 +98,8 @@ export const editor: FeatureCopy = {
   status: "in-development",
   points: [
     "Set in and out points on a preview timeline",
-    "Export copies the streams to a new file without re-encoding",
-    "A multi-track timeline with per-track mute is planned",
+    "Export writes a new MP4 with exact cuts and the enabled audio mix",
+    "Multi-track audio timeline with per-track mute, solo, gain, split and undo",
   ],
 };
 
