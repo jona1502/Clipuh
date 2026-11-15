@@ -159,3 +159,41 @@ test("chapter headings and copy are visible without JavaScript", async ({
   expect(await noHorizontalScroll(page)).toBe(true);
   await context.close();
 });
+
+for (const width of [375, 1440]) {
+  test(`hero window is a preview: Tab skips it at ${width}px`, async ({
+    browser,
+  }) => {
+    const context = await browser.newContext({
+      viewport: { width, height: 900 },
+    });
+    const page = await context.newPage();
+    await page.goto("/");
+    const hero = page.locator("#top");
+    await expect(hero.locator("astro-island").first()).not.toHaveAttribute(
+      "ssr",
+    );
+    // The hero shows another page than the Capture chapter right below.
+    await expect(hero.locator("[data-app-window]")).toHaveAttribute(
+      "data-page",
+      "library",
+    );
+    // The honesty label stays visible and readable.
+    await expect(
+      hero.getByText("Interactive demo · sample data", { exact: true }),
+    ).toBeVisible();
+
+    await hero.getByRole("link", { name: "Take the tour" }).focus();
+    await page.keyboard.press("Tab");
+    const landed = await page.evaluate(() => ({
+      inHero: !!document.activeElement?.closest(".hero-window"),
+      chapter: document.activeElement?.closest("section")?.id ?? null,
+    }));
+    expect(landed.inHero).toBe(false);
+    expect(landed.chapter).toBe("capture");
+    expect(
+      await hero.locator(".hero-window").evaluate((e) => e.scrollTop),
+    ).toBe(0);
+    await context.close();
+  });
+}

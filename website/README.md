@@ -77,19 +77,23 @@ nav links to the four chapters (mobile menu below 768px).
 
 - **Islands.** Every window is one `AppTour` island
   (`interactive/app/AppTour.tsx`): the hero mounts it with `client:idle` on the
-  Capture page, each `TourChapter` with `client:visible` on its own page. The
+  Library page, each `TourChapter` with `client:visible` on its own page. The
   islands share one module-level store (`app/store.ts`, `useSyncExternalStore`),
   so favorites, renames, deletes, accent, theme and top-bar values sync across
   windows. Each window keeps its own current page. Page components are
   `React.lazy` chunks loaded when a window shows them.
 - **Hero choice.** The server render of the hero window is visible at once and
-  the LCP element stays text (Lighthouse 12: mobile LCP 2.5 s on the hero
-  headline block, desktop 0.5 s, CLS 0), so the hero keeps the live island
-  instead of a static image. Below 768px the hero shows the window's top part
-  and fades out; the full window follows in the Capture chapter.
+  the LCP element stays text (Lighthouse 12: mobile LCP 2.5 s, desktop 0.6 s,
+  both on the hero headline block, CLS 0), so the hero keeps the live island
+  instead of a static image (a server-only render would leave the lazy page as
+  a skeleton). The hero window is a preview: it sits in an `inert` wrapper (no
+  focus, no clicks; the demo label stays outside it), so keyboard users go from
+  the hero CTAs straight to the Capture chapter. Below 768px it shows the
+  window's top part with `overflow: clip` and a fade.
 - **JS budget.** At most 150 KB gzip loaded when the first window hydrates.
-  Measured: 84.0 KB (react-dom client 65.7 KB, Dropdown 7.3 KB, AppTour 3.9 KB,
-  CapturePage 3.6 KB, react 3.0 KB, the rest under 2 KB each). Re-measure after
+  Measured: 83.9 KB at hero hydration (react-dom client 65.7 KB, Dropdown
+  7.3 KB, AppTour 3.9 KB, LibraryPage 3.9 KB, react 3.0 KB, the rest under
+  2 KB each), 87.8 KB once the Capture chapter is visible. Re-measure after
   changes: collect the `.js` responses until the hero island hydrates and gzip
   (`-9`) the matching files in `dist/`.
 - **Visual direction.** Raycast-like pacing, own assets only: near-black

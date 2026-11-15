@@ -10,9 +10,13 @@ const directUrl = download.available ? download.url : null;
 const downloadHref = directUrl ?? `#${sections.download}`;
 
 /*
- * Hero window: the Capture page itself, as an island on client:idle. Its
- * server render is visible immediately (no layout shift), the headline stays
- * the LCP element, and React only loads once the browser is idle.
+ * Hero window: the Library page, as an island on client:idle (the Capture
+ * chapter follows right below). The server render is visible immediately
+ * (no layout shift) and the headline stays the LCP element. The window is a
+ * preview: it sits in an `inert` wrapper, so it takes no focus or clicks and
+ * keyboard users go from the CTAs straight to the Capture chapter. The demo
+ * label stays outside the inert part. A server-only render is not an option:
+ * the lazy page would stay a skeleton.
  */
 ---
 
@@ -68,7 +72,9 @@ const downloadHref = directUrl ?? `#${sections.download}`;
           minHeight="32rem"
           class="hero-frame"
         >
-          <AppTour client:idle initialPage="capture" />
+          <div inert class="hero-preview">
+            <AppTour client:idle initialPage="library" />
+          </div>
         </DemoFrame>
       </div>
     </div>
@@ -121,11 +127,12 @@ const downloadHref = directUrl ?? `#${sections.download}`;
       var(--shadow-float);
   }
   /* Phones: the stacked window is tall, so the hero shows its top part
-     and fades out; the full window follows in the Capture chapter. */
+     and fades out; the full windows follow in the chapters. overflow: clip
+     (not hidden) is no scroll container, so nothing can scroll it. */
   @media (max-width: 767px) {
     .hero-window {
       max-height: 34rem;
-      overflow: hidden;
+      overflow: clip;
       mask-image: linear-gradient(180deg, #000 70%, transparent);
     }
   }
