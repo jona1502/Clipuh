@@ -14,8 +14,7 @@ includes a non-destructive editor for trimming them and mixing their audio track
 built with [GPUI](https://github.com/zed-industries/zed) (Zed's UI framework); capture and encoding use Windows Graphics Capture and
 Media Foundation hardware encoders.
 
-> **Status:** early prerelease (0.1.0). There is no installer or public download yet; see
-> [Installation](#installation).
+**[Download Windows x64 Setup](https://github.com/jona1502/Clipuh/releases/download/v0.1.1/clipuh-setup.exe)** · [Latest release](https://github.com/jona1502/Clipuh/releases/latest)
 
 ## Contents
 
@@ -104,12 +103,10 @@ message.
 
 ## Installation
 
-There is no installer and no public download. The
-[Releases page](https://github.com/jona1502/Clipuh/releases) of this private repository has a
-0.1.0 prerelease with a manually attached `clipuh-v0.1.0-windows-x64.exe`, available to people
-with access to the repository. It is not code-signed, so Windows SmartScreen may warn on
-first start. Otherwise, build from source (see [Development](#development)) on a Windows x64
-machine.
+Download `clipuh-setup.exe` from the [latest release](https://github.com/jona1502/Clipuh/releases/latest)
+and run it. Setup installs clipuh for your Windows account and adds a Start menu shortcut.
+The release also includes a portable ZIP. Both downloads are unsigned, so Windows SmartScreen
+may warn on first start.
 
 Settings and clips are stored in your user profile, not next to the executable, so
 replacing the executable keeps them.
