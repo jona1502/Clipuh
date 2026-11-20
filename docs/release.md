@@ -61,7 +61,7 @@ prereleases. Leading zeros, build metadata (`+…`) and other suffixes are rejec
 
 | File | Contents |
 | --- | --- |
-| `clipuh-vX.Y.Z-windows-x64.zip` | `clipuh.exe` |
+| `clipuh-vX.Y.Z-windows-x64.zip` | `clipuh.exe`, `THIRD_PARTY_NOTICES.md` |
 | `clipuh-vX.Y.Z-windows-x64.zip.sha256` | `<sha256>  clipuh-vX.Y.Z-windows-x64.zip` (`sha256sum -c` format) |
 
 `clipuh.exe` is self-contained: icons, sounds and the window icon are compiled in, and Media

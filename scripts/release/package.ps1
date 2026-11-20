@@ -4,7 +4,7 @@
 #
 # Expects `cargo build --release --locked -p clipper-app --bin clipuh` to have
 # run. Writes to -OutDir (default: dist):
-#   clipuh-v<Version>-windows-x64.zip         clipuh.exe at the archive root
+#   clipuh-v<Version>-windows-x64.zip         clipuh.exe and third-party notices
 #   clipuh-v<Version>-windows-x64.zip.sha256  "<hash>  <zip name>" (sha256sum -c)
 #
 # clipuh.exe is self-contained: icons, sounds and the app icon are compiled in,
@@ -42,6 +42,7 @@ New-Item -ItemType Directory -Path $stage -Force | Out-Null
 # Everything the portable build needs at run time.
 $payload = @(
     @{ From = $Exe; To = 'clipuh.exe' }
+    @{ From = Join-Path $PSScriptRoot '../../THIRD_PARTY_NOTICES.md'; To = 'THIRD_PARTY_NOTICES.md' }
 )
 foreach ($item in $payload) {
     Copy-Item -LiteralPath $item.From -Destination (Join-Path $stage $item.To)

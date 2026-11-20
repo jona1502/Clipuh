@@ -28,7 +28,7 @@ the website and is not the app version.
 Git tags are the version with a `v` prefix: `v0.1.0`, `v0.2.0-rc.1`. A release tag must point
 at a commit on `main` whose `Cargo.toml` has exactly that version.
 
-`Cargo.toml` declares **0.1.0**, which has been published as a prerelease (see below).
+`Cargo.toml` declares the version to use for the next release tag.
 
 ## Preparing a release
 
