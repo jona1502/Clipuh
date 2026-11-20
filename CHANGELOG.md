@@ -8,6 +8,14 @@ process: [docs/versioning.md](docs/versioning.md).
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-20
+
+### Fixed
+
+- More reliable instant replay buffering and replay saves. (#62)
+- More reliable recovery from capture and encoder failures. (#61)
+- Safer clip saving and finalization when storage operations fail. (#60)
+
 ## [0.1.0] - 2026-11-15
 
 First prerelease: a GitHub prerelease in the private repository for tag `v0.1.0` (`a7c45d9`),
@@ -54,5 +62,6 @@ release workflow existed.
 - Opening files and folders no longer blocks the UI. (#48)
 - Timeline scrolling, audio track order and the initial window size. (#52)
 
-[Unreleased]: https://github.com/jona1502/Clipuh/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/jona1502/Clipuh/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/jona1502/Clipuh/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/jona1502/Clipuh/releases/tag/v0.1.0
