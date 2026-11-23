@@ -137,7 +137,10 @@ fn run(endpoint: &RecorderEndpoint) {
             emit(endpoint, RecorderEvent::ReplayStopped { error: None });
             continue;
         }
-        if matches!(command, RecorderCommand::SetReplayDuration(_)) {
+        if matches!(
+            command,
+            RecorderCommand::SetReplayDuration(_) | RecorderCommand::SetAudioSources(_)
+        ) {
             continue;
         }
         emit(

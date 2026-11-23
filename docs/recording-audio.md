@@ -32,9 +32,15 @@ the mix never holds a signal twice:
 - Desktop with exactly one application: process loopback EXCLUDE of that
   application ("Desktop (without X)"). It is system-wide, so the chosen output
   device is ignored for this stream.
-- Desktop with two or more applications: no desktop track (Windows can exclude
-  only one tree) and the source shows "Desktop audio is off: ...". Signals are
-  never subtracted.
+- Desktop with two or more applications: Windows process loopback can exclude
+  only one tree, so the remainder is composed instead ("Desktop (without X,
+  Y)"): one process loopback INCLUDE stream per other process that owns an
+  audio session, re-listed once a second and summed in the mixer
+  (`clipper_audio::desktop`). Signals are never subtracted. Audio that cannot
+  be separated (the Windows system sounds session; a process whose tree
+  contains a separated application) is left out of the desktop track and
+  listed in the source's status note instead of being recorded twice. See
+  `docs/quality/audio-routing-live-sources.md`.
 - Microphones: one track per distinct device. A device chosen explicitly that
   is also the Windows default counts as the default when a source follows the
   default, and is reported as a duplicate.
@@ -46,8 +52,16 @@ the mix never holds a signal twice:
 
 Every requested source gets an `AudioSources` status: `Capturing`,
 `Waiting(reason)`, `Starting`, `Failed(message)` or `Skipped(reason)`.
-`Skipped` carries the routing warning (unsupported Windows, duplicate, desktop
-dropped, whole display captured for Game, more than four sources).
+`Skipped` carries the routing warning (unsupported Windows, duplicate, whole
+display captured for Game, more than four sources).
+
+While instant replay runs, source changes (add, remove, enable, disable,
+another device or application) are applied live through
+`RecorderCommand::SetAudioSources`: only the affected capture streams start or
+stop; video, encoder and replay buffer continue. The encoder's audio tracks are
+fixed per session, so a source added live is recorded in the mix and gets its
+own isolated track with the next session. A manual recording keeps its sources
+until it ends.
 
 ## Capability fallback
 

@@ -440,6 +440,15 @@ impl Worker<'_> {
                     test.set_noise_gate(source, settings);
                 }
             }
+            RecorderCommand::SetAudioSources(options) => {
+                // Only instant replay applies source changes live; a manual
+                // recording or audio test keeps its sources until it ends.
+                if let Some(replay) = &mut self.replay
+                    && let Some(states) = replay.reconfigure_audio(&options)
+                {
+                    crate::emit(self.endpoint, RecorderEvent::AudioSources(states));
+                }
+            }
             RecorderCommand::SaveReplay => self.save_replay(),
         }
         true

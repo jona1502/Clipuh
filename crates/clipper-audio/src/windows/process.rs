@@ -164,6 +164,33 @@ fn find_executable_root(name: &str) -> Option<u32> {
         .map(|(_, pid)| pid)
 }
 
+/// Snapshot of the process table (pid, parent pid, executable name) for the
+/// composed desktop remainder. Empty when the snapshot fails.
+pub(crate) fn process_table() -> Vec<crate::desktop::ProcessEntry> {
+    // SAFETY: plain Win32 call; handle wrapped for closing.
+    let Ok(raw) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }) else {
+        return Vec::new();
+    };
+    let snapshot = OwnedHandle(raw);
+    let mut out = Vec::new();
+    let mut entry = PROCESSENTRY32W {
+        dwSize: size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: valid snapshot handle and entry with dwSize set.
+    let mut more = unsafe { Process32FirstW(snapshot.0, &mut entry) }.is_ok();
+    while more {
+        out.push(crate::desktop::ProcessEntry {
+            pid: entry.th32ProcessID,
+            parent: entry.th32ParentProcessID,
+            exe: String::from_utf16_lossy(exe_name(&entry)),
+        });
+        // SAFETY: as above.
+        more = unsafe { Process32NextW(snapshot.0, &mut entry) }.is_ok();
+    }
+    out
+}
+
 /// Lowercases one UTF-16 unit (BMP simple mapping; exe names are ASCII in
 /// practice, and the needle is lowercased with full Unicode rules).
 fn lower_utf16(unit: u16) -> u16 {

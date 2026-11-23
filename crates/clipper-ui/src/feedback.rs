@@ -331,7 +331,10 @@ mod tests {
         let off = ReplayPhase::Off;
         let capturing = [AudioSourceState {
             source: 3,
-            status: AudioSourceStatus::Capturing { track: None },
+            status: AudioSourceStatus::Capturing {
+                track: None,
+                note: None,
+            },
         }];
         let waiting = AudioSourceState {
             source: 3,

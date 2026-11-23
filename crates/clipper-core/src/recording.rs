@@ -261,8 +261,11 @@ pub struct SourceLevel {
 pub enum AudioSourceStatus {
     Starting,
     /// Captured into the session; `track` is its isolated track, if any.
+    /// `note` explains a limitation of what is captured (e.g. applications a
+    /// desktop track cannot contain without duplicating a separated app).
     Capturing {
         track: Option<usize>,
+        note: Option<String>,
     },
     /// Kept in the session but silent right now (application not running,
     /// device gone); capture resumes on its own when it comes back.
@@ -351,6 +354,11 @@ pub enum RecorderCommand {
         source: u32,
         gain_percent: u16,
     },
+    /// The enabled audio sources changed (added, removed, enabled, disabled,
+    /// retargeted). A running instant replay applies the change live,
+    /// without restarting capture, encoder or buffer; a manual recording or
+    /// audio test keeps its sources until it ends.
+    SetAudioSources(RecordingAudioOptions),
     /// Update only this source's gate in the active recording, replay or test.
     SetAudioNoiseGate {
         source: u32,

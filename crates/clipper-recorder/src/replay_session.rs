@@ -29,7 +29,7 @@ use crate::logic::{
     Counters, Failure, FailureKind, OutputWatchdog, SlotTimeline, fit_output_size,
     repeat_lag_ticks, replay_status, replay_warning, valid_replay_duration,
 };
-use crate::recording_audio::{AudioPlan, AudioReporter, RecordingAudio};
+use crate::recording_audio::{AudioPlan, AudioReporter, RecordingAudio, session_window};
 use crate::windows_worker::{encoder_message, round_up_even, signal_handler};
 
 /// Longest wait for a capture/audio wake. Short on purpose: on a static scene
@@ -111,6 +111,8 @@ pub struct ReplaySession {
     encoder: PacketEncoder,
     audio: Option<RecordingAudio>,
     audio_reporter: AudioReporter,
+    /// Captured window that `Game` audio follows, for live source changes.
+    audio_window: Option<u64>,
     buffer: Option<ReplayBuffer>,
     /// Keeps the device alive until everything above is released.
     _d3d: D3DContext,
@@ -198,6 +200,7 @@ impl ReplaySession {
             encoder,
             audio,
             audio_reporter,
+            audio_window: session_window(Some(source)),
             buffer: None,
             _d3d: d3d,
             config: ReplayConfig {
@@ -259,6 +262,22 @@ impl ReplaySession {
     }
 
     /// Source statuses and levels for the UI.
+    /// Applies changed audio sources live (no capture, encoder or buffer
+    /// restart). A session that started without audio has no audio tracks
+    /// to feed; then the returned statuses say a restart is needed.
+    pub fn reconfigure_audio(
+        &mut self,
+        options: &clipper_core::recording::RecordingAudioOptions,
+    ) -> Option<Vec<clipper_core::recording::AudioSourceState>> {
+        match &mut self.audio {
+            Some(audio) => {
+                audio.reconfigure(options);
+                None
+            }
+            None => Some(AudioPlan::for_window(options, self.audio_window).restart_states()),
+        }
+    }
+
     pub fn report_audio(&mut self, endpoint: &RecorderEndpoint) {
         self.audio_reporter.report(endpoint, self.audio.as_mut());
     }
