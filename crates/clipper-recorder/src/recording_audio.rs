@@ -1383,7 +1383,9 @@ mod tests {
             source(4, AudioSourceTarget::Microphone(None)),
         ]);
         let defaults = DefaultDevices::default();
-        assert_eq!(planned_audio_tracks_with(&opts, MODERN, &defaults), 4);
+        // Mix + game + Discord + composed desktop + microphone (the desktop
+        // is no longer dropped when two apps are separated).
+        assert_eq!(planned_audio_tracks_with(&opts, MODERN, &defaults), 5);
         // Legacy: apps dropped, desktop becomes the full mix again.
         assert_eq!(planned_audio_tracks_with(&opts, LEGACY, &defaults), 3);
         for caps in [MODERN, LEGACY] {
