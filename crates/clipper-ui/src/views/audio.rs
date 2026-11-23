@@ -174,7 +174,19 @@ fn overlap_note(names: &[String]) -> Option<String> {
         [one] => Some(format!(
             "Records desktop audio without {one} to avoid double audio"
         )),
-        _ => Some("Skipped while 2+ apps are recorded: Windows can exclude only one app".into()),
+        [rest @ .., last] => Some(format!(
+            "Records desktop audio without {} and {last} to avoid double audio",
+            rest.join(", ")
+        )),
+    }
+}
+
+/// The running session's note on a capturing source (e.g. apps a desktop
+/// track cannot contain), if any.
+fn capturing_note(status: Option<&AudioSourceStatus>) -> Option<String> {
+    match status {
+        Some(AudioSourceStatus::Capturing { note, .. }) => note.clone(),
+        _ => None,
     }
 }
 
@@ -481,6 +493,14 @@ impl ClipperWindow {
 
     // rows
 
+    /// Sends the enabled sources to the recorder. A running instant replay
+    /// applies them live; otherwise the recorder ignores the command and the
+    /// next session uses the saved settings.
+    fn audio_sources_changed(&mut self) {
+        let options = self.config.audio.recording_options();
+        self.send(RecorderCommand::SetAudioSources(options));
+    }
+
     fn audio_toggle(&mut self, id: u32, on: bool, cx: &mut Context<Self>) {
         if on && self.audio_enabled_count() >= MAX_RECORDED_AUDIO_SOURCES {
             self.audio_notice = Some(format!(
@@ -493,6 +513,7 @@ impl ClipperWindow {
             source.enabled = on;
             self.audio_notice = None;
             self.persist_config(cx);
+            self.audio_sources_changed();
             // A disabled soloed row no longer silences the others.
             self.audio_push_gains();
         }
@@ -516,6 +537,7 @@ impl ClipperWindow {
         }
         self.audio_notice = None;
         self.persist_config(cx);
+        self.audio_sources_changed();
         self.audio_push_gains();
     }
 
@@ -633,6 +655,7 @@ impl ClipperWindow {
                 if let Some(source) = self.config.audio.sources.iter_mut().find(|s| s.id == id) {
                     source.target = value;
                     self.persist_config(cx);
+                    self.audio_sources_changed();
                 }
             }
             Some(RowAction::ResetGain) => {
@@ -787,6 +810,9 @@ impl ClipperWindow {
         });
         self.audio_add = None;
         self.persist_config(cx);
+        self.audio_sources_changed();
+        // Solo on another row also silences the new one.
+        self.audio_push_gains();
     }
 
     fn start_audio_test(&mut self, cx: &mut Context<Self>) {
@@ -1474,9 +1500,12 @@ pub(super) fn content(window: &ClipperWindow, cx: &mut Context<ClipperWindow>) -
         {
             text = Some(IDLE_APP_HINT.into());
         }
-        let overlap = (source.kind == AudioSourceType::Desktop && source.enabled)
-            .then(|| overlap_note(&overlap_names))
-            .flatten();
+        // What the running session reports wins over the planned routing.
+        let overlap = capturing_note(state.map(|s| &s.status)).or_else(|| {
+            (source.kind == AudioSourceType::Desktop && source.enabled)
+                .then(|| overlap_note(&overlap_names))
+                .flatten()
+        });
 
         let highlighted = window
             .audio_menu
@@ -1795,9 +1824,16 @@ mod tests {
     fn status_mapping() {
         use AudioSourceStatus::*;
         assert_eq!(
-            row_status(false, Some(&Capturing { track: None }), None)
-                .1
-                .as_deref(),
+            row_status(
+                false,
+                Some(&Capturing {
+                    track: None,
+                    note: None
+                }),
+                None
+            )
+            .1
+            .as_deref(),
             Some("Off")
         );
         assert_eq!(
@@ -1805,7 +1841,14 @@ mod tests {
             (Tone::Neutral, Some("Not capturing".into()), false)
         );
         assert_eq!(
-            row_status(true, Some(&Capturing { track: Some(1) }), None),
+            row_status(
+                true,
+                Some(&Capturing {
+                    track: Some(1),
+                    note: None
+                }),
+                None
+            ),
             (Tone::Success, None, true)
         );
         assert_eq!(row_status(true, Some(&Starting), None).0, Tone::Warning);
@@ -1896,5 +1939,34 @@ mod tests {
             row_labels(AudioSourceType::Application, Some("a.exe"), Some("App")),
             ("App".into(), "a.exe".into())
         );
+    }
+
+    /// Bug 1: with two or more separated apps the desktop row describes the
+    /// composed remainder instead of claiming the desktop is skipped.
+    #[test]
+    fn desktop_note_names_every_separated_app() {
+        assert_eq!(overlap_note(&[]), None);
+        assert_eq!(
+            overlap_note(&["Spotify".into()]).unwrap(),
+            "Records desktop audio without Spotify to avoid double audio"
+        );
+        assert_eq!(
+            overlap_note(&["the game".into(), "Spotify".into(), "Discord".into()]).unwrap(),
+            "Records desktop audio without the game, Spotify and Discord to avoid double audio"
+        );
+    }
+
+    #[test]
+    fn running_note_is_shown_only_while_capturing() {
+        let capturing = AudioSourceStatus::Capturing {
+            track: None,
+            note: Some("Not in desktop audio: explorer.exe".into()),
+        };
+        assert_eq!(
+            capturing_note(Some(&capturing)).as_deref(),
+            Some("Not in desktop audio: explorer.exe")
+        );
+        assert_eq!(capturing_note(Some(&AudioSourceStatus::Starting)), None);
+        assert_eq!(capturing_note(None), None);
     }
 }

@@ -1,20 +1,25 @@
 //! WASAPI to aligned AAC on the recorder worker. No file I/O on capture threads.
 //!
-//! Topology is fixed per session: the [`AudioPlan`] (sources resolved against
-//! the capture source and the Windows version) decides the encoder's track
-//! count before the encoder exists. Enabling, disabling, adding or removing
-//! sources therefore applies to the NEXT session; gain and noise gate changes
-//! are live ([`RecordingAudio::set_gain`], [`RecordingAudio::set_noise_gate`]).
+//! The encoder's track topology is fixed per session: the [`AudioPlan`]
+//! (sources resolved against the capture source and the Windows version)
+//! decides the encoder's track count before the encoder exists. Capture is
+//! not: enabling, disabling, adding, removing or retargeting sources is
+//! applied to a running session by [`RecordingAudio::reconfigure`] (see
+//! [`clipper_audio::live`]); a source added that way feeds the mix, and gets
+//! an isolated track only if it owned one at session start. Gain and noise
+//! gate changes are live ([`RecordingAudio::set_gain`],
+//! [`RecordingAudio::set_noise_gate`]).
 //! Each source passes through its linked stereo gate before ramped gain and
 //! limiting, then feeds both mix and isolated tracks. Thresholds therefore
 //! remain independent of gain, Mute and Solo. Gating changes no timestamps.
 use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant};
 
+use clipper_audio::live::{LiveRouting, LiveTrack};
 use clipper_audio::mixer::TimelineMixer;
-use clipper_audio::routing::{self, RoutingPlan};
+use clipper_audio::routing::{self, PlannedTrack, RoutingPlan};
 use clipper_audio::windows::{
-    AudioCapture, capabilities, executable_of_window, list_devices, qpc_now_ticks,
+    AudioCapture, Finished, capabilities, executable_of_window, list_devices, qpc_now_ticks,
 };
 use clipper_audio::{
     AudioCapabilities, AudioConfig, AudioEvent, AudioSelection, DeviceFlow, MicrophoneChoice,
@@ -50,14 +55,20 @@ impl AudioSink for PacketEncoder {
 /// Meter refresh: ~30 Hz is smooth once the UI interpolates, and cheap.
 const METER_INTERVAL: Duration = Duration::from_millis(33);
 
+/// How often a composed desktop track's unseparable-application list is
+/// re-read for the UI status and the log.
+const NOTE_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Mixer sources resolved against the session's capture source and the
 /// Windows version.
 pub struct AudioPlan {
     sources: Vec<RecordingAudioSource>,
-    selection: AudioSelection,
     routing: RoutingPlan,
     skipped: Vec<(u32, String)>,
     separate: bool,
+    /// Captured window (`None`: display or audio test), kept so live source
+    /// changes resolve `Game` the same way the session start did.
+    window: Option<u64>,
 }
 
 /// Resolves mixer sources to capture requests. `window` is the HWND of the
@@ -201,12 +212,23 @@ fn planned_audio_tracks_with(
     .encoder_tracks() as u32
 }
 
+/// The captured window of a session (`None` for a display or no capture),
+/// which `Game` audio follows.
+pub fn session_window(source: Option<&CaptureSource>) -> Option<u64> {
+    source
+        .filter(|source| source.kind == SourceKind::Window)
+        .map(|source| source.id)
+}
+
 impl AudioPlan {
     /// Plans the audio of a session capturing `source` (`None`: audio test).
     pub fn for_session(options: &RecordingAudioOptions, source: Option<&CaptureSource>) -> Self {
-        let window = source
-            .filter(|source| source.kind == SourceKind::Window)
-            .map(|source| source.id);
+        Self::for_window(options, session_window(source))
+    }
+
+    /// Plans the audio of a session capturing `window` (`None`: a display
+    /// or no capture).
+    pub fn for_window(options: &RecordingAudioOptions, window: Option<u64>) -> Self {
         Self::build(
             options,
             window,
@@ -233,11 +255,26 @@ impl AudioPlan {
         routing.tracks.truncate(MAX_RECORDED_AUDIO_SOURCES);
         Self {
             sources: options.sources.clone(),
-            selection,
             routing,
             skipped,
             separate: options.separate_tracks,
+            window,
         }
+    }
+
+    /// The plan for changed `options` within the running session: same
+    /// captured window and, because the encoder topology cannot change,
+    /// the session's separate-tracks setting.
+    fn replan(&self, options: &RecordingAudioOptions) -> Self {
+        let mut next = Self::build(
+            options,
+            self.window,
+            executable_of_window,
+            capabilities(),
+            &DefaultDevices::query(),
+        );
+        next.separate = self.separate;
+        next
     }
 
     /// Audio tracks of the encoder: the mix plus, when separate tracks are on,
@@ -268,31 +305,48 @@ impl AudioPlan {
             .map_or(100, |s| s.gain_percent.min(MAX_AUDIO_GAIN_PERCENT))
     }
 
-    /// Status of every requested source given the per-track states.
-    fn states(&self, tracks: &[TrackRt]) -> Vec<AudioSourceState> {
+    /// Status of every requested source given the per-track states, the
+    /// session's isolated outputs and sources refused by a live change.
+    fn states(
+        &self,
+        tracks: &[TrackRt],
+        live: &LiveRouting,
+        rejected: &[(u32, String)],
+    ) -> Vec<AudioSourceState> {
         self.sources
             .iter()
             .map(|source| {
-                let status = match tracks
-                    .iter()
-                    .enumerate()
-                    .find(|(_, track)| track.source == source.id)
-                {
-                    Some((index, track)) => match &track.live {
+                let status = match tracks.iter().find(|track| track.source == source.id) {
+                    Some(track) => match &track.live {
                         Live::Starting => AudioSourceStatus::Starting,
-                        Live::Capturing => AudioSourceStatus::Capturing {
-                            track: self.separate.then_some(index + 1),
-                        },
+                        Live::Capturing => {
+                            let output = live.output_of(source.id).map(|o| o + 1);
+                            let note = if self.separate && output.is_none() {
+                                Some(
+                                    "Recorded in the mix; its own track starts with the next session."
+                                        .to_owned(),
+                                )
+                            } else {
+                                track.note.clone()
+                            };
+                            AudioSourceStatus::Capturing {
+                                track: output,
+                                note,
+                            }
+                        }
                         Live::Waiting(reason) => AudioSourceStatus::Waiting(reason.clone()),
                         Live::Failed(message) => AudioSourceStatus::Failed(message.clone()),
                     },
-                    None => AudioSourceStatus::Skipped(
-                        self.skipped
-                            .iter()
-                            .find(|(id, _)| *id == source.id)
-                            .map_or("Not available.", |(_, reason)| reason.as_str())
-                            .to_owned(),
-                    ),
+                    None => match rejected.iter().find(|(id, _)| *id == source.id) {
+                        Some((_, reason)) => AudioSourceStatus::Failed(reason.clone()),
+                        None => AudioSourceStatus::Skipped(
+                            self.skipped
+                                .iter()
+                                .find(|(id, _)| *id == source.id)
+                                .map_or("Not available.", |(_, reason)| reason.as_str())
+                                .to_owned(),
+                        ),
+                    },
                 };
                 AudioSourceState {
                     source: source.id,
@@ -304,7 +358,21 @@ impl AudioPlan {
 
     /// States of a session that captures no audio (every source skipped).
     pub fn idle_states(&self) -> Vec<AudioSourceState> {
-        self.states(&[])
+        self.states(&[], &LiveRouting::default(), &[])
+    }
+
+    /// States of a session that was started without audio and cannot gain
+    /// audio tracks while it runs: every enabled source waits for a restart.
+    pub fn restart_states(&self) -> Vec<AudioSourceState> {
+        self.sources
+            .iter()
+            .map(|source| AudioSourceState {
+                source: source.id,
+                status: AudioSourceStatus::Skipped(
+                    "This session started without audio; restart it to record audio.".to_owned(),
+                ),
+            })
+            .collect()
     }
 }
 
@@ -316,9 +384,10 @@ enum Live {
     Failed(String),
 }
 
-/// Runtime state of one capture track. Its index is the capture and mixer
-/// track index; the isolated stream is `index + 1`.
+/// Runtime state of one capture track.
 struct TrackRt {
+    /// Capture and mixer track index (unique within the session).
+    index: usize,
     source: u32,
     /// Executable of an application track. These may be absent without
     /// failing the session.
@@ -328,6 +397,32 @@ struct TrackRt {
     quiet_ok: bool,
     live: Live,
     gain: f32,
+    /// Started by a live source change. Its failure only marks the source
+    /// `Failed`: adding a broken device must not end a running replay.
+    live_added: bool,
+    /// Status note (applications a composed desktop cannot contain).
+    note: Option<String>,
+}
+
+impl TrackRt {
+    fn new(index: usize, planned: &PlannedTrack, gain: f32, live_added: bool) -> Self {
+        Self {
+            index,
+            source: planned.source,
+            process: match &planned.content {
+                TrackContent::Application(exe) => Some(exe.clone()),
+                _ => None,
+            },
+            quiet_ok: matches!(
+                planned.content,
+                TrackContent::DesktopExcluding(_) | TrackContent::DesktopExcludingMany(_)
+            ),
+            live: Live::Starting,
+            gain,
+            live_added,
+            note: None,
+        }
+    }
 }
 
 impl TrackRt {
@@ -354,7 +449,7 @@ fn transition(rt: &TrackRt, tolerant: bool, event: AudioEvent) -> Result<Option<
             None => return Err(format!("Audio source lost: {reason}")),
         },
         AudioEvent::Failed { message, .. } => {
-            if rt.process.is_none() {
+            if rt.process.is_none() && !rt.live_added {
                 return Err(format!("Audio capture failed: {message}"));
             }
             Some(Live::Failed(message))
@@ -364,11 +459,41 @@ fn transition(rt: &TrackRt, tolerant: bool, event: AudioEvent) -> Result<Option<
     })
 }
 
+/// A desktop or microphone track whose device is not present cannot start:
+/// an actionable error instead of a stream that never delivers.
+fn check_device(planned: &PlannedTrack) -> Result<(), String> {
+    let (flow, selected) = match &planned.stream {
+        routing::StreamPlan::EndpointLoopback(device) => (DeviceFlow::Render, device.as_ref()),
+        routing::StreamPlan::Microphone(MicrophoneChoice::Device(id)) => {
+            (DeviceFlow::Capture, Some(id))
+        }
+        routing::StreamPlan::Microphone(MicrophoneChoice::Default) => (DeviceFlow::Capture, None),
+        // Process loopback is system-wide: no device to check.
+        _ => return Ok(()),
+    };
+    let devices = list_devices(flow).map_err(|e| e.to_string())?;
+    if devices
+        .iter()
+        .any(|d| selected.map_or(d.is_default, |id| &d.id == id))
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "Selected {flow:?} audio device is unavailable. Select an available device or disable this source."
+        ))
+    }
+}
+
 pub struct RecordingAudio {
     capture: AudioCapture,
     mixer: TimelineMixer,
     plan: AudioPlan,
     tracks: Vec<TrackRt>,
+    /// Running tracks and the session's fixed isolated outputs.
+    live: LiveRouting,
+    /// Sources a live change could not start: `(source id, reason)`.
+    rejected: Vec<(u32, String)>,
+    last_note_check: Instant,
     origin: i64,
     initial_dropped: u64,
     /// Replay: dropped and late audio is counted and rendered as silence, and
@@ -393,51 +518,37 @@ impl RecordingAudio {
         if plan.routing.tracks.is_empty() {
             return Ok(None);
         }
-        for request in &plan.selection.sources {
-            if !plan.routing.tracks.iter().any(|t| t.source == request.id) {
-                continue;
-            }
-            let (flow, selected) = match &request.kind {
-                SourceRequestKind::Desktop { device } => (DeviceFlow::Render, device.as_ref()),
-                SourceRequestKind::Microphone(MicrophoneChoice::Device(id)) => {
-                    (DeviceFlow::Capture, Some(id))
-                }
-                SourceRequestKind::Microphone(MicrophoneChoice::Default) => {
-                    (DeviceFlow::Capture, None)
-                }
-                SourceRequestKind::Process(_) => continue,
-            };
-            let devices = list_devices(flow).map_err(|e| e.to_string())?;
-            if !devices
-                .iter()
-                .any(|d| selected.map_or(d.is_default, |id| &d.id == id))
-            {
-                return Err(format!(
-                    "Selected {flow:?} audio device is unavailable. Select an available device or disable this source."
-                ));
-            }
+        for planned in &plan.routing.tracks {
+            check_device(planned)?;
         }
         let capture = AudioCapture::start_plan(&plan.routing, AudioConfig::default(), Some(wake))
             .map_err(|e| e.to_string())?;
-        let tracks: Vec<TrackRt> = capture
+        // The engine starts the plan's tracks in order.
+        let started: Vec<LiveTrack> = capture
             .tracks()
             .iter()
-            .map(|t| TrackRt {
-                source: t.source,
-                process: match &t.content {
-                    TrackContent::Application(exe) => Some(exe.clone()),
-                    _ => None,
-                },
-                quiet_ok: matches!(t.content, TrackContent::DesktopExcluding(_)),
-                live: Live::Starting,
-                gain: f32::from(plan.gain_percent(t.source)) / 100.0,
+            .zip(&plan.routing.tracks)
+            .map(|(info, planned)| LiveTrack {
+                index: info.index,
+                planned: planned.clone(),
             })
             .collect();
+        let tracks: Vec<TrackRt> = started
+            .iter()
+            .map(|t| {
+                let gain = f32::from(plan.gain_percent(t.planned.source)) / 100.0;
+                TrackRt::new(t.index, &t.planned, gain, false)
+            })
+            .collect();
+        let live = LiveRouting::new(started, plan.separate);
         let mut this = Self {
             capture,
             mixer: TimelineMixer::new(0, Vec::new(), false),
             plan,
             tracks,
+            live,
+            rejected: Vec::new(),
+            last_note_check: Instant::now(),
             origin: 0,
             initial_dropped: 0,
             tolerant: false,
@@ -470,15 +581,13 @@ impl RecordingAudio {
             }
         }
         this.origin = qpc_now_ticks();
-        this.mixer = TimelineMixer::new(
-            this.origin,
-            this.tracks.iter().map(|t| t.gain).collect(),
-            this.plan.separate,
-        );
-        for (index, track) in this.tracks.iter().enumerate() {
+        this.mixer = TimelineMixer::with_outputs(this.origin, this.live.outputs());
+        for track in &this.tracks {
+            this.mixer
+                .add_source(track.index, track.gain, this.live.output_of(track.source));
             if let Some(source) = this.plan.sources.iter().find(|s| s.id == track.source) {
-                this.mixer.set_noise_gate(index, source.noise_gate);
-                this.mixer.reset_noise_gate(index);
+                this.mixer.set_noise_gate(track.index, source.noise_gate);
+                this.mixer.reset_noise_gate(track.index);
             }
         }
         this.initial_dropped = this.capture.dropped_frames();
@@ -496,7 +605,8 @@ impl RecordingAudio {
             | AudioEvent::Overflow { track, .. }
             | AudioEvent::Failed { track, .. } => *track,
         };
-        let Some(rt) = self.tracks.get_mut(index) else {
+        // Events of removed tracks (unknown index) are stale: ignored.
+        let Some(rt) = self.tracks.iter_mut().find(|t| t.index == index) else {
             return Ok(());
         };
         if matches!(
@@ -526,7 +636,55 @@ impl RecordingAudio {
 
     /// Current state of every requested source.
     pub fn states(&self) -> Vec<AudioSourceState> {
-        self.plan.states(&self.tracks)
+        self.plan.states(&self.tracks, &self.live, &self.rejected)
+    }
+
+    /// Applies changed audio sources to the running session without touching
+    /// video, the encoder or the replay buffer (see [`clipper_audio::live`]).
+    /// Sources that cannot start are reported `Failed`, never as capturing.
+    pub fn reconfigure(&mut self, options: &RecordingAudioOptions) {
+        let next = self.plan.replan(options);
+        let gain_of = |source: u32| f32::from(next.gain_percent(source)) / 100.0;
+        let change = self.live.apply(
+            &next.routing,
+            &mut self.capture,
+            &mut self.mixer,
+            gain_of,
+            check_device,
+        );
+        for removed in &change.removed {
+            self.tracks.retain(|t| t.index != removed.index);
+        }
+        for added in &change.added {
+            let gain = gain_of(added.planned.source);
+            self.tracks
+                .push(TrackRt::new(added.index, &added.planned, gain, true));
+        }
+        // Plan order, like the running tracks.
+        let order: Vec<usize> = self.live.tracks().iter().map(|t| t.index).collect();
+        self.tracks
+            .sort_by_key(|t| order.iter().position(|i| *i == t.index));
+        for track in &mut self.tracks {
+            track.gain = gain_of(track.source);
+            self.mixer.set_gain(track.index, track.gain);
+            if let Some(source) = next.sources.iter().find(|s| s.id == track.source) {
+                self.mixer.set_noise_gate(track.index, source.noise_gate);
+            }
+        }
+        for added in &change.added {
+            self.mixer.reset_noise_gate(added.index);
+        }
+        if !change.is_empty() {
+            log::info!(
+                "audio sources changed live: +{} -{} failed {:?}",
+                change.added.len(),
+                change.removed.len(),
+                change.failed
+            );
+        }
+        self.rejected = change.failed;
+        self.plan = next;
+        self.changed = true;
     }
 
     /// The states, once, after they changed since the last call.
@@ -537,9 +695,9 @@ impl RecordingAudio {
     /// Post-gain peak of every captured source.
     pub fn levels(&mut self) -> Vec<SourceLevel> {
         let mut out: Vec<SourceLevel> = Vec::new();
-        for (index, track) in self.tracks.iter().enumerate() {
+        for track in &self.tracks {
             // Held peak since the last report: no transient or clip is missed.
-            let peak = self.mixer.take_peak(index);
+            let peak = self.mixer.take_peak(track.index);
             match out.iter_mut().find(|l| l.source == track.source) {
                 Some(level) => level.peak = level.peak.max(peak),
                 None => out.push(SourceLevel {
@@ -556,10 +714,10 @@ impl RecordingAudio {
     pub fn set_gain(&mut self, source: u32, gain_percent: u16) -> bool {
         let gain = f32::from(gain_percent.min(MAX_AUDIO_GAIN_PERCENT)) / 100.0;
         let mut found = false;
-        for (index, track) in self.tracks.iter_mut().enumerate() {
+        for track in &mut self.tracks {
             if track.source == source {
                 track.gain = gain;
-                self.mixer.set_gain(index, gain);
+                self.mixer.set_gain(track.index, gain);
                 found = true;
             }
         }
@@ -567,9 +725,9 @@ impl RecordingAudio {
     }
 
     pub fn set_noise_gate(&mut self, source: u32, settings: NoiseGateSettings) {
-        for (index, track) in self.tracks.iter().enumerate() {
+        for track in &self.tracks {
             if track.source == source {
-                self.mixer.set_noise_gate(index, settings);
+                self.mixer.set_noise_gate(track.index, settings);
             }
         }
     }
@@ -614,11 +772,9 @@ impl RecordingAudio {
     /// event channel.
     fn check_latched_failure(&self) -> Result<(), String> {
         if !self.tolerant
-            && self
-                .tracks
-                .iter()
-                .enumerate()
-                .any(|(i, t)| !t.loss_is_routine() && self.capture.track_failed(i))
+            && self.tracks.iter().any(|t| {
+                !t.loss_is_routine() && !t.live_added && self.capture.track_failed(t.index)
+            })
         {
             return Err("An audio source failed; recording is incomplete.".into());
         }
@@ -632,17 +788,29 @@ impl RecordingAudio {
 
     /// Moves captured packets into the mixer and applies capture events.
     fn ingest(&mut self, finish: bool) -> Result<(), String> {
+        let push = |mixer: &mut TimelineMixer, frame: clipper_audio::AudioFrameRef<'_>| {
+            mixer.push_input(
+                frame.track,
+                frame.input,
+                frame.timestamp,
+                frame.channels,
+                frame.samples,
+            )
+        };
         if finish {
-            self.capture.stop_and_drain(|frame| {
-                self.mixer
-                    .push(frame.track, frame.timestamp, frame.channels, frame.samples)
-            });
+            self.capture
+                .stop_and_drain(|frame| push(&mut self.mixer, frame));
         } else {
-            self.capture.read_frames(|frame| {
-                self.mixer
-                    .push(frame.track, frame.timestamp, frame.channels, frame.samples)
-            });
+            self.capture
+                .read_frames(|frame| push(&mut self.mixer, frame));
         }
+        for finished in self.capture.take_finished() {
+            // Removed tracks were retired in the mixer when removed.
+            if let Finished::Input { track, input } = finished {
+                self.mixer.retire_input(track, input);
+            }
+        }
+        self.refresh_notes();
         self.check_latched_failure()?;
         let dropped = self
             .capture
@@ -656,14 +824,38 @@ impl RecordingAudio {
         self.drain_events()
     }
 
+    /// Re-reads (at most once a second) which applications a composed
+    /// desktop track cannot contain, for its status and the log.
+    fn refresh_notes(&mut self) {
+        if self.last_note_check.elapsed() < NOTE_INTERVAL {
+            return;
+        }
+        self.last_note_check = Instant::now();
+        for track in &mut self.tracks {
+            let names = self.capture.unseparable(track.index);
+            let note = (!names.is_empty()).then(|| {
+                format!(
+                    "Not in desktop audio (would duplicate a separated app): {}",
+                    names.join(", ")
+                )
+            });
+            if note != track.note {
+                if let Some(note) = &note {
+                    log::warn!("audio source {}: {note}", track.source);
+                }
+                track.note = note;
+                self.changed = true;
+            }
+        }
+    }
+
     /// A device track that never delivered a sample fails a finished clip;
     /// application tracks and desktop remainders may legitimately have stayed
     /// silent.
     fn missing_device_audio(&self) -> bool {
-        self.tracks
-            .iter()
-            .enumerate()
-            .any(|(i, t)| t.process.is_none() && !t.quiet_ok && !self.mixer.has_received(i))
+        self.tracks.iter().any(|t| {
+            t.process.is_none() && !t.quiet_ok && !t.live_added && !self.mixer.has_received(t.index)
+        })
     }
 
     pub fn pump(
@@ -1083,18 +1275,22 @@ mod tests {
             MODERN,
             &DefaultDevices::default(),
         );
-        // Two apps: the desktop remainder cannot exist and says why.
+        // Two apps: the desktop remainder is composed without both (Bug 1
+        // regression: it used to be skipped as "Desktop audio is off").
         assert_eq!(
             plan.labels(),
-            ["Mix", "game.exe", "Discord.exe", "Microphone"]
+            [
+                "Mix",
+                "game.exe",
+                "Discord.exe",
+                "Desktop (without game.exe, Discord.exe)",
+                "Microphone"
+            ]
         );
-        assert_eq!(plan.encoder_tracks(), 4);
-        assert!(matches!(
-            status_of(&plan, 3),
-            AudioSourceStatus::Skipped(m) if m.contains("Desktop audio is off")
-        ));
+        assert_eq!(plan.encoder_tracks(), 5);
+        assert!(plan.skipped.is_empty(), "{:?}", plan.skipped);
         let planned: Vec<u32> = plan.routing.tracks.iter().map(|t| t.source).collect();
-        assert_eq!(planned, [1, 2, 4]);
+        assert_eq!(planned, [1, 2, 3, 4]);
     }
 
     #[test]
@@ -1202,12 +1398,133 @@ mod tests {
 
     fn track(process: Option<&str>, quiet_ok: bool) -> TrackRt {
         TrackRt {
+            index: 0,
             source: 1,
             process: process.map(str::to_owned),
             quiet_ok,
             live: Live::Capturing,
             gain: 1.0,
+            live_added: false,
+            note: None,
         }
+    }
+
+    /// TEST J / M: a device source added live that fails, or whose worker
+    /// exits, is reported `Failed` and never shown as capturing; it does not
+    /// end the replay (other sources keep recording).
+    #[test]
+    fn failed_live_added_device_is_failed_not_fatal() {
+        let mut rt = track(None, false);
+        rt.live_added = true;
+        for tolerant in [false, true] {
+            assert_eq!(
+                transition(&rt, tolerant, failed("activation failed")),
+                Ok(Some(Live::Failed("activation failed".into())))
+            );
+        }
+        // Devices present at session start keep their strict policy.
+        assert!(transition(&track(None, false), true, failed("gone")).is_err());
+    }
+
+    /// TEST M: a stream that exits after starting is reported, not kept
+    /// as capturing.
+    #[test]
+    fn worker_loss_after_start_leaves_capturing() {
+        let rt = track(None, false);
+        assert_eq!(
+            transition(&rt, true, lost("device removed")),
+            Ok(Some(Live::Waiting("device removed".into())))
+        );
+        let app = track(Some("Spotify.exe"), false);
+        assert_eq!(
+            transition(&app, true, lost("process exited")),
+            Ok(Some(Live::Waiting("Spotify.exe is not running".into())))
+        );
+    }
+
+    /// Status mapping of a running session: isolated tracks follow the
+    /// session's fixed outputs, a live-added source in a separate-tracks
+    /// session is honestly "mix only", refused sources are `Failed`, and
+    /// the composed desktop carries its limitation note.
+    #[test]
+    fn states_report_outputs_refusals_and_notes() {
+        let caps = MODERN;
+        let opts = RecordingAudioOptions {
+            sources: vec![
+                source(1, AudioSourceTarget::Desktop(None)),
+                source(2, AudioSourceTarget::Application("Spotify.exe".into())),
+                source(3, AudioSourceTarget::Application("Discord.exe".into())),
+                source(4, AudioSourceTarget::Microphone(None)),
+            ],
+            separate_tracks: true,
+        };
+        let plan = AudioPlan::build(&opts, None, |_| None, caps, &DefaultDevices::default());
+        // Bug 1: the desktop is planned (composed) next to both apps.
+        assert_eq!(plan.routing.tracks.len(), 4);
+        assert!(plan.skipped.is_empty(), "{:?}", plan.skipped);
+        let started: Vec<LiveTrack> = plan.routing.tracks[..3]
+            .iter()
+            .enumerate()
+            .map(|(index, planned)| LiveTrack {
+                index,
+                planned: planned.clone(),
+            })
+            .collect();
+        let live = LiveRouting::new(started, true);
+        let mut tracks: Vec<TrackRt> = live
+            .tracks()
+            .iter()
+            .map(|t| {
+                let mut rt = TrackRt::new(t.index, &t.planned, 1.0, false);
+                rt.live = Live::Capturing;
+                rt
+            })
+            .collect();
+        tracks[0].note = Some("Not in desktop audio: explorer.exe".into());
+        assert!(tracks[0].quiet_ok);
+        // Source 4 was added live and is capturing (mix only).
+        let mut mic = TrackRt::new(9, &plan.routing.tracks[3], 1.0, true);
+        mic.live = Live::Capturing;
+        tracks.push(mic);
+        let states = plan.states(&tracks, &live, &[]);
+        let status = |id: u32| {
+            states
+                .iter()
+                .find(|s| s.source == id)
+                .unwrap()
+                .status
+                .clone()
+        };
+        assert_eq!(
+            status(1),
+            AudioSourceStatus::Capturing {
+                track: Some(1),
+                note: Some("Not in desktop audio: explorer.exe".into())
+            }
+        );
+        assert_eq!(
+            status(3),
+            AudioSourceStatus::Capturing {
+                track: Some(3),
+                note: None
+            }
+        );
+        assert!(matches!(
+            status(4),
+            AudioSourceStatus::Capturing {
+                track: None,
+                note: Some(_)
+            }
+        ));
+        let refused = plan.states(
+            &tracks[..3],
+            &live,
+            &[(4, "Selected Capture audio device is unavailable.".into())],
+        );
+        assert_eq!(
+            refused[3].status,
+            AudioSourceStatus::Failed("Selected Capture audio device is unavailable.".into())
+        );
     }
 
     fn lost(reason: &str) -> AudioEvent {

@@ -11,9 +11,12 @@
 //! - desktop with no separately captured process: endpoint loopback, labelled
 //!   "full mix",
 //! - desktop with exactly one separately captured process: EXCLUDE that one,
-//! - desktop with two or more: impossible with a single exclusion, so no
-//!   desktop track is planned and a warning explains why. Subtracting signals
-//!   is not attempted: loopback copies are not sample-aligned.
+//! - desktop with two or more: one exclusion cannot express it (the Windows
+//!   process loopback parameters take ONE target process id), so the desktop
+//!   remainder is composed instead: one INCLUDE stream per other process that
+//!   owns an audio session, summed in the mixer (see [`crate::desktop`]).
+//!   Subtracting signals is never attempted: loopback copies are not
+//!   sample-aligned.
 //! - microphones are independent devices, one track per distinct choice.
 
 use crate::types::{
@@ -32,7 +35,23 @@ pub enum StreamPlan {
     /// While the target is not running the remainder equals the full mix, so
     /// backends may capture endpoint loopback until the target appears.
     ProcessExclude(ProcessTarget),
+    /// Everything except these process trees (two or more), composed from
+    /// per-process INCLUDE streams of every other process with an audio
+    /// session. System-wide like `ProcessExclude`. Audio that cannot be
+    /// attributed to a separable process (see [`crate::desktop`]) is missing
+    /// from this track and reported, never captured twice.
+    DesktopComposite(Vec<ProcessTarget>),
     Microphone(MicrophoneChoice),
+}
+
+impl StreamPlan {
+    /// Needs WASAPI process loopback.
+    pub fn needs_process_loopback(&self) -> bool {
+        matches!(
+            self,
+            Self::ProcessInclude(_) | Self::ProcessExclude(_) | Self::DesktopComposite(_)
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,8 +66,6 @@ pub struct PlannedTrack {
 pub enum RoutingWarning {
     /// Process loopback needs Windows 10 build 20348+ / Windows 11.
     ProcessLoopbackUnsupported,
-    /// Desktop remainder with two or more separate apps cannot be captured.
-    DesktopRemainderUnavailable,
     /// Same source selected more than once; recorded only once.
     Duplicate,
 }
@@ -58,10 +75,6 @@ impl RoutingWarning {
         match self {
             Self::ProcessLoopbackUnsupported => {
                 "Per-app audio needs Windows 11 (or Windows 10 build 20348+)."
-            }
-            Self::DesktopRemainderUnavailable => {
-                "Desktop audio is off: Windows can exclude only one app from desktop capture, \
-                 so other desktop sounds cannot be separated from several apps."
             }
             Self::Duplicate => "This source is already recorded by another entry.",
         }
@@ -146,13 +159,50 @@ pub fn plan(selection: &AudioSelection, caps: AudioCapabilities) -> RoutingPlan 
                         content: TrackContent::DesktopExcluding(app_name(target)),
                         stream: StreamPlan::ProcessExclude((*target).clone()),
                     }),
-                    _ => out
-                        .warnings
-                        .push((id, RoutingWarning::DesktopRemainderUnavailable)),
+                    many => out.tracks.push(PlannedTrack {
+                        source: id,
+                        content: TrackContent::DesktopExcludingMany(
+                            many.iter().map(|t| app_name(t)).collect(),
+                        ),
+                        stream: StreamPlan::DesktopComposite(
+                            many.iter().map(|t| (*t).clone()).collect(),
+                        ),
+                    }),
                 }
             }
         }
     }
+    out
+}
+
+/// How a running set of tracks becomes a new plan (live source changes).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RoutingDiff {
+    /// Positions in `running` to stop.
+    pub remove: Vec<usize>,
+    /// Tracks of `next` to start, in plan order.
+    pub add: Vec<PlannedTrack>,
+}
+
+/// Minimal change from `running` to `next`. A track survives only when its
+/// source, content and stream are all unchanged, so it keeps capturing
+/// without a gap; anything else (another device, another application, a
+/// desktop whose exclusions changed) is stopped and started anew. Every
+/// running track is matched at most once, so a duplicate can never survive.
+pub fn diff(running: &[PlannedTrack], next: &RoutingPlan) -> RoutingDiff {
+    let mut kept = vec![false; running.len()];
+    let mut out = RoutingDiff::default();
+    for track in &next.tracks {
+        match running
+            .iter()
+            .enumerate()
+            .find(|(i, r)| !kept[*i] && *r == track)
+        {
+            Some((i, _)) => kept[i] = true,
+            None => out.add.push(track.clone()),
+        }
+    }
+    out.remove = (0..running.len()).filter(|i| !kept[*i]).collect();
     out
 }
 
@@ -227,6 +277,14 @@ mod tests {
                     assert!(
                         includes.iter().all(|i| *i == excluded),
                         "remainder excluding {excluded:?} overlaps {includes:?}"
+                    )
+                }
+                StreamPlan::DesktopComposite(excluded) => {
+                    remainders += 1;
+                    assert!(excluded.len() >= 2, "composite for {excluded:?}");
+                    assert!(
+                        includes.iter().all(|i| excluded.contains(i)),
+                        "composite excluding {excluded:?} overlaps {includes:?}"
                     )
                 }
                 _ => {}
@@ -319,18 +377,130 @@ mod tests {
         assert_disjoint(&plan);
     }
 
+    /// Regression (Bug 1): Desktop + Spotify + Discord used to plan no
+    /// desktop track at all (`DesktopRemainderUnavailable`), so everything
+    /// else (game audio) was silently lost. Desktop must stay planned.
     #[test]
-    fn desktop_and_two_apps_drops_desktop_with_warning() {
+    fn desktop_and_two_apps_keeps_desktop_as_composite() {
         let plan = plan(
-            &sel(vec![app(1, "a.exe"), desktop(2, None), app(3, "b.exe")]),
+            &sel(vec![
+                desktop(1, None),
+                app(2, "Spotify.exe"),
+                app(3, "Discord.exe"),
+            ]),
             SUPPORTED,
         );
-        assert_eq!(plan.tracks.len(), 2);
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
         assert_eq!(
-            plan.warnings,
-            [(2, RoutingWarning::DesktopRemainderUnavailable)]
+            contents(&plan),
+            [
+                TrackContent::DesktopExcludingMany(vec![
+                    "Spotify.exe".into(),
+                    "Discord.exe".into()
+                ]),
+                TrackContent::Application("Spotify.exe".into()),
+                TrackContent::Application("Discord.exe".into()),
+            ]
+        );
+        assert_eq!(
+            plan.tracks[0].stream,
+            StreamPlan::DesktopComposite(vec![exe("Spotify.exe"), exe("Discord.exe")])
+        );
+        assert_eq!(
+            contents(&plan)[0].label(),
+            "Desktop (without Spotify.exe, Discord.exe)"
         );
         assert_disjoint(&plan);
+    }
+
+    /// Desktop + two apps + an unrelated app that is not separated: the
+    /// unrelated one stays in the desktop remainder (not excluded).
+    #[test]
+    fn unseparated_apps_stay_in_the_desktop_remainder() {
+        let plan = plan(
+            &sel(vec![
+                app(1, "a.exe"),
+                desktop(2, None),
+                app(3, "b.exe"),
+                mic(4, MicrophoneChoice::Default),
+            ]),
+            SUPPORTED,
+        );
+        assert_eq!(plan.tracks.len(), 4);
+        assert_eq!(
+            plan.tracks[1].stream,
+            StreamPlan::DesktopComposite(vec![exe("a.exe"), exe("b.exe")])
+        );
+        assert_disjoint(&plan);
+    }
+
+    #[test]
+    fn source_ids_never_collide_across_many_sources() {
+        let plan = plan(
+            &sel(vec![
+                desktop(1, None),
+                app(2, "a.exe"),
+                app(3, "b.exe"),
+                app(4, "c.exe"),
+                mic(5, MicrophoneChoice::Default),
+            ]),
+            SUPPORTED,
+        );
+        let mut ids: Vec<u32> = plan.tracks.iter().map(|t| t.source).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), plan.tracks.len());
+        assert_disjoint(&plan);
+    }
+
+    #[test]
+    fn diff_keeps_unchanged_tracks_and_replaces_reshaped_desktop() {
+        let before = plan(&sel(vec![desktop(1, None), app(2, "a.exe")]), SUPPORTED);
+        let after = plan(
+            &sel(vec![desktop(1, None), app(2, "a.exe"), app(3, "b.exe")]),
+            SUPPORTED,
+        );
+        let d = diff(&before.tracks, &after);
+        // The app track keeps running; the desktop changes shape.
+        assert_eq!(d.remove, [0]);
+        assert_eq!(d.add.iter().map(|t| t.source).collect::<Vec<_>>(), [1, 3]);
+        assert!(matches!(d.add[0].stream, StreamPlan::DesktopComposite(_)));
+    }
+
+    #[test]
+    fn diff_of_identical_plans_is_empty_and_removal_stops_only_that_track() {
+        let full = plan(
+            &sel(vec![desktop(1, None), mic(2, MicrophoneChoice::Default)]),
+            SUPPORTED,
+        );
+        assert_eq!(diff(&full.tracks, &full), RoutingDiff::default());
+        let no_mic = plan(&sel(vec![desktop(1, None)]), SUPPORTED);
+        assert_eq!(
+            diff(&full.tracks, &no_mic),
+            RoutingDiff {
+                remove: vec![1],
+                add: vec![]
+            }
+        );
+    }
+
+    #[test]
+    fn diff_changed_device_restarts_only_that_source() {
+        let a = plan(
+            &sel(vec![desktop(1, None), mic(2, MicrophoneChoice::Default)]),
+            SUPPORTED,
+        );
+        let b = plan(
+            &sel(vec![
+                desktop(1, None),
+                mic(2, MicrophoneChoice::Device("usb".into())),
+            ]),
+            SUPPORTED,
+        );
+        let d = diff(&a.tracks, &b);
+        assert_eq!(d.remove, [1]);
+        assert_eq!(d.add.len(), 1);
+        assert_eq!(d.add[0].source, 2);
     }
 
     #[test]

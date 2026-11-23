@@ -353,6 +353,11 @@ impl StreamThread {
         self.stop.signal();
     }
 
+    /// Whether the thread has exited (joining it then does not block).
+    pub fn is_finished(&self) -> bool {
+        self.thread.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
     /// Signals stop and joins the thread.
     pub fn stop(mut self) {
         self.shutdown();

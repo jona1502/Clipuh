@@ -87,6 +87,9 @@ pub enum TrackContent {
     DesktopFull,
     /// Desktop playback without the process tree of this executable.
     DesktopExcluding(String),
+    /// Desktop playback without these (two or more) applications, composed
+    /// from per-process streams (see [`crate::desktop`]).
+    DesktopExcludingMany(Vec<String>),
     Microphone,
 }
 
@@ -96,6 +99,7 @@ impl TrackContent {
             Self::Application(name) => name.clone(),
             Self::DesktopFull => "Desktop (full mix)".to_owned(),
             Self::DesktopExcluding(name) => format!("Desktop (without {name})"),
+            Self::DesktopExcludingMany(names) => format!("Desktop (without {})", names.join(", ")),
             Self::Microphone => "Microphone".to_owned(),
         }
     }
@@ -126,6 +130,10 @@ pub struct FrameFlags {
 #[derive(Clone, Copy, Debug)]
 pub struct AudioFrameRef<'a> {
     pub track: usize,
+    /// Capture stream of the track that delivered the packet. A track has a
+    /// single stream (`0`) except a composed desktop remainder, which has
+    /// one per captured process; keys are never reused within a capture.
+    pub input: u64,
     /// QPC time of the first sample, 100 ns ticks.
     pub timestamp: i64,
     pub channels: u16,

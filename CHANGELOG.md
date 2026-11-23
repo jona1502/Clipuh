@@ -8,6 +8,14 @@ process: [docs/versioning.md](docs/versioning.md).
 
 ## [Unreleased]
 
+### Fixed
+
+- Desktop Audio keeps recording when two or more applications are recorded as
+  separate sources; the separated apps are left out of it instead of the whole
+  desktop track being dropped.
+- Audio sources added, removed, enabled, disabled or retargeted while Instant
+  Replay runs are applied immediately, without restarting the replay.
+
 ## [0.1.1] - 2026-11-20
 
 ### Fixed

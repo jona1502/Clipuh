@@ -1,4 +1,15 @@
 //! Bounded timestamp-addressed mixing on the recorder thread, never a capture callback.
+//!
+//! A mixer *source* (one per user audio source) owns gain, noise gate, peak
+//! meter and at most one isolated output. It is fed by one or more *inputs*
+//! (capture streams): normally exactly one; a desktop remainder built from
+//! several per-process streams has one input per process. Inputs of a source
+//! are summed (never subtracted) before its gate and gain.
+//!
+//! Sources can be added and retired while the timeline runs (live audio
+//! source changes during instant replay). The number of isolated outputs is
+//! fixed at construction because it is the encoder's track topology; a
+//! source added later either reuses a reserved output or feeds the mix only.
 
 use crate::gate::NoiseGate;
 use crate::types::{SAMPLE_RATE, TICKS_PER_SECOND};
@@ -25,34 +36,104 @@ pub struct ResyncStats {
     pub max_frames: u64,
 }
 
-struct Track {
+impl ResyncStats {
+    fn merge(self, other: Self) -> Self {
+        Self {
+            count: self.count + other.count,
+            max_frames: self.max_frames.max(other.max_frames),
+        }
+    }
+}
+
+/// One capture stream feeding a source: one second of stereo samples.
+struct Input {
+    key: u64,
     samples: Vec<[f32; 2]>,
     positions: Vec<i64>,
+    next_position: Option<i64>,
+    /// The stream ended: dropped once everything it delivered is rendered.
+    retired: bool,
+}
+
+impl Input {
+    fn new(key: u64) -> Self {
+        Self {
+            key,
+            samples: vec![[0.0; 2]; CAPACITY],
+            positions: vec![-1; CAPACITY],
+            next_position: None,
+            retired: false,
+        }
+    }
+
+    /// Nothing left to render at or after `position`.
+    fn drained(&self, position: i64) -> bool {
+        self.next_position.is_none_or(|next| next <= position)
+    }
+}
+
+struct Track {
+    inputs: Vec<Input>,
+    /// Isolated output (encoder stream `output + 1`), if any.
+    output: Option<usize>,
     /// Gain applied right now; moves towards `target` by `step` per sample.
     gain: f32,
     target: f32,
     step: f32,
     received: u64,
-    next_position: Option<i64>,
     resync: ResyncStats,
     gate: NoiseGate,
     peak: f32,
+    /// Removed from the session: dropped once its inputs are rendered.
+    retired: bool,
 }
 
-/// One second of stereo samples per source. Old/oversized packets are dropped,
+impl Track {
+    fn new(gain: f32, output: Option<usize>) -> Self {
+        let gain = sanitize_gain(gain);
+        Self {
+            inputs: Vec::new(),
+            output,
+            gain,
+            target: gain,
+            step: 0.0,
+            received: 0,
+            resync: ResyncStats::default(),
+            gate: NoiseGate::default(),
+            peak: 0.0,
+            retired: false,
+        }
+    }
+}
+
+fn sanitize_gain(gain: f32) -> f32 {
+    if gain.is_finite() {
+        gain.clamp(0.0, MAX_GAIN)
+    } else {
+        1.0
+    }
+}
+
+/// One second of stereo samples per input. Old/oversized packets are dropped,
 /// never allowed to allocate more memory. QPC positions continuously correct
 /// sample-clock drift by placing samples on the common 48 kHz grid.
 pub struct TimelineMixer {
     origin: i64,
     position: i64,
-    tracks: Vec<Track>,
-    separate: bool,
+    /// Indexed by source index; `None` for removed (or never used) indexes.
+    /// Indexes are never reused by the recorder, so a late packet of a
+    /// removed source cannot land in a newer one.
+    tracks: Vec<Option<Track>>,
+    /// Isolated outputs (fixed for the session: encoder topology).
+    outputs: usize,
     late: u64,
     /// Samples before this position are ignored silently (see `skip_to`).
     skipped_until: i64,
     mixed: Vec<f32>,
-    /// One block per track, already gained and limited.
+    /// One block per isolated output, already gained and limited.
     isolated: Vec<f32>,
+    /// Re-anchors of sources that were removed, kept for diagnostics.
+    removed_resync: ResyncStats,
 }
 
 /// Highest per-track gain accepted by [`TimelineMixer::set_gain`] (200 %).
@@ -75,49 +156,94 @@ fn soft_limit(x: f32) -> f32 {
 }
 
 impl TimelineMixer {
+    /// Sources `0..gains.len()`; with `separate`, source `i` owns isolated
+    /// output `i` (encoder stream `i + 1`).
     pub fn new(origin: i64, gains: Vec<f32>, separate: bool) -> Self {
-        let count = gains.len();
-        let gains: Vec<f32> = gains
-            .into_iter()
-            .map(|gain| {
-                if gain.is_finite() {
-                    gain.clamp(0.0, MAX_GAIN)
-                } else {
-                    1.0
-                }
-            })
-            .collect();
+        let outputs = if separate { gains.len() } else { 0 };
+        let mut mixer = Self::with_outputs(origin, outputs);
+        for (index, gain) in gains.into_iter().enumerate() {
+            mixer.add_source(index, gain, separate.then_some(index));
+        }
+        mixer
+    }
+
+    /// No sources yet and `outputs` isolated outputs that render silence
+    /// until a source is assigned to them.
+    pub fn with_outputs(origin: i64, outputs: usize) -> Self {
         Self {
             origin,
             position: 0,
-            tracks: gains
-                .into_iter()
-                .map(|gain| Track {
-                    samples: vec![[0.0; 2]; CAPACITY],
-                    positions: vec![-1; CAPACITY],
-                    gain,
-                    target: gain,
-                    step: 0.0,
-                    received: 0,
-                    next_position: None,
-                    resync: ResyncStats::default(),
-                    gate: NoiseGate::default(),
-                    peak: 0.0,
-                })
-                .collect(),
-            separate,
+            tracks: Vec::new(),
+            outputs,
             late: 0,
             skipped_until: 0,
             mixed: vec![0.0; BLOCK * 2],
-            isolated: vec![0.0; BLOCK * 2 * count],
+            isolated: vec![0.0; BLOCK * 2 * outputs],
+            removed_resync: ResyncStats::default(),
         }
+    }
+
+    /// Adds source `index` (replacing a previous one with that index) with
+    /// `gain` and, if `output` is a valid output index, that isolated output.
+    /// It contributes from its first packet's QPC position on; nothing
+    /// earlier is synthesized.
+    pub fn add_source(&mut self, index: usize, gain: f32, output: Option<usize>) {
+        if self.tracks.len() <= index {
+            self.tracks.resize_with(index + 1, || None);
+        }
+        let output = output.filter(|o| *o < self.outputs);
+        if let Some(old) = self.tracks[index].take() {
+            self.removed_resync = self.removed_resync.merge(old.resync);
+        }
+        self.tracks[index] = Some(Track::new(gain, output));
+    }
+
+    /// Removes source `index` once everything already delivered for it is
+    /// rendered (its tail before the removal is kept, nothing after it).
+    pub fn retire_source(&mut self, index: usize) {
+        if let Some(Some(track)) = self.tracks.get_mut(index) {
+            track.retired = true;
+        }
+    }
+
+    /// Input `key` of source `index` ended (its stream stopped). Dropped once
+    /// its samples are rendered; its memory is released then.
+    pub fn retire_input(&mut self, index: usize, key: u64) {
+        if let Some(Some(track)) = self.tracks.get_mut(index)
+            && let Some(input) = track.inputs.iter_mut().find(|i| i.key == key)
+        {
+            input.retired = true;
+        }
+    }
+
+    /// Whether source `index` exists (not removed yet).
+    pub fn has_source(&self, index: usize) -> bool {
+        matches!(self.tracks.get(index), Some(Some(_)))
+    }
+
+    /// Live inputs of source `index` (diagnostics and tests).
+    pub fn input_count(&self, index: usize) -> usize {
+        self.track(index).map_or(0, |t| t.inputs.len())
+    }
+
+    /// Isolated outputs (encoder streams `1..=outputs`).
+    pub fn outputs(&self) -> usize {
+        self.outputs
+    }
+
+    fn track(&self, index: usize) -> Option<&Track> {
+        self.tracks.get(index).and_then(Option::as_ref)
+    }
+
+    fn track_mut(&mut self, index: usize) -> Option<&mut Track> {
+        self.tracks.get_mut(index).and_then(Option::as_mut)
     }
 
     /// Ramps track `index` linearly to `gain` (clamped to `0..=`[`MAX_GAIN`])
     /// over one 480-frame block (no click). Out-of-range indexes and
     /// non-finite gains are ignored.
     pub fn set_gain(&mut self, index: usize, gain: f32) {
-        if let Some(track) = self.tracks.get_mut(index)
+        if let Some(track) = self.track_mut(index)
             && gain.is_finite()
         {
             track.target = gain.clamp(0.0, MAX_GAIN);
@@ -127,29 +253,26 @@ impl TimelineMixer {
 
     /// Live updates retain the current gain envelope to avoid toggle clicks.
     pub fn set_noise_gate(&mut self, index: usize, settings: NoiseGateSettings) {
-        if let Some(track) = self.tracks.get_mut(index) {
+        if let Some(track) = self.track_mut(index) {
             track.gate.configure(settings);
         }
     }
 
     pub fn reset_noise_gate(&mut self, index: usize) {
-        if let Some(track) = self.tracks.get_mut(index) {
+        if let Some(track) = self.track_mut(index) {
             track.gate.reset();
         }
     }
 
     /// Actual rendered source peak, after gate, gain and per-track limiting.
     pub fn take_peak(&mut self, index: usize) -> f32 {
-        self.tracks
-            .get_mut(index)
+        self.track_mut(index)
             .map_or(0.0, |track| std::mem::take(&mut track.peak))
     }
 
     /// Whether track `index` has delivered at least one sample.
     pub fn has_received(&self, index: usize) -> bool {
-        self.tracks
-            .get(index)
-            .is_some_and(|track| track.received > 0)
+        self.track(index).is_some_and(|track| track.received > 0)
     }
 
     pub fn late_frames(&self) -> u64 {
@@ -160,9 +283,9 @@ impl TimelineMixer {
     pub fn resync_stats(&self) -> ResyncStats {
         self.tracks
             .iter()
-            .fold(ResyncStats::default(), |total, track| ResyncStats {
-                count: total.count + track.resync.count,
-                max_frames: total.max_frames.max(track.resync.max_frames),
+            .flatten()
+            .fold(self.removed_resync, |total, track| {
+                total.merge(track.resync)
             })
     }
 
@@ -175,29 +298,51 @@ impl TimelineMixer {
         if target > self.position {
             self.position = target;
             self.skipped_until = target;
-            for track in &mut self.tracks {
+            for track in self.tracks.iter_mut().flatten() {
                 track.gate.reset();
             }
         }
     }
 
     pub fn all_sources_received(&self) -> bool {
-        self.tracks.iter().all(|track| track.received > 0)
+        self.tracks.iter().flatten().all(|track| track.received > 0)
     }
 
+    /// Packet of the single (first) input of source `index`.
     pub fn push(&mut self, index: usize, timestamp: i64, channels: u16, samples: &[f32]) {
-        let Some(track) = self.tracks.get_mut(index) else {
+        self.push_input(index, 0, timestamp, channels, samples);
+    }
+
+    /// Packet of input `key` of source `index`. A new key allocates that
+    /// input's ring once (recorder thread, never per sample).
+    pub fn push_input(
+        &mut self,
+        index: usize,
+        key: u64,
+        timestamp: i64,
+        channels: u16,
+        samples: &[f32],
+    ) {
+        let (origin, position, skipped_until) = (self.origin, self.position, self.skipped_until);
+        let Some(track) = self.tracks.get_mut(index).and_then(Option::as_mut) else {
             return;
         };
         let channels = usize::from(channels);
         if channels == 0 {
             return;
         }
-        let first = ((i128::from(timestamp) - i128::from(self.origin)) * i128::from(SAMPLE_RATE)
+        let input = match track.inputs.iter().position(|i| i.key == key) {
+            Some(found) => &mut track.inputs[found],
+            None => {
+                track.inputs.push(Input::new(key));
+                track.inputs.last_mut().expect("just pushed")
+            }
+        };
+        let first = ((i128::from(timestamp) - i128::from(origin)) * i128::from(SAMPLE_RATE)
             / i128::from(TICKS_PER_SECOND)) as i64;
         // Packet-clock jitter below 2 ms preserves sample continuity. Larger
         // clock offsets are corrected against QPC instead of accumulating drift.
-        let first = match track.next_position {
+        let first = match input.next_position {
             Some(next) if (next - first).abs() <= CONTINUITY_FRAMES => next,
             Some(next) => {
                 track.resync.count += 1;
@@ -206,24 +351,39 @@ impl TimelineMixer {
             }
             None => first,
         };
-        track.next_position = Some(first.saturating_add((samples.len() / channels) as i64));
+        input.next_position = Some(first.saturating_add((samples.len() / channels) as i64));
         for (offset, frame) in samples.chunks_exact(channels).enumerate() {
-            let position = first.saturating_add(offset as i64);
-            if position < 0 {
+            let position_now = first.saturating_add(offset as i64);
+            if position_now < 0 {
                 continue;
             }
-            if position < self.skipped_until {
+            if position_now < skipped_until {
                 continue;
             }
-            if position < self.position || position >= self.position + CAPACITY as i64 {
+            if position_now < position || position_now >= position + CAPACITY as i64 {
                 self.late += 1;
                 continue;
             }
-            let slot = position as usize % CAPACITY;
+            let slot = position_now as usize % CAPACITY;
             let clean = |value: f32| if value.is_finite() { value } else { 0.0 };
-            track.samples[slot] = [clean(frame[0]), clean(frame[channels.min(2) - 1])];
-            track.positions[slot] = position;
+            input.samples[slot] = [clean(frame[0]), clean(frame[channels.min(2) - 1])];
+            input.positions[slot] = position_now;
             track.received += 1;
+        }
+    }
+
+    /// Drops retired inputs and sources whose delivered audio is rendered.
+    fn collect_retired(&mut self) {
+        let position = self.position;
+        for slot in &mut self.tracks {
+            let Some(track) = slot else { continue };
+            track
+                .inputs
+                .retain(|input| !(input.retired && input.drained(position)));
+            if track.retired && track.inputs.iter().all(|input| input.drained(position)) {
+                self.removed_resync = self.removed_resync.merge(track.resync);
+                *slot = None;
+            }
         }
     }
 
@@ -248,8 +408,8 @@ impl TimelineMixer {
         while self.position < end {
             let count = ((end - self.position) as usize).min(BLOCK);
             self.mixed[..count * 2].fill(0.0);
-            for (index, track) in self.tracks.iter_mut().enumerate() {
-                let out = &mut self.isolated[index * BLOCK * 2..][..count * 2];
+            self.isolated.fill(0.0);
+            for track in self.tracks.iter_mut().flatten() {
                 for offset in 0..count {
                     if track.gain != track.target {
                         track.gain += track.step;
@@ -259,44 +419,53 @@ impl TimelineMixer {
                             track.gain = track.target;
                         }
                     }
-                    let slot = (self.position + offset as i64) as usize % CAPACITY;
-                    let present = track.positions[slot] == self.position + offset as i64;
-                    let frame = if present {
-                        track.samples[slot]
-                    } else {
-                        [0.0; 2]
-                    };
+                    let position = self.position + offset as i64;
+                    let slot = position as usize % CAPACITY;
+                    // Inputs of one source are disjoint captures: summed.
+                    let mut frame = [0.0f32; 2];
+                    let mut present = false;
+                    for input in &track.inputs {
+                        if input.positions[slot] == position {
+                            present = true;
+                            frame[0] += input.samples[slot][0];
+                            frame[1] += input.samples[slot][1];
+                        }
+                    }
                     // One detector per source, before gain/mute/solo. Both
                     // channels and the mix/isolated outputs share its envelope.
                     let gate_gain = track.gate.gain(frame[0].abs().max(frame[1].abs()));
-                    for channel in 0..2 {
+                    for (channel, sample) in frame.iter().enumerate() {
                         let value = if present {
-                            frame[channel] * gate_gain * track.gain
+                            sample * gate_gain * track.gain
                         } else {
                             0.0
                         };
                         self.mixed[offset * 2 + channel] += value;
-                        out[offset * 2 + channel] = soft_limit(value);
-                        track.peak = track.peak.max(out[offset * 2 + channel].abs());
+                        if let Some(output) = track.output {
+                            self.isolated[output * BLOCK * 2 + offset * 2 + channel] += value;
+                        }
+                        track.peak = track.peak.max(soft_limit(value).abs());
                     }
                 }
             }
             for value in &mut self.mixed[..count * 2] {
                 *value = soft_limit(*value);
             }
+            for value in &mut self.isolated {
+                *value = soft_limit(*value);
+            }
             let time = (i128::from(self.position) * i128::from(TICKS_PER_SECOND)
                 / i128::from(SAMPLE_RATE)) as i64;
             write(0, time, &self.mixed[..count * 2])?;
-            if self.separate {
-                for index in 0..self.tracks.len() {
-                    write(
-                        index + 1,
-                        time,
-                        &self.isolated[index * BLOCK * 2..][..count * 2],
-                    )?;
-                }
+            for output in 0..self.outputs {
+                write(
+                    output + 1,
+                    time,
+                    &self.isolated[output * BLOCK * 2..][..count * 2],
+                )?;
             }
             self.position += count as i64;
+            self.collect_retired();
         }
         Ok(())
     }
@@ -463,15 +632,15 @@ mod tests {
     #[test]
     fn gain_is_clamped_to_two_and_never_negative() {
         let mut mixer = TimelineMixer::new(0, vec![50.0, -3.0, f32::NAN], false);
-        assert_eq!(mixer.tracks[0].gain, MAX_GAIN);
-        assert_eq!(mixer.tracks[1].gain, 0.0);
-        assert_eq!(mixer.tracks[2].gain, 1.0);
+        assert_eq!(mixer.tracks[0].as_ref().unwrap().gain, MAX_GAIN);
+        assert_eq!(mixer.tracks[1].as_ref().unwrap().gain, 0.0);
+        assert_eq!(mixer.tracks[2].as_ref().unwrap().gain, 1.0);
         mixer.set_gain(1, 10.0);
-        assert_eq!(mixer.tracks[1].target, MAX_GAIN);
+        assert_eq!(mixer.tracks[1].as_ref().unwrap().target, MAX_GAIN);
         mixer.set_gain(1, -1.0);
-        assert_eq!(mixer.tracks[1].target, 0.0);
+        assert_eq!(mixer.tracks[1].as_ref().unwrap().target, 0.0);
         mixer.set_gain(1, f32::INFINITY);
-        assert_eq!(mixer.tracks[1].target, 0.0);
+        assert_eq!(mixer.tracks[1].as_ref().unwrap().target, 0.0);
     }
 
     #[test]
